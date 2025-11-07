@@ -4,3 +4,20 @@ model
 images
 *.engine
 
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+
+# 博客系统生成的文件
+blog_data.json
+*.html
+python_tutorial.md
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
