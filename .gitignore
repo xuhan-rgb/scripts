@@ -1,6 +1,6 @@
-build/
+/build/
+__pycache__/
 *.onnx
-model
-images
+/model/
+/images/
 *.engine
-

@@ -1,88 +1,93 @@
-import subprocess
-import os
-import importlib.util
 import ctypes
+import importlib.util
+import os
+import subprocess
 
-# 检查 CUDA
-try:
-    cuda = ctypes.CDLL("libcudart.so")
-    print("CUDA 库加载成功！")
-    cuda_version = ctypes.c_int()
-    cuda.cudaRuntimeGetVersion(ctypes.byref(cuda_version))
-    print(f"CUDA 版本: {cuda_version.value // 1000}.{(cuda_version.value % 1000) // 10}")
-except OSError as e:
-    print("CUDA 库加载失败:", e)
-# 检查 cuDNN
-try:
-    cudnn = ctypes.CDLL("libcudnn.so")
-    print("cuDNN 库加载成功！")
-    cudnn_version = ctypes.c_int()
-    cudnn.cudnnGetVersion.restype = ctypes.c_size_t
-    print("cuDNN 版本:", cudnn.cudnnGetVersion())
-except OSError as e:
-    print("cuDNN 库加载失败:", e)
-    
-def find_onnxruntime_dependencies():
-    # 尝试导入 onnxruntime 或 onnxruntime-gpu
+
+def print_cuda_runtime_version():
     try:
-        onnxruntime_spec = importlib.util.find_spec("onnxruntime")
-        if not onnxruntime_spec:
-            print("ONNX Runtime is not installed in the current environment.")
+        cuda = ctypes.CDLL("libcudart.so")
+        cuda.cudaRuntimeGetVersion.argtypes = [ctypes.POINTER(ctypes.c_int)]
+        cuda.cudaRuntimeGetVersion.restype = ctypes.c_int
+        version = ctypes.c_int()
+        result = cuda.cudaRuntimeGetVersion(ctypes.byref(version))
+        if result != 0:
+            print(f"CUDA runtime version query failed with error code: {result}")
             return
+        print("CUDA library loaded successfully!")
+        print(
+            "CUDA version: "
+            f"{version.value // 1000}.{(version.value % 1000) // 10}"
+        )
+    except (AttributeError, OSError) as error:
+        print("CUDA library could not be loaded:", error)
 
-        # 获取 onnxruntime 库的路径
-        onnxruntime_path = os.path.dirname(onnxruntime_spec.origin)
-        onnx_lib_path = os.path.join(onnxruntime_path, "capi", "libonnxruntime_providers_cuda.so")
 
-        if not os.path.exists(onnx_lib_path):
-            print("ONNX Runtime GPU library not found.")
-            return
+def print_cudnn_version():
+    try:
+        cudnn = ctypes.CDLL("libcudnn.so")
+        cudnn.cudnnGetVersion.restype = ctypes.c_size_t
+        print("cuDNN library loaded successfully!")
+        print("cuDNN version:", cudnn.cudnnGetVersion())
+    except (AttributeError, OSError) as error:
+        print("cuDNN library could not be loaded:", error)
 
-        # 使用 ldd 命令获取依赖信息
-        try:
-            ldd_output = subprocess.check_output(["ldd", onnx_lib_path]).decode("utf-8")
-        except subprocess.CalledProcessError as e:
-            print("Error running ldd:", e)
-            return
 
-        # 查找 CUDA 和 cuDNN 版本信息
-        cuda_version = None
-        cudnn_version = None
-        for line in ldd_output.splitlines():
-            if "cuda" in line:
-                cuda_version = line.split("=>")[-1].strip().split(" ")[0]
-            elif "cudnn" in line:
-                cudnn_version = line.split("=>")[-1].strip().split(" ")[0]
+def find_ldd_dependency(ldd_output, library_name):
+    for line in ldd_output.splitlines():
+        if library_name not in line or "=>" not in line:
+            continue
+        return line.split("=>", 1)[1].strip().split(" ", 1)[0]
+    return None
 
-        # 输出结果
-        def print_library_path(lib_name, lib_path):
-            if os.path.islink(lib_path):
-                real_path = os.path.realpath(lib_path)
-                print(f"{lib_name} path: {lib_path} -> {real_path}")
-            else:
-                print(f"{lib_name} path: {lib_path}")
-        
-        if cuda_version != 'not':
-            print_library_path("CUDA library", cuda_version)
+
+def print_dependency_result(lib_name, lib_path, ldd_output, marker):
+    if lib_path and lib_path != "not":
+        if os.path.islink(lib_path):
+            print(f"{lib_name} path: {lib_path} -> {os.path.realpath(lib_path)}")
         else:
-            print("CUDA library not found in ONNX Runtime dependencies.")
-            print("Filtered ldd output for CUDA debugging:")
-            for line in ldd_output.splitlines():
-                if "cuda" in line and "cudnn" not in line:
-                    print(line)
+            print(f"{lib_name} path: {lib_path}")
+        return
 
-        if cudnn_version != 'not':
-            print_library_path("cuDNN library", cudnn_version)
-        else:
-            print("cuDNN library not found in ONNX Runtime dependencies.")
-            print("Filtered ldd output for cuDNN debugging:")
-            for line in ldd_output.splitlines():
-                if "cudnn" in line:
-                    print(line)
+    print(f"{lib_name} not found in ONNX Runtime dependencies.")
+    print(f"Filtered ldd output for {lib_name} debugging:")
+    for line in ldd_output.splitlines():
+        if marker in line:
+            print(line)
 
-    except ImportError:
-        print("ONNX Runtime is not installed.")
+
+def find_onnxruntime_dependencies():
+    onnxruntime_spec = importlib.util.find_spec("onnxruntime")
+    if not onnxruntime_spec:
+        print("ONNX Runtime is not installed in the current environment.")
+        return
+
+    onnxruntime_path = os.path.dirname(onnxruntime_spec.origin)
+    onnx_lib_path = os.path.join(
+        onnxruntime_path, "capi", "libonnxruntime_providers_cuda.so"
+    )
+    if not os.path.exists(onnx_lib_path):
+        print("ONNX Runtime GPU library not found.")
+        return
+
+    try:
+        result = subprocess.run(
+            ["ldd", onnx_lib_path], capture_output=True, check=False, text=True
+        )
+    except OSError as error:
+        print("Could not run ldd:", error)
+        return
+    if result.returncode != 0:
+        print("ldd failed:", result.stderr.strip())
+        return
+
+    cuda_path = find_ldd_dependency(result.stdout, "libcudart.so")
+    cudnn_path = find_ldd_dependency(result.stdout, "libcudnn.so")
+    print_dependency_result("CUDA library", cuda_path, result.stdout, "libcudart.so")
+    print_dependency_result("cuDNN library", cudnn_path, result.stdout, "libcudnn.so")
+
 
 if __name__ == "__main__":
+    print_cuda_runtime_version()
+    print_cudnn_version()
     find_onnxruntime_dependencies()
-
