@@ -2,6 +2,34 @@
 
 用于 Linux 桌面配置、ONNX 环境检测以及 TensorRT 模型转换与推理的个人脚本集合。
 
+## Claude Code / Codex 网关
+
+### 部署跟随本地 Codex 配置的桥接服务
+
+```bash
+bash claude/install-codex-bridge.sh
+```
+
+脚本会安装固定版本的 CLIProxyAPI user service。每次启动 `claudex` 时，它会读取 `~/.codex/config.toml` 当前的 `model_provider`，再从对应的 `[model_providers.<name>]` 读取 `base_url`、`wire_api` 和 `env_key`。因此 Codex 切换 provider 后，Claude 会自动使用新的连接配置；provider 的 `env_key` 必须已导出到当前 shell。模型与思考强度由本服务独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
+
+```bash
+claudex       # 正常权限确认
+claudex-yolo  # 跳过权限确认
+claudex --pick  # 启动前交互选择模型和思考强度
+claudex-ui    # 打开本地可视化控制台
+```
+
+Claude 的 Opus、Sonnet、Haiku 档位分别映射到 Sol、Terra、Luna。脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
+
+在 Claude Code 中输入 `/model` 可在三个 GPT 模型间选择，并在模型选择器底部用 `←/→` 调整思考强度；也可以输入 `/effort` 单独调整。三个模型共同支持 `low`、`medium`、`high`、`xhigh` 和 `max`。启动前指定选择的示例：
+
+```bash
+claudex --gpt-model gpt-5.6-terra --gpt-effort high
+claudex-yolo --gpt-model gpt-5.6-luna --gpt-effort medium
+```
+
+`claudex-ui` 打开的 Codex Routing Desk 只监听 `127.0.0.1:8320`。界面可持久切换模型与 effort、查看当前 Codex provider 和网关健康状态；保存结果用于后续新开的 Claude 会话，已经运行的会话仍使用 `/model` 或 `/effort` 切换。
+
 ## 桌面工具
 
 ### 安装 Flameshot 并配置 GNOME 快捷键

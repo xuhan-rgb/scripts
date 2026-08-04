@@ -4,13 +4,14 @@
 
 这是一个面向 Linux 桌面与 NVIDIA GPU 服务器的轻量脚本工具集，用于：
 
+- 部署跟随本地 Codex provider、独立管理模型和思考强度的 Claude Code 桥接服务。
 - 安装 Flameshot 相关依赖并配置 GNOME 截图快捷键。
 - 诊断 CUDA、cuDNN 与 ONNX Runtime GPU 动态库环境。
 - 生成最小 ONNX 模型并验证 ONNX Runtime 的 CUDA Provider。
 - 将静态 ONNX 模型构建或加载为 TensorRT engine，再以 NumPy 数组执行推理。
 - 对一个固定输入尺寸的深度估计模型进行端到端推理和结果可视化。
 
-项目没有 Web 服务或打包配置；脚本由当前 Python 环境直接执行，非 GPU 辅助逻辑由标准库 `unittest` 测试。
+除仅监听 `127.0.0.1` 的 Codex Routing Desk 外，项目没有对外 Web 服务或打包配置；脚本由当前 Python 环境直接执行，非 GPU 辅助逻辑由标准库 `unittest` 测试。
 
 ## 环境要求
 
@@ -30,6 +31,15 @@
 ## 常用命令
 
 ```bash
+# 安装读取 ~/.codex/config.toml 的 CLIProxyAPI user service
+bash claude/install-codex-bridge.sh
+
+# 打开本地模型与思考强度控制台
+claudex-ui
+
+# Shell 语法检查；不会修改系统或用户服务
+bash -n claude/install-codex-bridge.sh
+
 # 检查并安装 Flameshot 依赖，配置 Alt+A 与 Alt+S
 bash desktop/install-flameshot-shortcuts.sh
 
@@ -62,13 +72,16 @@ python convert_trt.py
 
 ```text
 .
+|- claude/install-codex-bridge.sh     # 跟随本地 Codex provider 的 Claude Code 桥接服务
+|- claude/codex_bridge_manager.py     # 本地模型与 effort 可视化控制台
 |- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置
 |- get_onnx_dependencies.py  # 动态库与 onnxruntime CUDA provider 依赖诊断
 |- test_onnx_env.py          # 最小 ONNX Runtime CUDA 推理验证
 |- tensorrt_inference.py     # TensorRTModel 引擎构建、加载、推理与释放
 |- convert_trt.py            # 固定尺寸深度估计模型示例和深度图可视化
 |- README.md                 # 面向使用者的快速开始
-`- tests/test_helpers.py     # 环境诊断和深度图辅助函数的无 GPU 回归测试
+|- tests/test_helpers.py     # 环境诊断和深度图辅助函数的无 GPU 回归测试
+`- tests/test_codex_bridge_manager.py # Codex provider 解析与选择状态回归测试
 ```
 
 数据流为：ONNX 文件 -> `TensorRTModel` 构建或加载 engine -> 分配主机/显存缓冲区 -> `infer()` 执行并返回 NumPy 输出列表。`convert_trt.py` 在此基础上读取图片、调整至 `(1, 3, 352, 640)`、归一化后取第一个输出的首通道生成伪彩深度图。
@@ -83,6 +96,7 @@ python convert_trt.py
 
 ## 维护约定
 
+- 修改 Codex 桥接脚本后运行 `bash -n`；不得把 provider API key 写入仓库。
 - 修改桌面安装脚本后运行 `bash -n`；已安装的依赖必须跳过，缺失依赖必须能够自动安装。
 - 保持脚本直接可运行，不引入框架、命令行包装或配置层，除非需求明确要求。
 - 修改 `TensorRTModel` 时，同时核对 ONNX 构建路径、已有 engine 加载路径和多输出返回行为。
