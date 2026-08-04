@@ -114,7 +114,7 @@ codex-provider test crs
 - 创建仅监听 `127.0.0.1` 的 `cli-proxy-api.service` 与 `claudex-manager.service`。
 - 创建权限为 `0600` 的 Codex 配置、provider secrets、网关配置和 usage 数据库。
 
-Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端使用 `opus[1m]` 长上下文模式，effort 固定为 `medium`。这里的 Opus 只用于解除 Claude Code 的普通 200K 客户端窗口限制；真实的 GPT 模型和 reasoning effort 仍由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
+Claude 始终只连接一个稳定的虚拟模型 `claudex-router[1m]`，客户端 effort 固定为 `medium`。`claudex` 通过进程级 `availableModels` 把 `/model` 收敛为 `Default` 和 `GPT Router (1M)`，两项都指向本地中转；该限制不会写入 `~/.claude/settings.json`，也不会影响 `claude-yolo` 的官方账号登录。真实的 GPT 模型和 reasoning effort 仍由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
 
 当前部署使用 ChatGPT/Codex 订阅账号中转，而不是 OpenAI Platform API Key，因此按订阅产品的窗口和 usage 风险配置：Codex 的最大上下文写为 `372000`，但自动 compact 固定在 `244800`；`claudex` 的 auto-compact window 固定为 `250k`。运行 Codex `/status` 应看到 `372K` context window，运行 Claude `/context` 应看到 `claudex-router[1m]` 和 `250k` auto-compact window。
 
@@ -133,7 +133,7 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 首次关闭扩展前，安装器会各保留一份固定备份：Codex 配置使用 `*.before-disabled-extensions`，Claude 设置使用 `~/.claude/settings.json.before-disabled-extensions`。重复安装不会继续堆积备份。
 
-控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取和缓存命中率。卡片每 3 秒增量更新，不会重新创建界面节点。
+控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取、缓存命中率和醒目的相对时间。请求数据每 3 秒增量更新，相对时间由浏览器每秒更新，不会额外请求服务或重新创建界面节点。
 
 Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、非缓存输入、输出 token、推理 token、缓存读取/创建、命中率、首 Token 时间（TTFT）、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。其中“输入”始终按 `input_tokens - cache_read_tokens` 计算，避免与单独展示的缓存读取重复。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
 

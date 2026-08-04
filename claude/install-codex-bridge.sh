@@ -311,13 +311,16 @@ exec env \
   -u CLAUDE_CODE_AUTO_COMPACT_WINDOW \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8317 \
   ANTHROPIC_AUTH_TOKEN=claudex-local \
-  ANTHROPIC_DEFAULT_OPUS_MODEL=claudex-router \
-  ANTHROPIC_DEFAULT_SONNET_MODEL=claudex-router \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL=claudex-router \
+  'ANTHROPIC_DEFAULT_OPUS_MODEL=claudex-router[1m]' \
+  'ANTHROPIC_CUSTOM_MODEL_OPTION=claudex-router[1m]' \
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=GPT Router (1M)' \
+  'ANTHROPIC_CUSTOM_MODEL_OPTION_DESCRIPTION=Choose GPT model and effort at 127.0.0.1:8320' \
   CLAUDE_CODE_SUBAGENT_MODEL=claudex-router \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
-  claude --model 'opus[1m]' --autocompact 250k --effort medium --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
+  claude --model 'claudex-router[1m]' --autocompact 250k --effort medium \
+    --settings '{"availableModels":["claudex-router[1m]"]}' \
+    --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
 ln -sfn claudex "${BIN_DIR}/claudex-yolo"

@@ -559,9 +559,11 @@ HTML = r'''<!doctype html>
     .usage-breakdown span { color: var(--ink-soft); font-size: 10px; }
     .usage-breakdown strong { display: block; margin-top: 3px; color: var(--ink); font: 800 11px "DejaVu Sans Mono", monospace; }
     .last-request { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(520px, 2.2fr); align-items: center; gap: 24px; margin-top: 12px; padding: 15px 20px; border-left: 4px solid var(--signal); }
+    .last-request-title { display: flex; align-items: center; gap: 9px; flex-wrap: wrap; }
     .last-request-label strong, .last-request-label span { display: block; }
     .last-request-label strong { font-size: 13px; }
     .last-request-label span { margin-top: 4px; color: var(--ink-soft); font: 10px "DejaVu Sans Mono", monospace; }
+    .last-request-label .last-request-age { margin-top: 0; padding: 4px 8px; color: #9b3516; background: rgba(237,106,58,.14); border: 1px solid rgba(237,106,58,.42); border-radius: 999px; font-weight: 900; letter-spacing: .02em; }
     .last-request-breakdown { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
     .last-request-breakdown span { color: var(--ink-soft); font-size: 10px; }
     .last-request-breakdown strong { display: block; margin-top: 3px; color: var(--ink); font: 800 14px "DejaVu Sans Mono", monospace; }
@@ -696,7 +698,10 @@ HTML = r'''<!doctype html>
         </article>
       </div>
       <article class="panel last-request">
-        <div class="last-request-label"><strong>Last request</strong><span id="last-request-meta">No requests captured</span></div>
+        <div class="last-request-label">
+          <div class="last-request-title"><strong>Last request</strong><span id="last-request-age" class="last-request-age" aria-live="polite">—</span></div>
+          <span id="last-request-meta">No requests captured</span>
+        </div>
         <div class="last-request-breakdown">
           <span>Input<strong id="last-request-input">0</strong></span>
           <span>Output<strong id="last-request-output">0</strong></span>
@@ -747,6 +752,23 @@ HTML = r'''<!doctype html>
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', {hour12: false});
     };
+    const formatRelativeTime = (value, now = Date.now()) => {
+      const timestamp = new Date(value).getTime();
+      if (Number.isNaN(timestamp)) return '—';
+      const seconds = Math.max(0, Math.floor((now - timestamp) / 1000));
+      if (seconds === 0) return '刚刚';
+      if (seconds < 60) return `${seconds} 秒前`;
+      const minutes = Math.floor(seconds / 60);
+      if (minutes < 60) return `${minutes} 分钟前`;
+      const hours = Math.floor(minutes / 60);
+      if (hours < 24) return `${hours} 小时前`;
+      return `${Math.floor(hours / 24)} 天前`;
+    };
+
+    function refreshLastRequestAge() {
+      const last = app.requests[0];
+      $('last-request-age').textContent = last ? formatRelativeTime(last.timestamp) : '—';
+    }
 
     function renderUsage() {
       const periods = app.state.usage.periods || {};
@@ -767,6 +789,7 @@ HTML = r'''<!doctype html>
       $('last-request-cache-read').textContent = formatTokens(cacheRead);
       $('last-request-cache-hit').textContent = totalInput > 0 ? `${(cacheRead / totalInput * 100).toFixed(1)}%` : '—';
       $('last-request-meta').textContent = last ? `${formatTime(last.timestamp)} · ${last.model || 'unknown model'}` : 'No requests captured';
+      refreshLastRequestAge();
     }
 
     function renderRequests() {
@@ -939,7 +962,9 @@ HTML = r'''<!doctype html>
       if (!event.altKey && index >= 0 && index < 3 && app.state) chooseModel(app.state.models[index].id);
       if (event.altKey && index >= 0 && index < 5 && app.state) { event.preventDefault(); chooseEffort(app.state.efforts[index]); }
     });
-    refresh(); setInterval(() => { if (!app.dirty) refresh(); }, 3000);
+    refresh();
+    setInterval(refreshLastRequestAge, 1000);
+    setInterval(() => { if (!app.dirty) refresh(); }, 3000);
   </script>
 </body>
 </html>'''
