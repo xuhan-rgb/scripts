@@ -114,7 +114,11 @@ codex-provider test crs
 - 创建仅监听 `127.0.0.1` 的 `cli-proxy-api.service` 与 `claudex-manager.service`。
 - 创建权限为 `0600` 的 Codex 配置、provider secrets、网关配置和 usage 数据库。
 
-Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端 effort 固定为 `medium`。真实的 GPT 模型和 reasoning effort 由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
+Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端使用 `opus[1m]` 长上下文模式，effort 固定为 `medium`。这里的 Opus 只用于解除 Claude Code 的普通 200K 客户端窗口限制；真实的 GPT 模型和 reasoning effort 仍由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
+
+当前部署使用 ChatGPT/Codex 订阅账号中转，而不是 OpenAI Platform API Key，因此按订阅产品的窗口和 usage 风险配置：Codex 的最大上下文写为 `372000`，但自动 compact 固定在 `244800`；`claudex` 的 auto-compact window 固定为 `250k`。运行 Codex `/status` 应看到 `372K` context window，运行 Claude `/context` 应看到 `claudex-router[1m]` 和 `250k` auto-compact window。
+
+GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) 和 [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) 的模型 API 上限虽然是 1,050,000 Token（最大输入 922,000、最大输出 128,000），但官方同时规定：输入超过 272K 后，整次 API 请求的输入按 2 倍、输出按 1.5 倍计价。订阅账号中转不会直接产生相同形式的 API 账单，OpenAI 也没有公开完全等价的订阅 usage 换算规则；这里仍把 272K 作为保护线，避免长会话过快消耗账号或中转额度。如确实需要一次性使用更长上下文，应先手动 compact 或开启新会话，而不是长期提高默认阈值。
 
 `claudex-ui` 打开的 Codex Routing Desk 只监听 `127.0.0.1:8320`。Instant switch 默认开启；在界面点击 Sol、Terra、Luna 或 reasoning effort 后会立即应用到下一次 Claude 请求。关闭 Instant switch 后可恢复 `Apply selection` 手动确认。所有已打开的 `claudex` 会话都会跟随新路由，不需要重启。
 

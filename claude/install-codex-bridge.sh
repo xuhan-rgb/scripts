@@ -317,7 +317,7 @@ exec env \
   CLAUDE_CODE_SUBAGENT_MODEL=claudex-router \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
-  claude --model claudex-router --effort medium --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
+  claude --model 'opus[1m]' --autocompact 250k --effort medium --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
 ln -sfn claudex "${BIN_DIR}/claudex-yolo"

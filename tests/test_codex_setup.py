@@ -15,6 +15,8 @@ class CodexSetupTests(unittest.TestCase):
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("--prompt-suggestions false", installer)
+        self.assertIn("--model 'opus[1m]'", installer)
+        self.assertIn("--autocompact 250k", installer)
         self.assertIn("extension_args=(--safe-mode)", installer)
         self.assertNotIn("--disable-slash-commands", installer)
         self.assertIn("CLAUDEX_EXTENSIONS", installer)
@@ -62,7 +64,17 @@ class CodexSetupTests(unittest.TestCase):
                 self.assertEqual(completed.returncode, 0, completed.stderr)
                 output = completed.stdout
                 if iteration == 0:
-                    with (home / ".codex" / "config.toml").open("a", encoding="utf-8") as config_file:
+                    config_path = home / ".codex" / "config.toml"
+                    config_path.write_text(
+                        config_path.read_text(encoding="utf-8")
+                        .replace("model_context_window = 372000", "model_context_window = 999999")
+                        .replace(
+                            "model_auto_compact_token_limit = 244800",
+                            "model_auto_compact_token_limit = 999999",
+                        ),
+                        encoding="utf-8",
+                    )
+                    with config_path.open("a", encoding="utf-8") as config_file:
                         config_file.write('\n[plugins."unused@example"]\nenabled = true\n')
 
             config = home / ".codex" / "config.toml"
@@ -71,6 +83,8 @@ class CodexSetupTests(unittest.TestCase):
             bashrc_text = bashrc.read_text(encoding="utf-8")
 
             self.assertIn('model_provider = "crs_local"', config_text)
+            self.assertEqual(config_text.count("model_context_window = 372000"), 1)
+            self.assertEqual(config_text.count("model_auto_compact_token_limit = 244800"), 1)
             self.assertIn("[model_providers.crs_local]", config_text)
             self.assertIn("[mcp_servers.openaiDeveloperDocs]", config_text)
             self.assertIn('[plugins."unused@example"]\nenabled = false', config_text)

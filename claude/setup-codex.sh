@@ -123,6 +123,36 @@ toml_provider_value() {
   ' "${CODEX_CONFIG}"
 }
 
+upsert_top_level_number() {
+  local key="$1"
+  local value="$2"
+  local config_tmp
+  config_tmp="$(mktemp "${CODEX_CONFIG}.tmp.XXXXXX")"
+  awk -v wanted="${key}" -v replacement="${key} = ${value}" '
+    BEGIN { in_prefix = 1 }
+    in_prefix && /^[[:space:]]*\[/ {
+      if (!seen) print replacement
+      seen = 1
+      in_prefix = 0
+    }
+    in_prefix && $0 ~ "^[[:space:]]*" wanted "[[:space:]]*=" {
+      if (!seen) print replacement
+      seen = 1
+      next
+    }
+    { print }
+    END {
+      if (!seen) print replacement
+    }
+  ' "${CODEX_CONFIG}" >"${config_tmp}"
+  if cmp -s "${config_tmp}" "${CODEX_CONFIG}"; then
+    rm -f -- "${config_tmp}"
+  else
+    chmod 600 "${config_tmp}"
+    mv "${config_tmp}" "${CODEX_CONFIG}"
+  fi
+}
+
 if [[ ! -f ${CODEX_CONFIG} ]]; then
   config_tmp="$(mktemp "${CODEX_DIR}/config.toml.tmp.XXXXXX")"
   cat >"${config_tmp}" <<EOF
@@ -158,6 +188,8 @@ EOF
   mv "${config_tmp}" "${CODEX_CONFIG}"
 fi
 chmod 600 "${CODEX_CONFIG}"
+upsert_top_level_number model_context_window 372000
+upsert_top_level_number model_auto_compact_token_limit 244800
 
 ensure_provider() {
   local name="$1"
