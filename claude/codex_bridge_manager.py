@@ -556,7 +556,13 @@ HTML = r'''<!doctype html>
   </main>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>
-    const app = { state: null, draft: null, dirty: false, requests: [] };
+    const app = {
+      state: null,
+      draft: null,
+      dirty: false,
+      requests: [],
+      rendered: {models: '', efforts: '', requests: ''},
+    };
     const $ = (id) => document.getElementById(id);
     const escapeText = (value) => value || '—';
     const escapeHtml = (value) => String(value ?? '').replace(/[&<>"']/g, (character) => ({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;',"'":'&#39;'}[character]));
@@ -575,6 +581,9 @@ HTML = r'''<!doctype html>
       const rows = app.requests;
       $('request-count').textContent = `${app.state.usage.count} captured`;
       $('ledger-state').textContent = app.state.usage.error ? `Collector error: ${app.state.usage.error}` : 'Live metadata · local SQLite';
+      const signature = JSON.stringify(rows);
+      if (app.rendered.requests === signature) return;
+      app.rendered.requests = signature;
       if (!rows.length) {
         $('requests').innerHTML = '<tr class="empty-row"><td colspan="14">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr>';
         return;
@@ -607,15 +616,33 @@ HTML = r'''<!doctype html>
     function render() {
       const state = app.state;
       if (!state) return;
-      $('models').innerHTML = state.models.map((model, index) => `
-        <button class="model-card ${app.draft.model === model.id ? 'active' : ''}" data-model="${model.id}" aria-pressed="${app.draft.model === model.id}">
-          <span class="model-index">0${index + 1} / ${model.id}</span>
-          <span class="model-name">${model.name}</span><span class="model-role">${model.role}</span>
-          <span class="model-desc">${model.description}</span>
-        </button>`).join('');
-      $('models').querySelectorAll('[data-model]').forEach((button) => button.addEventListener('click', () => chooseModel(button.dataset.model)));
-      $('efforts').innerHTML = state.efforts.map((effort) => `<button class="${app.draft.effort === effort ? 'active' : ''}" data-effort="${effort}" aria-pressed="${app.draft.effort === effort}">${effort}</button>`).join('');
-      $('efforts').querySelectorAll('[data-effort]').forEach((button) => button.addEventListener('click', () => chooseEffort(button.dataset.effort)));
+      const modelCatalog = JSON.stringify(state.models);
+      if (app.rendered.models !== modelCatalog) {
+        app.rendered.models = modelCatalog;
+        $('models').innerHTML = state.models.map((model, index) => `
+          <button class="model-card" data-model="${model.id}" aria-pressed="false">
+            <span class="model-index">0${index + 1} / ${model.id}</span>
+            <span class="model-name">${model.name}</span><span class="model-role">${model.role}</span>
+            <span class="model-desc">${model.description}</span>
+          </button>`).join('');
+        $('models').querySelectorAll('[data-model]').forEach((button) => button.addEventListener('click', () => chooseModel(button.dataset.model)));
+      }
+      $('models').querySelectorAll('[data-model]').forEach((button) => {
+        const selected = app.draft.model === button.dataset.model;
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      });
+      const effortCatalog = JSON.stringify(state.efforts);
+      if (app.rendered.efforts !== effortCatalog) {
+        app.rendered.efforts = effortCatalog;
+        $('efforts').innerHTML = state.efforts.map((effort) => `<button data-effort="${effort}" aria-pressed="false">${effort}</button>`).join('');
+        $('efforts').querySelectorAll('[data-effort]').forEach((button) => button.addEventListener('click', () => chooseEffort(button.dataset.effort)));
+      }
+      $('efforts').querySelectorAll('[data-effort]').forEach((button) => {
+        const selected = app.draft.effort === button.dataset.effort;
+        button.classList.toggle('active', selected);
+        button.setAttribute('aria-pressed', String(selected));
+      });
       $('provider-name').textContent = escapeText(state.provider.provider);
       $('base-url').textContent = escapeText(state.provider.base_url);
       $('wire-api').textContent = escapeText(state.provider.wire_api);

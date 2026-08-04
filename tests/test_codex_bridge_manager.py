@@ -41,6 +41,11 @@ payload:
 
 
 class CodexBridgeManagerTests(unittest.TestCase):
+    def test_dashboard_preserves_unchanged_live_sections_between_polls(self):
+        self.assertIn("if (app.rendered.models !== modelCatalog)", manager.HTML)
+        self.assertIn("if (app.rendered.efforts !== effortCatalog)", manager.HTML)
+        self.assertIn("if (app.rendered.requests === signature) return", manager.HTML)
+
     def test_reads_the_dynamically_selected_provider(self):
         with tempfile.TemporaryDirectory() as directory:
             config = Path(directory) / "config.toml"
