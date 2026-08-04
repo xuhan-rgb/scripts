@@ -10,25 +10,21 @@
 bash claude/install-codex-bridge.sh
 ```
 
-脚本会安装固定版本的 CLIProxyAPI user service。每次启动 `claudex` 时，它会读取 `~/.codex/config.toml` 当前的 `model_provider`，再从对应的 `[model_providers.<name>]` 读取 `base_url`、`wire_api` 和 `env_key`。因此 Codex 切换 provider 后，Claude 会自动使用新的连接配置；provider 的 `env_key` 必须已导出到当前 shell。模型与思考强度由本服务独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
+脚本会安装固定版本的 CLIProxyAPI user service。每次启动 `claudex` 时，它会读取 `~/.codex/config.toml` 当前的 `model_provider`，再从对应的 `[model_providers.<name>]` 读取 `base_url`、`wire_api` 和 `env_key`。因此 Codex 切换 provider 后，Claude 会自动使用新的连接配置；provider 的 `env_key` 必须已导出到当前 shell。
+
+Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端 effort 固定为 `medium`。真实的 GPT 模型和 reasoning effort 由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
 
 ```bash
 claudex       # 正常权限确认
 claudex-yolo  # 跳过权限确认
-claudex --pick  # 启动前交互选择模型和思考强度
 claudex-ui    # 打开本地可视化控制台
 ```
 
-Claude 的 Opus、Sonnet、Haiku 档位分别映射到 Sol、Terra、Luna。脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
+`claudex-ui` 打开的 Codex Routing Desk 只监听 `127.0.0.1:8320`。在界面选择 Sol、Terra 或 Luna，以及 `low`、`medium`、`high`、`xhigh`、`max` 后保存，所有通过该本地网关的 Claude 会话会从下一次请求开始使用新路由，不需要重启。首次从旧版三模型入口升级到 `claudex-router` 时，需要重新启动一次已有 Claude 会话。
 
-在 Claude Code 中输入 `/model` 可在三个 GPT 模型间选择，并在模型选择器底部用 `←/→` 调整思考强度；也可以输入 `/effort` 单独调整。三个模型共同支持 `low`、`medium`、`high`、`xhigh` 和 `max`。启动前指定选择的示例：
+控制台的 Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、输入/输出 token、推理 token、缓存读取/创建、命中率、TTFT、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
 
-```bash
-claudex --gpt-model gpt-5.6-terra --gpt-effort high
-claudex-yolo --gpt-model gpt-5.6-luna --gpt-effort medium
-```
-
-`claudex-ui` 打开的 Codex Routing Desk 只监听 `127.0.0.1:8320`。界面可持久切换模型与 effort、查看当前 Codex provider 和网关健康状态；保存结果用于后续新开的 Claude 会话，已经运行的会话仍使用 `/model` 或 `/effort` 切换。
+脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
 
 ## 桌面工具
 

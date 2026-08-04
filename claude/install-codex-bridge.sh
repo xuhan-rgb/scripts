@@ -5,6 +5,7 @@ readonly CLIPROXY_VERSION="${CLIPROXY_VERSION:-7.2.116}"
 readonly SERVICE_NAME="cli-proxy-api.service"
 readonly MANAGER_SERVICE_NAME="claudex-manager.service"
 readonly STATE_DIR="${HOME}/.cli-proxy-api"
+readonly MANAGEMENT_ENV_FILE="${STATE_DIR}/management.env"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly LIB_DIR="${HOME}/.local/lib/claudex"
 readonly UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
@@ -27,7 +28,7 @@ fi
 
 [[ ${CLIPROXY_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid CLIPROXY_VERSION"
 
-for command_name in awk cmp cp curl date grep install mktemp mv printenv python3 readlink sed sha256sum sort systemctl tar; do
+for command_name in awk cmp cp curl date flock grep install mktemp mv printenv python3 readlink sed sha256sum sort systemctl tar; do
   require_command "${command_name}"
 done
 
@@ -50,6 +51,15 @@ cleanup() {
   rm -rf -- "${tmp_dir}"
 }
 trap cleanup EXIT
+
+if [[ ! -f ${MANAGEMENT_ENV_FILE} ]]; then
+  management_password="$(python3 -c 'import secrets; print(secrets.token_hex(32))')"
+  printf 'MANAGEMENT_PASSWORD=%s\n' "${management_password}" >"${tmp_dir}/management.env"
+  install -m 0600 "${tmp_dir}/management.env" "${MANAGEMENT_ENV_FILE}"
+fi
+chmod 600 "${MANAGEMENT_ENV_FILE}"
+grep -qE '^MANAGEMENT_PASSWORD=[0-9a-f]{64}$' "${MANAGEMENT_ENV_FILE}" \
+  || fail "invalid management credential file: ${MANAGEMENT_ENV_FILE}"
 
 binary_file="${BIN_DIR}/cli-proxy-api"
 if [[ ! -x ${binary_file} ]] || ! "${binary_file}" -h 2>&1 | grep -q "Version: ${CLIPROXY_VERSION}"; then
@@ -80,6 +90,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 WorkingDirectory=%h/.cli-proxy-api
+EnvironmentFile=%h/.cli-proxy-api/management.env
 ExecStart=%h/.local/bin/cli-proxy-api -config %h/.cli-proxy-api/config.yaml -local-model
 Restart=on-failure
 RestartSec=3
@@ -97,6 +108,7 @@ set -euo pipefail
 readonly STATE_DIR="${HOME}/.cli-proxy-api"
 readonly CONFIG_FILE="${STATE_DIR}/config.yaml"
 readonly SELECTION_FILE="${STATE_DIR}/selection.conf"
+readonly LOCK_FILE="${STATE_DIR}/selection.lock"
 readonly CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_CONFIG="${CODEX_DIR}/config.toml"
 
@@ -153,6 +165,9 @@ codex_effort="$(toml_top_value model_reasoning_effort)"
 
 mkdir -p "${STATE_DIR}"
 chmod 700 "${STATE_DIR}"
+exec 9>"${LOCK_FILE}"
+chmod 600 "${LOCK_FILE}"
+flock -x 9
 if [[ ! -f ${SELECTION_FILE} ]]; then
   case "${codex_model}" in
     gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna) initial_model="${codex_model}" ;;
@@ -214,7 +229,8 @@ api-keys:
 
 debug: false
 logging-to-file: false
-usage-statistics-enabled: false
+usage-statistics-enabled: true
+redis-usage-queue-retention-seconds: 3600
 disable-image-generation: true
 
 # Ignore stale OAuth files; requests use the API-key provider selected by Codex.
@@ -226,15 +242,21 @@ codex-api-key:
   - api-key: "$(yaml_escape "${api_key}")"
     base-url: "$(yaml_escape "${base_url}")"
     models:
-      - name: "gpt-5.6-sol"
-        alias: "gpt-5.6-sol"
-        display-name: "GPT 5.6 Sol"
-      - name: "gpt-5.6-terra"
-        alias: "gpt-5.6-terra"
-        display-name: "GPT 5.6 Terra"
-      - name: "gpt-5.6-luna"
-        alias: "gpt-5.6-luna"
-        display-name: "GPT 5.6 Luna"
+      - name: "${model}" # claudex-route-model
+        alias: "claudex-router"
+        display-name: "Claude GPT Router"
+        force-mapping: true
+        thinking:
+          levels: ["max", "xhigh", "high", "medium", "low"]
+
+payload:
+  override:
+    - models:
+        - name: "${model}" # claudex-effort-model
+          protocol: "codex"
+          from-protocol: "claude"
+      params:
+        "reasoning.effort": "${effort}" # claudex-route-effort
 YAML
 chmod 600 "${tmp_config}"
 
@@ -263,90 +285,22 @@ if [[ $(basename "$0") == "claudex-yolo" ]]; then
   extra_args+=(--dangerously-skip-permissions)
 fi
 
-usage() {
-  printf '%s\n' \
-    'Usage: claudex [--pick] [--gpt-model MODEL] [--gpt-effort EFFORT] [-- CLAUDE_ARGS...]' \
-    'Models: gpt-5.6-sol, gpt-5.6-terra, gpt-5.6-luna' \
-    'Effort: low, medium, high, xhigh, max'
-}
-
-selected_model=""
-selected_effort=""
-pick=false
-while [[ $# -gt 0 ]]; do
-  case "$1" in
-    --pick)
-      pick=true
-      shift
-      ;;
-    --gpt-model)
-      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-      selected_model="$2"
-      shift 2
-      ;;
-    --gpt-effort)
-      [[ $# -ge 2 ]] || { usage >&2; exit 2; }
-      selected_effort="$2"
-      shift 2
-      ;;
-    --gpt-help)
-      usage
-      exit 0
-      ;;
-    --)
-      shift
-      break
-      ;;
-    *) break ;;
-  esac
-done
-
 sync_output="$("${HOME}/.local/bin/claude-codex-sync")"
 mapfile -t active_route <<<"${sync_output}"
 [[ ${#active_route[@]} -ge 3 ]] || { printf 'Failed to read the active route.\n' >&2; exit 1; }
-
-if [[ ${pick} == true ]]; then
-  models=(gpt-5.6-sol gpt-5.6-terra gpt-5.6-luna)
-  efforts=(low medium high xhigh max)
-  printf 'Select GPT model (current: %s):\n' "${active_route[0]}"
-  select choice in "${models[@]}"; do
-    [[ -n ${choice} ]] && { selected_model="${choice}"; break; }
-  done
-  printf 'Select reasoning effort (current: %s):\n' "${active_route[1]}"
-  select choice in "${efforts[@]}"; do
-    [[ -n ${choice} ]] && { selected_effort="${choice}"; break; }
-  done
-fi
-
-model="${selected_model:-${CLAUDEX_MODEL:-${active_route[0]}}}"
-effort="${selected_effort:-${CLAUDEX_EFFORT:-${active_route[1]}}}"
-case "${model}" in
-  gpt-5.6-sol | gpt-5.6-terra | gpt-5.6-luna) ;;
-  *)
-    printf 'Unsupported model: %s\n' "${model}" >&2
-    exit 2
-    ;;
-esac
-case "${effort}" in
-  low | medium | high | xhigh | max) ;;
-  *)
-    printf 'Unsupported effort: %s\n' "${effort}" >&2
-    exit 2
-    ;;
-esac
 
 exec env \
   -u NO_COLOR \
   -u CLAUDE_CODE_AUTO_COMPACT_WINDOW \
   ANTHROPIC_BASE_URL=http://127.0.0.1:8317 \
   ANTHROPIC_AUTH_TOKEN=claudex-local \
-  ANTHROPIC_DEFAULT_OPUS_MODEL=gpt-5.6-sol \
-  ANTHROPIC_DEFAULT_SONNET_MODEL=gpt-5.6-terra \
-  ANTHROPIC_DEFAULT_HAIKU_MODEL=gpt-5.6-luna \
-  CLAUDE_CODE_SUBAGENT_MODEL=gpt-5.6-terra \
+  ANTHROPIC_DEFAULT_OPUS_MODEL=claudex-router \
+  ANTHROPIC_DEFAULT_SONNET_MODEL=claudex-router \
+  ANTHROPIC_DEFAULT_HAIKU_MODEL=claudex-router \
+  CLAUDE_CODE_SUBAGENT_MODEL=claudex-router \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
-  claude --model "${model}" --effort "${effort}" "${extra_args[@]}" "$@"
+  claude --model claudex-router --effort medium "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
 ln -sfn claudex "${BIN_DIR}/claudex-yolo"
@@ -360,6 +314,7 @@ Wants=cli-proxy-api.service
 [Service]
 Type=simple
 WorkingDirectory=%h/.local/lib/claudex
+EnvironmentFile=%h/.cli-proxy-api/management.env
 ExecStart=/usr/bin/env python3 %h/.local/lib/claudex/codex_bridge_manager.py
 Restart=on-failure
 RestartSec=3
@@ -422,7 +377,7 @@ actual_models="$(printf '%s' "${models_json}" \
   | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
   | sed -E 's/.*"([^"]+)"$/\1/' \
   | sort)"
-expected_models="$(printf '%s\n' gpt-5.6-luna gpt-5.6-sol gpt-5.6-terra | sort)"
+expected_models="claudex-router"
 [[ ${actual_models} == "${expected_models}" ]] || {
   printf 'Expected models:\n%s\n' "${expected_models}" >&2
   printf 'Visible models:\n%s\n' "${actual_models}" >&2
@@ -435,5 +390,5 @@ printf 'Active route: provider=%s model=%s effort=%s\n' \
 if ! command -v claude >/dev/null 2>&1; then
   printf 'warning: Claude Code is not installed; install it before running claudex.\n' >&2
 fi
-printf 'Launch with: claudex, claudex --pick, or claudex-yolo\n'
+printf 'Launch with: claudex or claudex-yolo\n'
 printf 'Open the visual model switcher with: claudex-ui\n'

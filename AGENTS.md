@@ -73,7 +73,7 @@ python convert_trt.py
 ```text
 .
 |- claude/install-codex-bridge.sh     # 跟随本地 Codex provider 的 Claude Code 桥接服务
-|- claude/codex_bridge_manager.py     # 本地模型与 effort 可视化控制台
+|- claude/codex_bridge_manager.py     # 实时模型路由与逐请求 usage 可视化控制台
 |- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置
 |- get_onnx_dependencies.py  # 动态库与 onnxruntime CUDA provider 依赖诊断
 |- test_onnx_env.py          # 最小 ONNX Runtime CUDA 推理验证
@@ -96,7 +96,7 @@ python convert_trt.py
 
 ## 维护约定
 
-- 修改 Codex 桥接脚本后运行 `bash -n`；不得把 provider API key 写入仓库。
+- 修改 Codex 桥接脚本后运行 `bash -n`；不得把 provider API key、管理密钥或 usage 数据库写入仓库。
 - 修改桌面安装脚本后运行 `bash -n`；已安装的依赖必须跳过，缺失依赖必须能够自动安装。
 - 保持脚本直接可运行，不引入框架、命令行包装或配置层，除非需求明确要求。
 - 修改 `TensorRTModel` 时，同时核对 ONNX 构建路径、已有 engine 加载路径和多输出返回行为。
