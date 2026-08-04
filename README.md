@@ -57,7 +57,7 @@ bash claude/install-codex-bridge.sh
 
 ```bash
 alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
-alias claude-yolo="claude --dangerously-skip-permissions --disable-slash-commands --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'"
+alias claude-yolo='claude --dangerously-skip-permissions --safe-mode'
 alias claudex-yolo='claudex --dangerously-skip-permissions'
 ```
 
@@ -123,7 +123,7 @@ Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端 e
 为了降低新会话的固定上下文，安装器默认关闭 Codex 与 Claude 的自定义 skills、plugins 和 MCP，但不会卸载或删除它们：
 
 - Codex 的每个 MCP/plugin section 会写为 `enabled = false`，已发现的 skill 会通过 `[[skills.config]]` 按绝对路径禁用；修改 `~/.codex/config.toml` 后重启 Codex 即可生效。
-- Claude 已安装插件会通过官方 `claude plugin disable` 关闭；`claude-yolo` 和 `claudex` 还会使用 `--disable-slash-commands --strict-mcp-config`，避免项目级 MCP 或本地 skill 自动进入上下文。
+- Claude 已安装插件会通过官方 `claude plugin disable` 关闭；`claude-yolo` 和 `claudex` 默认使用官方 `--safe-mode`，关闭自定义 skills、plugins、hooks、MCP 和自定义命令，但保留 `/clear`、`/compact` 等内置命令。
 - 临时需要 Claude GPT 中转的扩展时，使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`；官方 Claude 可先执行 `claude plugin enable <plugin@marketplace>`，再直接运行 `claude`。
 - Codex 需要单个 MCP 时，可在对应 `[mcp_servers.<name>]` 下把 `enabled` 改回 `true`；需要单个 skill 时，把对应 `[[skills.config]]` 的 `enabled` 改回 `true`，然后启动新会话。
 
@@ -135,7 +135,7 @@ Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模�
 
 延迟排查时优先比较“首 Token / 总耗时”：两者都高通常是上游网络、模型排队或上下文过长；首 Token 正常而总耗时高通常是回答生成较长。Claude 会在每轮携带会话上下文，即使缓存命中率很高，过长上下文仍可能增加模型处理时间；可使用 Claude 的 `/compact`，或在不再需要旧上下文时开启新会话。切换到 Luna 或降低 reasoning effort 可能更快，但应以该 provider 上实际记录的 TTFT 为准。
 
-Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的原始总输入可能仍有数万 Token。界面把它拆成“输入”和“缓存读取”：两者相加才是上游返回的原始输入总量。需要隔离排查时可运行 `claudex-yolo --safe-mode`：它保留认证、模型、内置工具和权限，但临时禁用自定义 plugins、MCP、skills、hooks 与 `CLAUDE.md`，不会修改现有配置或登录状态。
+Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的原始总输入可能仍有数万 Token。界面把它拆成“输入”和“缓存读取”：两者相加才是上游返回的原始输入总量。`claude-yolo` 与 `claudex-yolo` 默认安全模式不会修改现有配置或登录状态；临时需要完整自定义扩展时，中转使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`，官方 Claude 使用 `claude --dangerously-skip-permissions`。
 
 脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
 

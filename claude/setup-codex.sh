@@ -53,7 +53,7 @@ update_bashrc() {
 # >>> scripts AI yolo aliases >>>
 [ -f "$HOME/.config/codex/secrets.env" ] && source "$HOME/.config/codex/secrets.env"
 alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
-alias claude-yolo="claude --dangerously-skip-permissions --disable-slash-commands --strict-mcp-config --mcp-config '{\"mcpServers\":{}}'"
+alias claude-yolo='claude --dangerously-skip-permissions --safe-mode'
 alias claudex-yolo='claudex --dangerously-skip-permissions'
 # <<< scripts AI yolo aliases <<<
 EOF

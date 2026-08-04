@@ -514,17 +514,17 @@ HTML = r'''<!doctype html>
     .fact { display: grid; grid-template-columns: 78px 1fr; gap: 10px; padding-top: 12px; border-top: 1px solid var(--line); }
     .fact dt { color: var(--ink-soft); font: 700 10px "DejaVu Sans Mono", monospace; text-transform: uppercase; }
     .fact dd { margin: 0; overflow-wrap: anywhere; font: 12px/1.45 "DejaVu Sans Mono", monospace; }
-    .commit { padding: 20px; background: var(--ink); color: var(--panel); border-color: var(--ink); }
-    .commit h3 { margin: 0; font-size: 16px; }
-    .commit p { margin: 8px 0 14px; color: #bfcac9; font-size: 12px; line-height: 1.55; }
+    .commit { padding: 16px 18px; background: var(--ink); color: var(--panel); border-color: var(--ink); }
+    .commit-head { display: flex; align-items: center; justify-content: space-between; gap: 14px; }
+    .commit h3 { margin: 0; font-size: 14px; }
     .instant {
       display: flex;
       align-items: center;
       justify-content: space-between;
       gap: 14px;
       width: 100%;
-      margin-bottom: 12px;
-      padding: 10px 12px;
+      margin-top: 12px;
+      padding: 9px 11px;
       color: #dce5e3;
       background: #202f32;
       border: 1px solid #46575a;
@@ -533,17 +533,15 @@ HTML = r'''<!doctype html>
       text-align: left;
     }
     .instant:hover { border-color: #718285; }
-    .instant-copy strong, .instant-copy small { display: block; }
     .instant-copy strong { font-size: 12px; }
-    .instant-copy small { margin-top: 3px; color: #94a3a1; font-size: 10px; }
     .instant-switch { position: relative; flex: 0 0 38px; height: 22px; border-radius: 20px; background: #536164; transition: background .18s ease; }
     .instant-switch::after { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #dce5e3; content: ""; transition: transform .18s ease; }
     .instant[aria-pressed="true"] .instant-switch { background: var(--teal); }
     .instant[aria-pressed="true"] .instant-switch::after { transform: translateX(16px); }
-    .save { width: 100%; padding: 13px 16px; border: 0; border-radius: 11px; color: #1c2527; background: var(--signal); cursor: pointer; font-weight: 900; transition: filter .15s ease, transform .15s ease; }
+    .save { width: 100%; margin-top: 10px; padding: 11px 16px; border: 0; border-radius: 11px; color: #1c2527; background: var(--signal); cursor: pointer; font-weight: 900; transition: filter .15s ease, transform .15s ease; }
     .save:hover { filter: brightness(1.07); transform: translateY(-1px); }
     .save:disabled { color: #74807f; background: #435154; cursor: default; transform: none; }
-    .save-state { margin-top: 11px; min-height: 18px; color: #8f9d9b; font: 11px "DejaVu Sans Mono", monospace; }
+    .save-state { color: #8f9d9b; font: 10px "DejaVu Sans Mono", monospace; white-space: nowrap; }
     .usage { margin-top: 18px; }
     .usage-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin: 0 2px 10px; }
     .usage-head h2 { margin: 0; font-size: 15px; }
@@ -651,14 +649,12 @@ HTML = r'''<!doctype html>
           </dl>
         </section>
         <section class="panel commit">
-          <h3>Apply live GPT route</h3>
-          <p>Claude keeps one stable client model. Saving here reroutes the next request from every active Claude session.</p>
+          <div class="commit-head"><h3>Live route</h3><span id="save-state" class="save-state">Waiting…</span></div>
           <button id="instant" class="instant" type="button" aria-pressed="true">
-            <span class="instant-copy"><strong>Instant switch</strong><small>Apply on model or effort click</small></span>
+            <span class="instant-copy"><strong>Instant switch</strong></span>
             <span class="instant-switch" aria-hidden="true"></span>
           </button>
-          <button id="save" class="save" disabled>Saved</button>
-          <div id="save-state" class="save-state">Waiting for state…</div>
+          <button id="save" class="save" type="button" hidden disabled>Apply selection</button>
         </section>
       </aside>
     </div>
@@ -852,9 +848,10 @@ HTML = r'''<!doctype html>
       $('pulse').classList.toggle('good', healthy);
       $('health').textContent = healthy ? 'Gateway online · 127.0.0.1:8317' : 'Gateway unavailable';
       $('instant').setAttribute('aria-pressed', String(app.autoApply));
+      $('save').hidden = app.autoApply;
       $('save').disabled = app.saving || !app.dirty;
       $('save').textContent = app.saving ? 'Applying…' : app.dirty ? 'Apply selection' : 'Saved';
-      $('save-state').textContent = app.saving ? `Applying: ${app.draft.model} · ${app.draft.effort}` : app.dirty ? `${app.draft.model} · ${app.draft.effort}` : `Live: ${app.draft.model} · ${app.draft.effort}`;
+      $('save-state').textContent = app.saving ? 'Applying…' : `${app.draft.model} · ${app.draft.effort}`;
       renderUsage();
       renderRequests();
     }

@@ -297,7 +297,7 @@ extra_args=()
 if [[ $(basename "$0") == "claudex-yolo" ]]; then
   extra_args+=(--dangerously-skip-permissions)
 fi
-extension_args=(--disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}')
+extension_args=(--safe-mode)
 if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
   extension_args=()
 fi

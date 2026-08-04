@@ -51,6 +51,8 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("id=\"instant\"", manager.HTML)
         self.assertIn("localStorage.getItem('claudex-instant-switch') !== 'false'", manager.HTML)
         self.assertIn("if (app.autoApply) scheduleSave()", manager.HTML)
+        self.assertIn("$('save').hidden = app.autoApply", manager.HTML)
+        self.assertNotIn("Claude keeps one stable client model", manager.HTML)
 
     def test_dashboard_renders_usage_periods_and_ttft_incrementally(self):
         self.assertIn('id="usage-day-total"', manager.HTML)

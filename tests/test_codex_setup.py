@@ -15,7 +15,8 @@ class CodexSetupTests(unittest.TestCase):
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("--prompt-suggestions false", installer)
-        self.assertIn("--disable-slash-commands --strict-mcp-config", installer)
+        self.assertIn("extension_args=(--safe-mode)", installer)
+        self.assertNotIn("--disable-slash-commands", installer)
         self.assertIn("CLAUDEX_EXTENSIONS", installer)
 
     def test_fresh_setup_is_idempotent_and_keeps_claude_login_separate(self):
@@ -93,7 +94,8 @@ class CodexSetupTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertIn("--disable-slash-commands --strict-mcp-config", bashrc_text)
+            self.assertIn("alias claude-yolo='claude --dangerously-skip-permissions --safe-mode'", bashrc_text)
+            self.assertNotIn("--disable-slash-commands", bashrc_text)
             self.assertLess(output.index("[1/3]"), output.index("[2/3]"))
             self.assertFalse((home / ".claude").exists())
 
