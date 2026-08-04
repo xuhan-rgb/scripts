@@ -57,7 +57,7 @@ bash claude/install-codex-bridge.sh
 
 ```bash
 alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
-alias claude-yolo='claude --dangerously-skip-permissions --safe-mode'
+alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
 alias claudex-yolo='claudex --dangerously-skip-permissions'
 ```
 
@@ -91,7 +91,7 @@ claudex-yolo      # GPT 中转，跳过确认
 claudex-ui        # 打开本地路由控制台
 ```
 
-`claude-yolo` 直接调用官方 `claude`，不会修改登录状态或 `~/.claude`；它不传入 `--autocompact`，因此使用 Claude 官方默认的自动 compact 阈值和账号模型。只有 `claudex`/`claudex-yolo` 会为当前进程注入本地 GPT 网关环境。安装器不替换 `claude`，也不调用 `claude login/logout`。
+`claude-yolo` 直接调用官方 `claude`，不会修改登录状态或账号凭据；它不传入 `--autocompact`，因此使用 Claude 官方默认的自动 compact 阈值和账号模型。只有 `claudex`/`claudex-yolo` 会为当前进程注入本地 GPT 网关环境。安装器不替换 `claude`，也不调用 `claude login/logout`。两个 Claude 启动命令都会保留 `~/.claude/CLAUDE.md` 和当前项目层级的 `CLAUDE.md`。
 
 #### 4. Provider 日常管理
 
@@ -124,12 +124,12 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 `claudex` 默认传入 `--prompt-suggestions false`，避免 Claude Code 在主回答结束后再调用一次 GPT 生成“下一条建议”，减少每轮额外的上下文 Token 和后台等待；如确实需要该功能，可用 `claudex-yolo --prompt-suggestions true` 临时恢复。
 
-为了降低新会话的固定上下文，安装器默认关闭 Codex 与 Claude 的自定义 skills、plugins 和 MCP，但不会卸载或删除它们：
+为了降低新会话的固定上下文，安装器默认关闭不需要的 Codex 与 Claude 自定义 skills、plugins 和 MCP，但不会卸载或删除它们。默认只开启三个通用编程 Skill：`dev-plan`、`project-audit`、`document-project`：
 
-- Codex 的每个 MCP/plugin section 会写为 `enabled = false`，已发现的 skill 会通过 `[[skills.config]]` 按绝对路径禁用；修改 `~/.codex/config.toml` 后重启 Codex 即可生效。
-- Claude 已安装插件会通过官方 `claude plugin disable` 关闭；`claude-yolo` 和 `claudex` 默认使用官方 `--safe-mode`，关闭自定义 skills、plugins、hooks、MCP 和自定义命令，但保留 `/clear`、`/compact` 等内置命令。
-- 临时需要 Claude GPT 中转的扩展时，使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`；官方 Claude 可先执行 `claude plugin enable <plugin@marketplace>`，再直接运行 `claude`。
-- Codex 需要单个 MCP 时，可在对应 `[mcp_servers.<name>]` 下把 `enabled` 改回 `true`；需要单个 skill 时，把对应 `[[skills.config]]` 的 `enabled` 改回 `true`，然后启动新会话。
+- Codex 的每个 MCP/plugin section 会写为 `enabled = false`，默认 Skill 会通过 `[[skills.config]]` 按绝对路径只开启上述三个；修改 `~/.codex/config.toml` 后重启 Codex 即可生效。
+- Claude 的已安装插件会通过官方 `claude plugin disable` 关闭；`~/.claude/settings.json` 的 `skillOverrides` 会把上述三个设为 `on`，其余已发现 Skill 设为 `off`。Claude 启动器使用 `--strict-mcp-config`，不会读取用户、项目或全局 MCP 配置，但不会使用 `--safe-mode`，所以两层 `CLAUDE.md` 仍然生效。
+- 临时需要 Claude 读取已有 MCP 配置时，使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`；这会取消本地中转进程的严格 MCP 限制，Skill 仍以 `skillOverrides` 为准。
+- Claude 需要临时打开其他 Skill 时，在 `~/.claude/settings.json` 的 `skillOverrides` 中将对应名称改为 `on`；Codex 则在 `~/.codex/config.toml` 中将对应 `[[skills.config]]` 的 `enabled` 改为 `true`，然后启动新会话。
 
 首次关闭扩展前，安装器会各保留一份固定备份：Codex 配置使用 `*.before-disabled-extensions`，Claude 设置使用 `~/.claude/settings.json.before-disabled-extensions`。重复安装不会继续堆积备份。
 
@@ -139,7 +139,7 @@ Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模�
 
 延迟排查时优先比较“首 Token / 总耗时”：两者都高通常是上游网络、模型排队或上下文过长；首 Token 正常而总耗时高通常是回答生成较长。Claude 会在每轮携带会话上下文，即使缓存命中率很高，过长上下文仍可能增加模型处理时间；可使用 Claude 的 `/compact`，或在不再需要旧上下文时开启新会话。切换到 Luna 或降低 reasoning effort 可能更快，但应以该 provider 上实际记录的 TTFT 为准。
 
-Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的原始总输入可能仍有数万 Token。界面把它拆成“输入”和“缓存读取”：两者相加才是上游返回的原始输入总量。`claude-yolo` 与 `claudex-yolo` 默认安全模式不会修改现有配置或登录状态；临时需要完整自定义扩展时，中转使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`，官方 Claude 使用 `claude --dangerously-skip-permissions`。
+Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的原始总输入可能仍有数万 Token。界面把它拆成“输入”和“缓存读取”：两者相加才是上游返回的原始输入总量。`claude-yolo` 与 `claudex-yolo` 默认保留用户级和项目级 `CLAUDE.md`，只按 allowlist 加载通用编程 Skill，并严格关闭 MCP；临时需要中转读取已有 MCP 配置时使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`。
 
 脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
 

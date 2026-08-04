@@ -1,3 +1,4 @@
+import json
 import os
 import subprocess
 import tempfile
@@ -23,9 +24,19 @@ class CodexSetupTests(unittest.TestCase):
         self.assertIn("availableModels", installer)
         self.assertNotIn("ANTHROPIC_DEFAULT_SONNET_MODEL", installer)
         self.assertNotIn("ANTHROPIC_DEFAULT_HAIKU_MODEL", installer)
-        self.assertIn("extension_args=(--safe-mode)", installer)
-        self.assertNotIn("--disable-slash-commands", installer)
+        self.assertIn("extension_args=(--strict-mcp-config)", installer)
+        self.assertNotIn("--safe-mode", installer)
         self.assertIn("CLAUDEX_EXTENSIONS", installer)
+
+    def test_default_skill_allowlist_preserves_claude_memory_files(self):
+        setup = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn('DEFAULT_CLAUDE_SKILLS="dev-plan project-audit document-project"', setup)
+        self.assertIn('alias claude-yolo=\'claude --dangerously-skip-permissions --strict-mcp-config\'', setup)
+        self.assertIn('settings["skillOverrides"] = overrides', setup)
+        self.assertIn("enabled = true", setup)
+        self.assertIn("codex_skill_is_default", setup)
+        self.assertNotIn("--safe-mode", setup)
 
     def test_fresh_setup_is_idempotent_and_keeps_claude_login_separate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -34,6 +45,20 @@ class CodexSetupTests(unittest.TestCase):
             skill = home / ".agents" / "skills" / "example" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("---\nname: example\n---\n", encoding="utf-8")
+            for skill_name in ("dev-plan", "project-audit", "document-project", "unused"):
+                skill_file = home / ".agents" / "skills" / skill_name / "SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text(
+                    f"---\nname: {skill_name}\n---\n",
+                    encoding="utf-8",
+                )
+            for skill_name in ("dev-plan", "project-audit", "document-project", "unused"):
+                skill_file = home / ".claude" / "skills" / skill_name / "SKILL.md"
+                skill_file.parent.mkdir(parents=True, exist_ok=True)
+                skill_file.write_text(
+                    f"---\nname: {skill_name}\n---\n",
+                    encoding="utf-8",
+                )
             bashrc.write_text(
                 "# keep this line\n"
                 "alias codex-yolo='old-codex-command'\n"
@@ -97,10 +122,32 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn("enabled = false", config_text)
             self.assertIn(str(skill), config_text)
             self.assertIn("[[skills.config]]", config_text)
+            self.assertIn(
+                'path = "' + str(home / ".agents" / "skills" / "dev-plan" / "SKILL.md") + '"\nenabled = true',
+                config_text,
+            )
+            self.assertIn(
+                'path = "' + str(home / ".agents" / "skills" / "project-audit" / "SKILL.md") + '"\nenabled = true',
+                config_text,
+            )
+            self.assertIn(
+                'path = "' + str(home / ".agents" / "skills" / "document-project" / "SKILL.md") + '"\nenabled = true',
+                config_text,
+            )
+            self.assertNotIn(
+                'path = "' + str(home / ".agents" / "skills" / "unused" / "SKILL.md") + '"\nenabled = true',
+                config_text,
+            )
             self.assertNotIn(secret_value, config_text)
             self.assertIn(secret_value, secrets.read_text(encoding="utf-8"))
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertEqual(secrets.stat().st_mode & 0o777, 0o600)
+            settings = home / ".claude" / "settings.json"
+            settings_data = json.loads(settings.read_text(encoding="utf-8"))
+            self.assertEqual(settings_data["skillOverrides"]["dev-plan"], "on")
+            self.assertEqual(settings_data["skillOverrides"]["project-audit"], "on")
+            self.assertEqual(settings_data["skillOverrides"]["document-project"], "on")
+            self.assertEqual(settings_data["skillOverrides"]["unused"], "off")
             self.assertEqual(bashrc_text.count("alias codex-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claude-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claudex-yolo="), 1)
@@ -114,10 +161,10 @@ class CodexSetupTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertIn("alias claude-yolo='claude --dangerously-skip-permissions --safe-mode'", bashrc_text)
-            self.assertNotIn("--disable-slash-commands", bashrc_text)
+            self.assertIn("alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'", bashrc_text)
+            self.assertNotIn("--safe-mode", bashrc_text)
             self.assertLess(output.index("[1/3]"), output.index("[2/3]"))
-            self.assertFalse((home / ".claude").exists())
+            self.assertTrue((home / ".claude" / "settings.json").exists())
 
 
 if __name__ == "__main__":

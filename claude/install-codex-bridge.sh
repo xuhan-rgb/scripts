@@ -297,7 +297,7 @@ extra_args=()
 if [[ $(basename "$0") == "claudex-yolo" ]]; then
   extra_args+=(--dangerously-skip-permissions)
 fi
-extension_args=(--safe-mode)
+extension_args=(--strict-mcp-config)
 if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
   extension_args=()
 fi
@@ -417,4 +417,4 @@ printf 'Launch with: claudex or claudex-yolo\n'
 printf 'Open the visual model switcher with: claudex-ui\n'
 printf 'Reload aliases with: source ~/.bashrc\n'
 printf 'Normal claude login is unchanged; claude-yolo uses the normal account, claudex-yolo uses the GPT bridge.\n'
-printf 'Custom MCP, plugins, and skills default to disabled; see README.md to re-enable them.\n'
+printf 'MCP and unused skills default to disabled; dev-plan, project-audit, and document-project are enabled.\n'
