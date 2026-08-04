@@ -2,8 +2,9 @@
 
 ## 项目概览
 
-这是一个面向 NVIDIA GPU 服务器的轻量 Python 工具集，用于：
+这是一个面向 Linux 桌面与 NVIDIA GPU 服务器的轻量脚本工具集，用于：
 
+- 安装 Flameshot 相关依赖并配置 GNOME 截图快捷键。
 - 诊断 CUDA、cuDNN 与 ONNX Runtime GPU 动态库环境。
 - 生成最小 ONNX 模型并验证 ONNX Runtime 的 CUDA Provider。
 - 将静态 ONNX 模型构建或加载为 TensorRT engine，再以 NumPy 数组执行推理。
@@ -14,6 +15,8 @@
 ## 环境要求
 
 运行 TensorRT 相关脚本前，主机须已具备兼容版本的 NVIDIA 驱动、CUDA、cuDNN 和 TensorRT。Python 依赖按脚本分组如下：
+
+桌面脚本仅支持使用 APT 的 Ubuntu/Debian GNOME 环境。它会自动安装缺失的 Flameshot、剪贴板和桌面组件；所有依赖均已存在时不得刷新 APT 索引。
 
 | 工作流 | Python 依赖 |
 | --- | --- |
@@ -27,6 +30,12 @@
 ## 常用命令
 
 ```bash
+# 检查并安装 Flameshot 依赖，配置 Alt+A 与 Alt+S
+bash desktop/install-flameshot-shortcuts.sh
+
+# Shell 语法检查；不会修改系统或桌面配置
+bash -n desktop/install-flameshot-shortcuts.sh
+
 # 仅做 Python 语法检查；不需要 CUDA 或第三方库
 python -m py_compile test_onnx_env.py get_onnx_dependencies.py tensorrt_inference.py convert_trt.py
 
@@ -53,6 +62,7 @@ python convert_trt.py
 
 ```text
 .
+|- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置
 |- get_onnx_dependencies.py  # 动态库与 onnxruntime CUDA provider 依赖诊断
 |- test_onnx_env.py          # 最小 ONNX Runtime CUDA 推理验证
 |- tensorrt_inference.py     # TensorRTModel 引擎构建、加载、推理与释放
@@ -73,6 +83,7 @@ python convert_trt.py
 
 ## 维护约定
 
+- 修改桌面安装脚本后运行 `bash -n`；已安装的依赖必须跳过，缺失依赖必须能够自动安装。
 - 保持脚本直接可运行，不引入框架、命令行包装或配置层，除非需求明确要求。
 - 修改 `TensorRTModel` 时，同时核对 ONNX 构建路径、已有 engine 加载路径和多输出返回行为。
 - 修改 `convert_trt.py` 的预处理时，确认模型实际期望的布局、尺寸、色彩空间和归一化方式；这些参数目前是示例专用的固定值，首输出必须为 NCHW 深度图。

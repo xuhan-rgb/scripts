@@ -1,8 +1,23 @@
-# TensorRT / ONNX 推理工具集
+# 个人脚本工具集
 
-ONNX 环境检测 + TensorRT 模型转换与推理的工具集，用于在 GPU 服务器上快速验证深度学习推理环境。
+用于 Linux 桌面配置、ONNX 环境检测以及 TensorRT 模型转换与推理的个人脚本集合。
 
-## 使用方法
+## 桌面工具
+
+### 安装 Flameshot 并配置 GNOME 快捷键
+
+```bash
+bash desktop/install-flameshot-shortcuts.sh
+```
+
+脚本会检查 Flameshot、剪贴板和 GNOME 桌面组件。所有依赖均已安装时不会调用 APT；缺少依赖时会更新软件包索引，并且只安装缺少的软件包。配置完成后：
+
+- `Alt+A`：打开 Flameshot 截图界面。
+- `Alt+S`：截图保存到 `/tmp`，并将完整文件路径复制到剪贴板。
+
+该脚本仅支持 Ubuntu/Debian 的 GNOME 桌面环境，应当以当前桌面用户运行，不要直接使用 `sudo` 启动整个脚本。
+
+## TensorRT / ONNX 工具
 
 `get_onnx_dependencies.py` 仅依赖 Linux 系统库和 `ldd`。ONNX Runtime 验证需要能实际加载 CUDA Execution Provider；TensorRT 推理则需要兼容的 NVIDIA 驱动、CUDA、cuDNN、TensorRT 和 PyCUDA。
 
@@ -58,6 +73,7 @@ python convert_trt.py --show
 
 ## 依赖
 
+- 桌面快捷键安装：Ubuntu/Debian、GNOME、APT（缺失的软件包由脚本自动安装）
 - 环境检查：Python 标准库
 - ONNX Runtime 测试：`numpy`、`onnx`、`onnxruntime-gpu`
 - TensorRT 推理：`numpy`、`torch`、`tensorrt`、`pycuda`
