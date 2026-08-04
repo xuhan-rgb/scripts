@@ -310,6 +310,7 @@ def usage_summary(path=USAGE_DB, now=None):
             "input_tokens": 0,
             "output_tokens": 0,
             "reasoning_tokens": 0,
+            "cache_read_tokens": 0,
         }
         for name in starts
     }
@@ -321,7 +322,8 @@ def usage_summary(path=USAGE_DB, now=None):
         connection.row_factory = sqlite3.Row
         rows = connection.execute(
             """
-            SELECT timestamp, input_tokens, output_tokens, reasoning_tokens, total_tokens
+            SELECT timestamp, input_tokens, output_tokens, reasoning_tokens,
+                   cache_read_tokens, total_tokens
             FROM requests
             """
         ).fetchall()
@@ -335,6 +337,8 @@ def usage_summary(path=USAGE_DB, now=None):
             timestamp = timestamp.replace(tzinfo=now.tzinfo)
         timestamp = timestamp.astimezone(now.tzinfo)
         input_tokens = int(row["input_tokens"] or 0)
+        cache_read_tokens = int(row["cache_read_tokens"] or 0)
+        uncached_input_tokens = max(input_tokens - cache_read_tokens, 0)
         output_tokens = int(row["output_tokens"] or 0)
         total_tokens = int(row["total_tokens"] or input_tokens + output_tokens)
         for name, start in starts.items():
@@ -342,9 +346,10 @@ def usage_summary(path=USAGE_DB, now=None):
                 continue
             periods[name]["requests"] += 1
             periods[name]["total_tokens"] += total_tokens
-            periods[name]["input_tokens"] += input_tokens
+            periods[name]["input_tokens"] += uncached_input_tokens
             periods[name]["output_tokens"] += output_tokens
             periods[name]["reasoning_tokens"] += int(row["reasoning_tokens"] or 0)
+            periods[name]["cache_read_tokens"] += cache_read_tokens
     return periods
 
 
@@ -552,16 +557,23 @@ HTML = r'''<!doctype html>
     .usage-label strong { color: var(--ink); font-size: 13px; }
     .usage-total { display: block; margin-top: 14px; font: 800 clamp(28px, 3vw, 42px)/1 "DejaVu Sans Mono", monospace; letter-spacing: -.055em; }
     .usage-unit { margin-left: 7px; color: var(--ink-soft); font: 700 10px "DejaVu Sans Mono", monospace; text-transform: uppercase; }
-    .usage-breakdown { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line); }
+    .usage-breakdown { display: grid; grid-template-columns: repeat(4, 1fr); gap: 9px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line); }
     .usage-breakdown span { color: var(--ink-soft); font-size: 10px; }
     .usage-breakdown strong { display: block; margin-top: 3px; color: var(--ink); font: 800 11px "DejaVu Sans Mono", monospace; }
+    .last-request { display: grid; grid-template-columns: minmax(190px, .8fr) minmax(520px, 2.2fr); align-items: center; gap: 24px; margin-top: 12px; padding: 15px 20px; border-left: 4px solid var(--signal); }
+    .last-request-label strong, .last-request-label span { display: block; }
+    .last-request-label strong { font-size: 13px; }
+    .last-request-label span { margin-top: 4px; color: var(--ink-soft); font: 10px "DejaVu Sans Mono", monospace; }
+    .last-request-breakdown { display: grid; grid-template-columns: repeat(4, 1fr); gap: 12px; }
+    .last-request-breakdown span { color: var(--ink-soft); font-size: 10px; }
+    .last-request-breakdown strong { display: block; margin-top: 3px; color: var(--ink); font: 800 14px "DejaVu Sans Mono", monospace; }
     .ledger { margin-top: 18px; }
     .ledger-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
     .ledger-title { display: flex; align-items: baseline; gap: 10px; }
     .ledger-count { color: var(--signal); font: 800 11px "DejaVu Sans Mono", monospace; }
     .ledger-state { color: var(--ink-soft); font: 11px "DejaVu Sans Mono", monospace; }
     .table-scroll { max-height: 430px; overflow: auto; }
-    table { width: 100%; min-width: 1380px; border-collapse: collapse; font-size: 12px; }
+    table { width: 100%; min-width: 1300px; border-collapse: collapse; font-size: 12px; }
     thead th {
       position: sticky;
       top: 0;
@@ -601,6 +613,8 @@ HTML = r'''<!doctype html>
       .usage-head { align-items: flex-start; flex-direction: column; gap: 4px; }
       .usage-grid { grid-template-columns: 1fr; }
       .usage-total { font-size: 34px; }
+      .last-request { grid-template-columns: 1fr; gap: 13px; }
+      .last-request-breakdown { grid-template-columns: repeat(2, 1fr); }
       .ledger-head { align-items: flex-start; flex-direction: column; }
       .table-scroll { max-height: 520px; }
       .foot { flex-direction: column; }
@@ -659,6 +673,7 @@ HTML = r'''<!doctype html>
           <span id="usage-day-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
           <div class="usage-breakdown">
             <span>Input<strong id="usage-day-input">0</strong></span>
+            <span>Cache read<strong id="usage-day-cache-read">0</strong></span>
             <span>Output<strong id="usage-day-output">0</strong></span>
             <span>Requests<strong id="usage-day-requests">0</strong></span>
           </div>
@@ -668,6 +683,7 @@ HTML = r'''<!doctype html>
           <span id="usage-week-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
           <div class="usage-breakdown">
             <span>Input<strong id="usage-week-input">0</strong></span>
+            <span>Cache read<strong id="usage-week-cache-read">0</strong></span>
             <span>Output<strong id="usage-week-output">0</strong></span>
             <span>Requests<strong id="usage-week-requests">0</strong></span>
           </div>
@@ -677,11 +693,21 @@ HTML = r'''<!doctype html>
           <span id="usage-month-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
           <div class="usage-breakdown">
             <span>Input<strong id="usage-month-input">0</strong></span>
+            <span>Cache read<strong id="usage-month-cache-read">0</strong></span>
             <span>Output<strong id="usage-month-output">0</strong></span>
             <span>Requests<strong id="usage-month-requests">0</strong></span>
           </div>
         </article>
       </div>
+      <article class="panel last-request">
+        <div class="last-request-label"><strong>Last request</strong><span id="last-request-meta">No requests captured</span></div>
+        <div class="last-request-breakdown">
+          <span>Input<strong id="last-request-input">0</strong></span>
+          <span>Output<strong id="last-request-output">0</strong></span>
+          <span>Cache read<strong id="last-request-cache-read">0</strong></span>
+          <span>Cache hit<strong id="last-request-cache-hit">—</strong></span>
+        </div>
+      </article>
     </section>
     <section class="panel ledger" aria-labelledby="ledger-heading">
       <div class="panel-head ledger-head">
@@ -692,9 +718,9 @@ HTML = r'''<!doctype html>
         <table>
           <thead><tr>
             <th>统计时间</th><th>API Key</th><th>凭据</th><th>实际模型</th><th>推理</th><th>接口</th>
-            <th>上下文</th><th>新增</th><th>输出</th><th>推理 Token</th><th>缓存读取</th><th>缓存创建</th><th>缓存命中率</th><th>首 Token / 总耗时</th><th>状态</th>
+            <th>输入</th><th>输出</th><th>推理 Token</th><th>缓存读取</th><th>缓存创建</th><th>缓存命中率</th><th>首 Token / 总耗时</th><th>状态</th>
           </tr></thead>
-          <tbody id="requests"><tr class="empty-row"><td colspan="15">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr></tbody>
+          <tbody id="requests"><tr class="empty-row"><td colspan="14">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -732,9 +758,19 @@ HTML = r'''<!doctype html>
         const period = periods[name] || {};
         $(`usage-${name}-total`).textContent = formatTokens(period.total_tokens);
         $(`usage-${name}-input`).textContent = formatTokens(period.input_tokens);
+        $(`usage-${name}-cache-read`).textContent = formatTokens(period.cache_read_tokens);
         $(`usage-${name}-output`).textContent = formatTokens(period.output_tokens);
         $(`usage-${name}-requests`).textContent = Number(period.requests || 0).toLocaleString();
       });
+      const last = app.requests[0];
+      const totalInput = Number(last?.input_tokens || 0);
+      const cacheRead = Number(last?.cache_read_tokens || 0);
+      const uncachedInput = Math.max(totalInput - cacheRead, 0);
+      $('last-request-input').textContent = formatTokens(uncachedInput);
+      $('last-request-output').textContent = formatTokens(last?.output_tokens);
+      $('last-request-cache-read').textContent = formatTokens(cacheRead);
+      $('last-request-cache-hit').textContent = totalInput > 0 ? `${(cacheRead / totalInput * 100).toFixed(1)}%` : '—';
+      $('last-request-meta').textContent = last ? `${formatTime(last.timestamp)} · ${last.model || 'unknown model'}` : 'No requests captured';
     }
 
     function renderRequests() {
@@ -745,7 +781,7 @@ HTML = r'''<!doctype html>
       if (app.rendered.requests === signature) return;
       app.rendered.requests = signature;
       if (!rows.length) {
-        $('requests').innerHTML = '<tr class="empty-row"><td colspan="15">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr>';
+        $('requests').innerHTML = '<tr class="empty-row"><td colspan="14">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr>';
         return;
       }
       $('requests').innerHTML = rows.map((row) => {
@@ -765,7 +801,6 @@ HTML = r'''<!doctype html>
           <td class="model-cell">${escapeHtml(row.model || '—')}</td>
           <td class="metric">${escapeHtml(row.reasoning_effort || '—')}</td>
           <td class="metric">${escapeHtml(row.endpoint || '—')}</td>
-          <td class="metric">${formatTokens(totalInput)}</td>
           <td class="metric">${formatTokens(freshInput)}</td>
           <td class="metric">${formatTokens(row.output_tokens)}</td>
           <td class="metric">${formatTokens(row.reasoning_tokens)}</td>

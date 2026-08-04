@@ -56,9 +56,15 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn('id="usage-day-total"', manager.HTML)
         self.assertIn('id="usage-week-total"', manager.HTML)
         self.assertIn('id="usage-month-total"', manager.HTML)
+        self.assertIn('id="last-request-input"', manager.HTML)
+        self.assertIn('id="last-request-cache-hit"', manager.HTML)
         self.assertIn("$(`usage-${name}-total`).textContent", manager.HTML)
+        self.assertIn("Math.max(totalInput - cacheRead, 0)", manager.HTML)
         self.assertIn("Number(row.ttft_ms || 0)", manager.HTML)
         self.assertIn("首 Token / 总耗时", manager.HTML)
+        self.assertIn("<th>输入</th><th>输出</th>", manager.HTML)
+        self.assertNotIn("<th>上下文</th>", manager.HTML)
+        self.assertNotIn("<th>新增</th>", manager.HTML)
 
     def test_reads_the_dynamically_selected_provider(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -142,7 +148,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
     def test_summarizes_tokens_by_local_day_week_and_month(self):
         now = datetime(2026, 8, 4, 21, 0, tzinfo=timezone.utc)
 
-        def record(request_id, timestamp, total_tokens):
+        def record(request_id, timestamp, total_tokens, cache_read_tokens=0):
             return {
                 "request_id": request_id,
                 "timestamp": timestamp,
@@ -150,12 +156,13 @@ class CodexBridgeManagerTests(unittest.TestCase):
                     "input_tokens": total_tokens - 10,
                     "output_tokens": 10,
                     "reasoning_tokens": 3,
+                    "cache_read_tokens": cache_read_tokens,
                     "total_tokens": total_tokens,
                 },
             }
 
         records = [
-            record("today", "2026-08-04T08:00:00.123456789+00:00", 100),
+            record("today", "2026-08-04T08:00:00.123456789+00:00", 100, 60),
             record("week", "2026-08-03T08:00:00+00:00", 200),
             record("month", "2026-08-01T08:00:00+00:00", 300),
             record("previous-month", "2026-07-31T08:00:00+00:00", 400),
@@ -166,6 +173,8 @@ class CodexBridgeManagerTests(unittest.TestCase):
             summary = manager.usage_summary(database, now=now)
 
         self.assertEqual(summary["day"]["total_tokens"], 100)
+        self.assertEqual(summary["day"]["input_tokens"], 30)
+        self.assertEqual(summary["day"]["cache_read_tokens"], 60)
         self.assertEqual(summary["week"]["total_tokens"], 300)
         self.assertEqual(summary["month"]["total_tokens"], 600)
         self.assertEqual(summary["day"]["requests"], 1)

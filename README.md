@@ -129,13 +129,13 @@ Claude 始终只连接一个稳定的虚拟模型 `claudex-router`，客户端 e
 
 首次关闭扩展前，安装器会各保留一份固定备份：Codex 配置使用 `*.before-disabled-extensions`，Claude 设置使用 `~/.claude/settings.json.before-disabled-extensions`。重复安装不会继续堆积备份。
 
-控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。卡片每 3 秒增量更新，不会重新创建界面节点。
+控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取和缓存命中率。卡片每 3 秒增量更新，不会重新创建界面节点。
 
-Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、总上下文、本轮新增输入、输出 token、推理 token、缓存读取/创建、命中率、首 Token 时间（TTFT）、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
+Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、非缓存输入、输出 token、推理 token、缓存读取/创建、命中率、首 Token 时间（TTFT）、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。其中“输入”始终按 `input_tokens - cache_read_tokens` 计算，避免与单独展示的缓存读取重复。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
 
 延迟排查时优先比较“首 Token / 总耗时”：两者都高通常是上游网络、模型排队或上下文过长；首 Token 正常而总耗时高通常是回答生成较长。Claude 会在每轮携带会话上下文，即使缓存命中率很高，过长上下文仍可能增加模型处理时间；可使用 Claude 的 `/compact`，或在不再需要旧上下文时开启新会话。切换到 Luna 或降低 reasoning effort 可能更快，但应以该 provider 上实际记录的 TTFT 为准。
 
-Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的总上下文可能仍有数万 Token。账本中的“上下文”是总量，“新增”才是本轮未命中缓存的输入。需要隔离排查时可运行 `claudex-yolo --safe-mode`：它保留认证、模型、内置工具和权限，但临时禁用自定义 plugins、MCP、skills、hooks 与 `CLAUDE.md`，不会修改现有配置或登录状态。
+Claude Code 的系统提示词、内置工具、plugins、MCP、skills 和 `CLAUDE.md` 也属于输入上下文，因此一句 `hello` 的原始总输入可能仍有数万 Token。界面把它拆成“输入”和“缓存读取”：两者相加才是上游返回的原始输入总量。需要隔离排查时可运行 `claudex-yolo --safe-mode`：它保留认证、模型、内置工具和权限，但临时禁用自定义 plugins、MCP、skills、hooks 与 `CLAUDE.md`，不会修改现有配置或登录状态。
 
 脚本支持 Linux x86_64 和 arm64，要求所选 Codex provider 使用 Responses API，并配置可用的 `base_url` 与 `env_key`。
 
