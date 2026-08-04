@@ -1,6 +1,7 @@
 import importlib.util
 import tempfile
 import unittest
+from datetime import datetime, timezone
 from pathlib import Path
 
 
@@ -45,6 +46,19 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("if (app.rendered.models !== modelCatalog)", manager.HTML)
         self.assertIn("if (app.rendered.efforts !== effortCatalog)", manager.HTML)
         self.assertIn("if (app.rendered.requests === signature) return", manager.HTML)
+
+    def test_dashboard_enables_instant_switching_by_default(self):
+        self.assertIn("id=\"instant\"", manager.HTML)
+        self.assertIn("localStorage.getItem('claudex-instant-switch') !== 'false'", manager.HTML)
+        self.assertIn("if (app.autoApply) scheduleSave()", manager.HTML)
+
+    def test_dashboard_renders_usage_periods_and_ttft_incrementally(self):
+        self.assertIn('id="usage-day-total"', manager.HTML)
+        self.assertIn('id="usage-week-total"', manager.HTML)
+        self.assertIn('id="usage-month-total"', manager.HTML)
+        self.assertIn("$(`usage-${name}-total`).textContent", manager.HTML)
+        self.assertIn("Number(row.ttft_ms || 0)", manager.HTML)
+        self.assertIn("首 Token / 总耗时", manager.HTML)
 
     def test_reads_the_dynamically_selected_provider(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -124,6 +138,39 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertEqual(rows[0]["model"], "gpt-5.6-sol")
         self.assertEqual(rows[0]["cache_read_tokens"], 71400)
         self.assertNotIn("prompt", rows[0])
+
+    def test_summarizes_tokens_by_local_day_week_and_month(self):
+        now = datetime(2026, 8, 4, 21, 0, tzinfo=timezone.utc)
+
+        def record(request_id, timestamp, total_tokens):
+            return {
+                "request_id": request_id,
+                "timestamp": timestamp,
+                "tokens": {
+                    "input_tokens": total_tokens - 10,
+                    "output_tokens": 10,
+                    "reasoning_tokens": 3,
+                    "total_tokens": total_tokens,
+                },
+            }
+
+        records = [
+            record("today", "2026-08-04T08:00:00.123456789+00:00", 100),
+            record("week", "2026-08-03T08:00:00+00:00", 200),
+            record("month", "2026-08-01T08:00:00+00:00", 300),
+            record("previous-month", "2026-07-31T08:00:00+00:00", 400),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            database = Path(directory) / "usage.sqlite3"
+            manager.store_usage_records(records, database)
+            summary = manager.usage_summary(database, now=now)
+
+        self.assertEqual(summary["day"]["total_tokens"], 100)
+        self.assertEqual(summary["week"]["total_tokens"], 300)
+        self.assertEqual(summary["month"]["total_tokens"], 600)
+        self.assertEqual(summary["day"]["requests"], 1)
+        self.assertEqual(summary["week"]["requests"], 2)
+        self.assertEqual(summary["month"]["requests"], 3)
 
     def test_rejects_unknown_model_and_effort(self):
         with tempfile.TemporaryDirectory() as directory:

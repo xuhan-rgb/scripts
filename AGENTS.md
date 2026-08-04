@@ -34,6 +34,9 @@
 # 安装读取 ~/.codex/config.toml 的 CLIProxyAPI user service
 bash claude/install-codex-bridge.sh
 
+# 仅初始化 Codex provider、私有密钥加载和三个 yolo alias
+bash claude/setup-codex.sh
+
 # 打开本地模型与思考强度控制台
 claudex-ui
 
@@ -73,6 +76,8 @@ python convert_trt.py
 ```text
 .
 |- claude/install-codex-bridge.sh     # 跟随本地 Codex provider 的 Claude Code 桥接服务
+|- claude/setup-codex.sh              # 新电脑 Codex provider、密钥加载和 alias 初始化
+|- claude/codex_provider.py           # Codex provider/profile/key 管理命令
 |- claude/codex_bridge_manager.py     # 实时模型路由与逐请求 usage 可视化控制台
 |- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置
 |- get_onnx_dependencies.py  # 动态库与 onnxruntime CUDA provider 依赖诊断

@@ -11,6 +11,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
 
@@ -284,6 +285,69 @@ def usage_count(path=USAGE_DB):
         return int(connection.execute("SELECT COUNT(*) FROM requests").fetchone()[0])
 
 
+def _parse_usage_timestamp(value):
+    if not isinstance(value, str):
+        raise ValueError("usage timestamp is not a string")
+    normalized = value.replace("Z", "+00:00")
+    normalized = re.sub(r"(\.\d{6})\d+(?=(?:[+-]\d{2}:\d{2})?$)", r"\1", normalized)
+    return datetime.fromisoformat(normalized)
+
+
+def usage_summary(path=USAGE_DB, now=None):
+    now = now or datetime.now().astimezone()
+    if now.tzinfo is None:
+        now = now.astimezone()
+    today = now.replace(hour=0, minute=0, second=0, microsecond=0)
+    starts = {
+        "day": today,
+        "week": today - timedelta(days=today.weekday()),
+        "month": today.replace(day=1),
+    }
+    periods = {
+        name: {
+            "requests": 0,
+            "total_tokens": 0,
+            "input_tokens": 0,
+            "output_tokens": 0,
+            "reasoning_tokens": 0,
+        }
+        for name in starts
+    }
+    path = Path(path)
+    if not path.exists():
+        return periods
+
+    with sqlite3.connect(path) as connection:
+        connection.row_factory = sqlite3.Row
+        rows = connection.execute(
+            """
+            SELECT timestamp, input_tokens, output_tokens, reasoning_tokens, total_tokens
+            FROM requests
+            """
+        ).fetchall()
+
+    for row in rows:
+        try:
+            timestamp = _parse_usage_timestamp(row["timestamp"])
+        except (AttributeError, ValueError):
+            continue
+        if timestamp.tzinfo is None:
+            timestamp = timestamp.replace(tzinfo=now.tzinfo)
+        timestamp = timestamp.astimezone(now.tzinfo)
+        input_tokens = int(row["input_tokens"] or 0)
+        output_tokens = int(row["output_tokens"] or 0)
+        total_tokens = int(row["total_tokens"] or input_tokens + output_tokens)
+        for name, start in starts.items():
+            if timestamp < start:
+                continue
+            periods[name]["requests"] += 1
+            periods[name]["total_tokens"] += total_tokens
+            periods[name]["input_tokens"] += input_tokens
+            periods[name]["output_tokens"] += output_tokens
+            periods[name]["reasoning_tokens"] += int(row["reasoning_tokens"] or 0)
+    return periods
+
+
 def fetch_usage_queue(password=MANAGEMENT_PASSWORD):
     if not password:
         raise ValueError("management credential is unavailable")
@@ -349,6 +413,7 @@ def build_state():
         "service_active": service_state(),
         "usage": {
             "count": usage_count(),
+            "periods": usage_summary(),
             "last_sync": USAGE_STATUS["last_sync"],
             "error": USAGE_STATUS["last_error"],
         },
@@ -424,7 +489,7 @@ HTML = r'''<!doctype html>
     .model-card:nth-child(2) { animation-delay: .06s; }
     .model-card:nth-child(3) { animation-delay: .12s; }
     .model-card:hover { transform: translateY(-3px); border-color: var(--ink); }
-    .model-card:focus-visible, .effort button:focus-visible, .save:focus-visible { outline: 3px solid rgba(25,125,120,.32); outline-offset: 2px; }
+    .model-card:focus-visible, .effort button:focus-visible, .instant:focus-visible, .save:focus-visible { outline: 3px solid rgba(25,125,120,.32); outline-offset: 2px; }
     .model-card.active { color: var(--panel); background: var(--ink); border-color: var(--ink); }
     .model-index { color: var(--signal); font: 800 11px "DejaVu Sans Mono", monospace; }
     .model-name { display: block; margin-top: 27px; font-size: 28px; font-weight: 800; letter-spacing: -.04em; }
@@ -446,18 +511,57 @@ HTML = r'''<!doctype html>
     .fact dd { margin: 0; overflow-wrap: anywhere; font: 12px/1.45 "DejaVu Sans Mono", monospace; }
     .commit { padding: 20px; background: var(--ink); color: var(--panel); border-color: var(--ink); }
     .commit h3 { margin: 0; font-size: 16px; }
-    .commit p { margin: 8px 0 18px; color: #bfcac9; font-size: 12px; line-height: 1.55; }
+    .commit p { margin: 8px 0 14px; color: #bfcac9; font-size: 12px; line-height: 1.55; }
+    .instant {
+      display: flex;
+      align-items: center;
+      justify-content: space-between;
+      gap: 14px;
+      width: 100%;
+      margin-bottom: 12px;
+      padding: 10px 12px;
+      color: #dce5e3;
+      background: #202f32;
+      border: 1px solid #46575a;
+      border-radius: 11px;
+      cursor: pointer;
+      text-align: left;
+    }
+    .instant:hover { border-color: #718285; }
+    .instant-copy strong, .instant-copy small { display: block; }
+    .instant-copy strong { font-size: 12px; }
+    .instant-copy small { margin-top: 3px; color: #94a3a1; font-size: 10px; }
+    .instant-switch { position: relative; flex: 0 0 38px; height: 22px; border-radius: 20px; background: #536164; transition: background .18s ease; }
+    .instant-switch::after { position: absolute; top: 3px; left: 3px; width: 16px; height: 16px; border-radius: 50%; background: #dce5e3; content: ""; transition: transform .18s ease; }
+    .instant[aria-pressed="true"] .instant-switch { background: var(--teal); }
+    .instant[aria-pressed="true"] .instant-switch::after { transform: translateX(16px); }
     .save { width: 100%; padding: 13px 16px; border: 0; border-radius: 11px; color: #1c2527; background: var(--signal); cursor: pointer; font-weight: 900; transition: filter .15s ease, transform .15s ease; }
     .save:hover { filter: brightness(1.07); transform: translateY(-1px); }
     .save:disabled { color: #74807f; background: #435154; cursor: default; transform: none; }
     .save-state { margin-top: 11px; min-height: 18px; color: #8f9d9b; font: 11px "DejaVu Sans Mono", monospace; }
+    .usage { margin-top: 18px; }
+    .usage-head { display: flex; align-items: flex-end; justify-content: space-between; gap: 18px; margin: 0 2px 10px; }
+    .usage-head h2 { margin: 0; font-size: 15px; }
+    .usage-head p { margin: 0; color: var(--ink-soft); font-size: 11px; }
+    .usage-grid { display: grid; grid-template-columns: repeat(3, 1fr); gap: 12px; }
+    .usage-card { position: relative; padding: 18px 20px 17px; }
+    .usage-card::before { position: absolute; inset: 0 0 auto; height: 4px; background: var(--teal); content: ""; }
+    .usage-card:nth-child(2)::before { background: var(--signal); }
+    .usage-card:nth-child(3)::before { background: var(--ink); }
+    .usage-label { display: flex; align-items: baseline; justify-content: space-between; gap: 12px; color: var(--ink-soft); font-size: 11px; }
+    .usage-label strong { color: var(--ink); font-size: 13px; }
+    .usage-total { display: block; margin-top: 14px; font: 800 clamp(28px, 3vw, 42px)/1 "DejaVu Sans Mono", monospace; letter-spacing: -.055em; }
+    .usage-unit { margin-left: 7px; color: var(--ink-soft); font: 700 10px "DejaVu Sans Mono", monospace; text-transform: uppercase; }
+    .usage-breakdown { display: grid; grid-template-columns: repeat(3, 1fr); gap: 9px; margin-top: 16px; padding-top: 13px; border-top: 1px solid var(--line); }
+    .usage-breakdown span { color: var(--ink-soft); font-size: 10px; }
+    .usage-breakdown strong { display: block; margin-top: 3px; color: var(--ink); font: 800 11px "DejaVu Sans Mono", monospace; }
     .ledger { margin-top: 18px; }
     .ledger-head { display: flex; align-items: center; justify-content: space-between; gap: 18px; }
     .ledger-title { display: flex; align-items: baseline; gap: 10px; }
     .ledger-count { color: var(--signal); font: 800 11px "DejaVu Sans Mono", monospace; }
     .ledger-state { color: var(--ink-soft); font: 11px "DejaVu Sans Mono", monospace; }
     .table-scroll { max-height: 430px; overflow: auto; }
-    table { width: 100%; min-width: 1260px; border-collapse: collapse; font-size: 12px; }
+    table { width: 100%; min-width: 1380px; border-collapse: collapse; font-size: 12px; }
     thead th {
       position: sticky;
       top: 0;
@@ -494,6 +598,9 @@ HTML = r'''<!doctype html>
       .model-grid { grid-template-columns: 1fr; }
       .model-card { min-height: 135px; }
       .model-name { margin-top: 15px; }
+      .usage-head { align-items: flex-start; flex-direction: column; gap: 4px; }
+      .usage-grid { grid-template-columns: 1fr; }
+      .usage-total { font-size: 34px; }
       .ledger-head { align-items: flex-start; flex-direction: column; }
       .table-scroll { max-height: 520px; }
       .foot { flex-direction: column; }
@@ -532,11 +639,50 @@ HTML = r'''<!doctype html>
         <section class="panel commit">
           <h3>Apply live GPT route</h3>
           <p>Claude keeps one stable client model. Saving here reroutes the next request from every active Claude session.</p>
+          <button id="instant" class="instant" type="button" aria-pressed="true">
+            <span class="instant-copy"><strong>Instant switch</strong><small>Apply on model or effort click</small></span>
+            <span class="instant-switch" aria-hidden="true"></span>
+          </button>
           <button id="save" class="save" disabled>Saved</button>
           <div id="save-state" class="save-state">Waiting for state…</div>
         </section>
       </aside>
     </div>
+    <section class="usage" aria-labelledby="usage-heading">
+      <div class="usage-head">
+        <h2 id="usage-heading">Token usage</h2>
+        <p>Calendar periods in local time · metadata only</p>
+      </div>
+      <div class="usage-grid">
+        <article class="panel usage-card">
+          <div class="usage-label"><strong>Today</strong><span>00:00 → now</span></div>
+          <span id="usage-day-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
+          <div class="usage-breakdown">
+            <span>Input<strong id="usage-day-input">0</strong></span>
+            <span>Output<strong id="usage-day-output">0</strong></span>
+            <span>Requests<strong id="usage-day-requests">0</strong></span>
+          </div>
+        </article>
+        <article class="panel usage-card">
+          <div class="usage-label"><strong>This week</strong><span>Monday → now</span></div>
+          <span id="usage-week-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
+          <div class="usage-breakdown">
+            <span>Input<strong id="usage-week-input">0</strong></span>
+            <span>Output<strong id="usage-week-output">0</strong></span>
+            <span>Requests<strong id="usage-week-requests">0</strong></span>
+          </div>
+        </article>
+        <article class="panel usage-card">
+          <div class="usage-label"><strong>This month</strong><span>Day 1 → now</span></div>
+          <span id="usage-month-total" class="usage-total">0</span><span class="usage-unit">tokens</span>
+          <div class="usage-breakdown">
+            <span>Input<strong id="usage-month-input">0</strong></span>
+            <span>Output<strong id="usage-month-output">0</strong></span>
+            <span>Requests<strong id="usage-month-requests">0</strong></span>
+          </div>
+        </article>
+      </div>
+    </section>
     <section class="panel ledger" aria-labelledby="ledger-heading">
       <div class="panel-head ledger-head">
         <div class="ledger-title"><h2 id="ledger-heading">Request ledger</h2><span id="request-count" class="ledger-count">0 captured</span></div>
@@ -546,9 +692,9 @@ HTML = r'''<!doctype html>
         <table>
           <thead><tr>
             <th>统计时间</th><th>API Key</th><th>凭据</th><th>实际模型</th><th>推理</th><th>接口</th>
-            <th>输入</th><th>输出</th><th>推理 Token</th><th>缓存读取</th><th>缓存创建</th><th>缓存命中率</th><th>耗时</th><th>状态</th>
+            <th>上下文</th><th>新增</th><th>输出</th><th>推理 Token</th><th>缓存读取</th><th>缓存创建</th><th>缓存命中率</th><th>首 Token / 总耗时</th><th>状态</th>
           </tr></thead>
-          <tbody id="requests"><tr class="empty-row"><td colspan="14">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr></tbody>
+          <tbody id="requests"><tr class="empty-row"><td colspan="15">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -562,6 +708,9 @@ HTML = r'''<!doctype html>
       dirty: false,
       requests: [],
       rendered: {models: '', efforts: '', requests: ''},
+      autoApply: localStorage.getItem('claudex-instant-switch') !== 'false',
+      saving: false,
+      saveTimer: null,
     };
     const $ = (id) => document.getElementById(id);
     const escapeText = (value) => value || '—';
@@ -577,6 +726,17 @@ HTML = r'''<!doctype html>
       return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', {hour12: false});
     };
 
+    function renderUsage() {
+      const periods = app.state.usage.periods || {};
+      ['day', 'week', 'month'].forEach((name) => {
+        const period = periods[name] || {};
+        $(`usage-${name}-total`).textContent = formatTokens(period.total_tokens);
+        $(`usage-${name}-input`).textContent = formatTokens(period.input_tokens);
+        $(`usage-${name}-output`).textContent = formatTokens(period.output_tokens);
+        $(`usage-${name}-requests`).textContent = Number(period.requests || 0).toLocaleString();
+      });
+    }
+
     function renderRequests() {
       const rows = app.requests;
       $('request-count').textContent = `${app.state.usage.count} captured`;
@@ -585,7 +745,7 @@ HTML = r'''<!doctype html>
       if (app.rendered.requests === signature) return;
       app.rendered.requests = signature;
       if (!rows.length) {
-        $('requests').innerHTML = '<tr class="empty-row"><td colspan="14">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr>';
+        $('requests').innerHTML = '<tr class="empty-row"><td colspan="15">完成一次 Claude 请求后，这里会显示真实的上游路由和用量。</td></tr>';
         return;
       }
       $('requests').innerHTML = rows.map((row) => {
@@ -594,6 +754,10 @@ HTML = r'''<!doctype html>
         const freshInput = Math.max(totalInput - cacheRead, 0);
         const hitRate = totalInput > 0 ? `${(cacheRead / totalInput * 100).toFixed(1)}%` : '—';
         const credential = row.auth_index ? row.auth_index.slice(0, 10) : row.provider;
+        const latency = Number(row.latency_ms || 0);
+        const ttft = Number(row.ttft_ms || 0);
+        const latencyText = `${ttft ? ttft.toLocaleString() : '—'} / ${latency ? latency.toLocaleString() : '—'}ms`;
+        const generationTime = Math.max(latency - ttft, 0);
         return `<tr>
           <td class="metric">${escapeHtml(formatTime(row.timestamp))}</td>
           <td class="metric">${escapeHtml(row.api_key || 'claudex-local')}</td>
@@ -601,13 +765,14 @@ HTML = r'''<!doctype html>
           <td class="model-cell">${escapeHtml(row.model || '—')}</td>
           <td class="metric">${escapeHtml(row.reasoning_effort || '—')}</td>
           <td class="metric">${escapeHtml(row.endpoint || '—')}</td>
-          <td class="metric" title="Total input: ${formatTokens(totalInput)}">${formatTokens(freshInput)}</td>
+          <td class="metric">${formatTokens(totalInput)}</td>
+          <td class="metric">${formatTokens(freshInput)}</td>
           <td class="metric">${formatTokens(row.output_tokens)}</td>
           <td class="metric">${formatTokens(row.reasoning_tokens)}</td>
           <td class="metric">${formatTokens(cacheRead)}</td>
           <td class="metric">${formatTokens(row.cache_creation_tokens)}</td>
           <td class="metric">${hitRate}</td>
-          <td class="metric">${Number(row.latency_ms || 0).toLocaleString()}ms</td>
+          <td class="metric" title="首 Token ${ttft.toLocaleString()}ms · 后续生成 ${generationTime.toLocaleString()}ms">${latencyText}</td>
           <td><span class="status ${row.failed ? 'failed' : ''}">${row.failed ? `HTTP ${row.status_code || 'ERR'}` : 'OK'}</span></td>
         </tr>`;
       }).join('');
@@ -651,14 +816,40 @@ HTML = r'''<!doctype html>
       const healthy = state.service_active && state.gateway.reachable;
       $('pulse').classList.toggle('good', healthy);
       $('health').textContent = healthy ? 'Gateway online · 127.0.0.1:8317' : 'Gateway unavailable';
-      $('save').disabled = !app.dirty;
-      $('save').textContent = app.dirty ? 'Apply selection' : 'Saved';
-      $('save-state').textContent = app.dirty ? `${app.draft.model} · ${app.draft.effort}` : `Live: ${app.draft.model} · ${app.draft.effort}`;
+      $('instant').setAttribute('aria-pressed', String(app.autoApply));
+      $('save').disabled = app.saving || !app.dirty;
+      $('save').textContent = app.saving ? 'Applying…' : app.dirty ? 'Apply selection' : 'Saved';
+      $('save-state').textContent = app.saving ? `Applying: ${app.draft.model} · ${app.draft.effort}` : app.dirty ? `${app.draft.model} · ${app.draft.effort}` : `Live: ${app.draft.model} · ${app.draft.effort}`;
+      renderUsage();
       renderRequests();
     }
 
-    function chooseModel(model) { app.draft.model = model; app.dirty = true; render(); }
-    function chooseEffort(effort) { app.draft.effort = effort; app.dirty = true; render(); }
+    function scheduleSave() {
+      clearTimeout(app.saveTimer);
+      app.saveTimer = setTimeout(save, 120);
+    }
+    function selectionChanged() {
+      app.dirty = true;
+      render();
+      if (app.autoApply) scheduleSave();
+    }
+    function chooseModel(model) {
+      if (app.draft.model === model) return;
+      app.draft.model = model;
+      selectionChanged();
+    }
+    function chooseEffort(effort) {
+      if (app.draft.effort === effort) return;
+      app.draft.effort = effort;
+      selectionChanged();
+    }
+    function toggleInstantSwitch() {
+      app.autoApply = !app.autoApply;
+      localStorage.setItem('claudex-instant-switch', String(app.autoApply));
+      if (!app.autoApply) clearTimeout(app.saveTimer);
+      render();
+      if (app.autoApply && app.dirty) scheduleSave();
+    }
     function notify(message, error = false) {
       const toast = $('toast'); toast.textContent = message; toast.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove('show'), 3200);
@@ -680,16 +871,34 @@ HTML = r'''<!doctype html>
     }
 
     async function save() {
-      if (!app.dirty) return;
-      $('save').disabled = true; $('save').textContent = 'Applying…';
+      if (!app.dirty || app.saving) return;
+      clearTimeout(app.saveTimer);
+      const submitted = {...app.draft};
+      let saveLatest = false;
+      app.saving = true;
+      render();
       try {
-        const response = await fetch('/api/selection', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(app.draft)});
+        const response = await fetch('/api/selection', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(submitted)});
         const payload = await response.json();
         if (!response.ok) throw new Error(payload.error || `HTTP ${response.status}`);
-        app.dirty = false; app.state = payload; app.draft = {...payload.selection}; render(); notify('Live route updated. Active sessions switch on the next request.');
-      } catch (error) { render(); notify(`Save failed: ${error.message}`, true); }
+        app.state = payload;
+        const unchanged = app.draft.model === submitted.model && app.draft.effort === submitted.effort;
+        if (unchanged) {
+          app.dirty = false;
+          app.draft = {...payload.selection};
+        } else {
+          saveLatest = app.autoApply;
+        }
+        notify('Live route updated. Active sessions switch on the next request.');
+      } catch (error) { notify(`Save failed: ${error.message}`, true); }
+      finally {
+        app.saving = false;
+        render();
+        if (saveLatest) scheduleSave();
+      }
     }
 
+    $('instant').addEventListener('click', toggleInstantSwitch);
     $('save').addEventListener('click', save);
     document.addEventListener('keydown', (event) => {
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save(); return; }

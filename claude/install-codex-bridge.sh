@@ -12,6 +12,7 @@ readonly UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
 readonly UNIT_FILE="${UNIT_DIR}/${SERVICE_NAME}"
 readonly MANAGER_UNIT_FILE="${UNIT_DIR}/${MANAGER_SERVICE_NAME}"
 readonly SCRIPT_DIR="$(dirname "$(readlink -f "${BASH_SOURCE[0]}")")"
+readonly CODEX_SETUP_SCRIPT="${SCRIPT_DIR}/setup-codex.sh"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -28,9 +29,14 @@ fi
 
 [[ ${CLIPROXY_VERSION} =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]] || fail "invalid CLIPROXY_VERSION"
 
-for command_name in awk cmp cp curl date flock grep install mktemp mv printenv python3 readlink sed sha256sum sort systemctl tar; do
+for command_name in awk bash cmp cp curl date flock grep install mktemp mv printenv python3 readlink sed sha256sum sort systemctl tar; do
   require_command "${command_name}"
 done
+
+[[ -f ${SCRIPT_DIR}/codex_bridge_manager.py ]] || fail "missing manager source: ${SCRIPT_DIR}/codex_bridge_manager.py"
+[[ -f ${CODEX_SETUP_SCRIPT} ]] || fail "missing Codex setup script: ${CODEX_SETUP_SCRIPT}"
+
+bash "${CODEX_SETUP_SCRIPT}"
 
 case "$(uname -m)" in
   x86_64) asset_arch="amd64" ;;
@@ -41,8 +47,7 @@ esac
 [[ $(uname -s) == "Linux" ]] || fail "only Linux is supported"
 systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user manager is unavailable"
 
-[[ -f ${SCRIPT_DIR}/codex_bridge_manager.py ]] || fail "missing manager source: ${SCRIPT_DIR}/codex_bridge_manager.py"
-
+printf '[3/3] Installing and starting the Claude-to-Codex relay\n'
 mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${STATE_DIR}" "${UNIT_DIR}"
 chmod 700 "${STATE_DIR}"
 
@@ -111,6 +116,14 @@ readonly SELECTION_FILE="${STATE_DIR}/selection.conf"
 readonly LOCK_FILE="${STATE_DIR}/selection.lock"
 readonly CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_CONFIG="${CODEX_DIR}/config.toml"
+readonly CODEX_SECRETS="${HOME}/.config/codex/secrets.env"
+
+if [[ -f ${CODEX_SECRETS} ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${CODEX_SECRETS}"
+  set +a
+fi
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -284,6 +297,10 @@ extra_args=()
 if [[ $(basename "$0") == "claudex-yolo" ]]; then
   extra_args+=(--dangerously-skip-permissions)
 fi
+extension_args=(--disable-slash-commands --strict-mcp-config --mcp-config '{"mcpServers":{}}')
+if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
+  extension_args=()
+fi
 
 sync_output="$("${HOME}/.local/bin/claude-codex-sync")"
 mapfile -t active_route <<<"${sync_output}"
@@ -300,7 +317,7 @@ exec env \
   CLAUDE_CODE_SUBAGENT_MODEL=claudex-router \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
-  claude --model claudex-router --effort medium "${extra_args[@]}" "$@"
+  claude --model claudex-router --effort medium --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
 ln -sfn claudex "${BIN_DIR}/claudex-yolo"
@@ -390,5 +407,11 @@ printf 'Active route: provider=%s model=%s effort=%s\n' \
 if ! command -v claude >/dev/null 2>&1; then
   printf 'warning: Claude Code is not installed; install it before running claudex.\n' >&2
 fi
+if ! command -v codex >/dev/null 2>&1; then
+  printf 'warning: Codex CLI is not installed; install it before running codex-yolo.\n' >&2
+fi
 printf 'Launch with: claudex or claudex-yolo\n'
 printf 'Open the visual model switcher with: claudex-ui\n'
+printf 'Reload aliases with: source ~/.bashrc\n'
+printf 'Normal claude login is unchanged; claude-yolo uses the normal account, claudex-yolo uses the GPT bridge.\n'
+printf 'Custom MCP, plugins, and skills default to disabled; see README.md to re-enable them.\n'
