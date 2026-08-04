@@ -91,7 +91,7 @@ claudex-yolo      # GPT 中转，跳过确认
 claudex-ui        # 打开本地路由控制台
 ```
 
-`claude-yolo` 直接调用官方 `claude`，不会修改登录状态或 `~/.claude`；只有 `claudex`/`claudex-yolo` 会为当前进程注入本地 GPT 网关环境。安装器不替换 `claude`，也不调用 `claude login/logout`。
+`claude-yolo` 直接调用官方 `claude`，不会修改登录状态或 `~/.claude`；它不传入 `--autocompact`，因此使用 Claude 官方默认的自动 compact 阈值和账号模型。只有 `claudex`/`claudex-yolo` 会为当前进程注入本地 GPT 网关环境。安装器不替换 `claude`，也不调用 `claude login/logout`。
 
 #### 4. Provider 日常管理
 
@@ -133,7 +133,7 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 首次关闭扩展前，安装器会各保留一份固定备份：Codex 配置使用 `*.before-disabled-extensions`，Claude 设置使用 `~/.claude/settings.json.before-disabled-extensions`。重复安装不会继续堆积备份。
 
-控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取、缓存命中率和醒目的相对时间。请求数据每 3 秒增量更新，相对时间由浏览器每秒更新，不会额外请求服务或重新创建界面节点。
+控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取、缓存命中率，以及“刚刚刷新 / N 秒前刷新”标记。请求数据每 3 秒增量更新，每次成功轮询都会重新开始计时；标记由浏览器每秒更新，不会额外请求服务或重新创建界面节点。
 
 Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、非缓存输入、输出 token、推理 token、缓存读取/创建、命中率、首 Token 时间（TTFT）、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。其中“输入”始终按 `input_tokens - cache_read_tokens` 计算，避免与单独展示的缓存读取重复。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
 
