@@ -65,9 +65,6 @@ EOF
   mv "${bashrc_tmp}" "${BASHRC}"
 }
 
-printf '[1/3] Updating AI yolo aliases in %s\n' "${BASHRC}"
-update_bashrc
-
 plugin_install_path() {
   claude plugin list --json 2>/dev/null | python3 -c '
 import json
@@ -164,8 +161,6 @@ install_selected_skills() {
   copy_skill_if_missing "${superpowers_path}/skills/brainstorming" brainstorming
 }
 
-install_selected_skills
-
 disable_claude_plugins() {
   command -v claude >/dev/null 2>&1 || return 0
   if [[ -f ${HOME}/.claude/settings.json ]]; then
@@ -187,8 +182,6 @@ for plugin in json.load(sys.stdin):
 '
   )
 }
-
-disable_claude_plugins
 
 configure_claude_skill_overrides() {
   local settings_file="${HOME}/.claude/settings.json"
@@ -255,12 +248,10 @@ PY
   mv "${settings_tmp}" "${settings_file}"
 }
 
-configure_claude_skill_overrides
-
+printf '[1/3] Installing and initializing codex-provider\n'
 mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}"
 chmod 700 "${CODEX_DIR}" "${SECRETS_DIR}"
 install -m 0755 "${CODEX_PROVIDER_SOURCE}" "${CODEX_PROVIDER}"
-printf '[2/3] Configuring Codex providers and credentials with codex-provider\n'
 
 toml_top_value() {
   awk -v wanted="$1" '
@@ -326,11 +317,6 @@ upsert_top_level_number() {
 if [[ ! -f ${CODEX_CONFIG} ]]; then
   config_tmp="$(mktemp "${CODEX_DIR}/config.toml.tmp.XXXXXX")"
   cat >"${config_tmp}" <<EOF
-model_provider = "${DEFAULT_PROVIDER}"
-model = "gpt-5.6-sol"
-model_reasoning_effort = "xhigh"
-model_reasoning_summary = "concise"
-model_verbosity = "medium"
 approval_policy = "on-request"
 sandbox_mode = "danger-full-access"
 personality = "pragmatic"
@@ -384,30 +370,6 @@ ensure_provider crs "http://81.70.201.249:3000/openai" CRS_OPENAI_KEY gpt-5.5 me
 ensure_provider crs_local "http://127.0.0.1:3000/openai" CRS_OPENAI_KEY gpt-5.6-sol xhigh
 ensure_provider sorryios "https://sorryios.ai/codex" SORRYIOS_OPENAI_KEY gpt-5.5 xhigh
 ensure_provider zskj "http://10.1.6.27/v1" ZSKJ_OPENAI_KEY gpt-5.4 xhigh
-
-ensure_profile() {
-  local name="$1"
-  local model="$2"
-  local effort="$3"
-  local profile="${CODEX_DIR}/${name}.config.toml"
-  local profile_tmp
-  [[ -f ${profile} ]] && return
-  profile_tmp="$(mktemp "${CODEX_DIR}/${name}.config.toml.tmp.XXXXXX")"
-  cat >"${profile_tmp}" <<EOF
-model_provider = "${name}"
-model = "${model}"
-model_reasoning_effort = "${effort}"
-model_reasoning_summary = "concise"
-model_verbosity = "medium"
-EOF
-  chmod 600 "${profile_tmp}"
-  mv "${profile_tmp}" "${profile}"
-}
-
-ensure_profile crs gpt-5.5 medium
-ensure_profile crs_local gpt-5.6-sol xhigh
-ensure_profile sorryios gpt-5.5 xhigh
-ensure_profile zskj gpt-5.4 xhigh
 
 disable_extension_tables() {
   local config_file="$1"
@@ -476,24 +438,12 @@ configure_codex_skills() {
   fi
 }
 
-for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
-  [[ -f ${config_file} ]] || continue
-  [[ -f ${config_file}.before-disabled-extensions ]] \
-    || cp -p "${config_file}" "${config_file}.before-disabled-extensions"
-  chmod 600 "${config_file}.before-disabled-extensions"
-  disable_extension_tables "${config_file}"
-done
-configure_codex_skills
-
 active_provider="$(toml_top_value model_provider)"
 if [[ -z ${active_provider} ]] || ! grep -Fqx "[model_providers.${active_provider}]" "${CODEX_CONFIG}"; then
-  "${CODEX_PROVIDER}" switch "${DEFAULT_PROVIDER}" \
-    --model gpt-5.6-sol \
-    --effort xhigh \
-    --summary concise \
-    --verbosity medium >/dev/null
+  "${CODEX_PROVIDER}" switch "${DEFAULT_PROVIDER}" >/dev/null
   active_provider="${DEFAULT_PROVIDER}"
 fi
+"${CODEX_PROVIDER}" init-existing >/dev/null
 
 if [[ -n ${CLAUDEX_SECRETS_FILE:-} ]]; then
   [[ -r ${CLAUDEX_SECRETS_FILE} ]] || fail "CLAUDEX_SECRETS_FILE is not readable: ${CLAUDEX_SECRETS_FILE}"
@@ -534,4 +484,19 @@ fi
 
 printf 'Codex configured: provider=%s config=%s\n' "${active_provider}" "${CODEX_CONFIG}"
 printf 'Provider manager: %s\n' "${CODEX_PROVIDER}"
+
+printf '[2/3] Updating aliases, skills, and extension policy\n'
+update_bashrc
+install_selected_skills
+disable_claude_plugins
+configure_claude_skill_overrides
+for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
+  [[ -f ${config_file} ]] || continue
+  [[ -f ${config_file}.before-disabled-extensions ]] \
+    || cp -p "${config_file}" "${config_file}.before-disabled-extensions"
+  chmod 600 "${config_file}.before-disabled-extensions"
+  disable_extension_tables "${config_file}"
+done
+configure_codex_skills
+
 printf 'Shell aliases installed in: %s\n' "${BASHRC}"

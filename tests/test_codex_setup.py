@@ -196,8 +196,63 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn("alias claudex-yolo='CLAUDEX_YOLO=1 claudex'", bashrc_text)
             self.assertNotIn("claude-api", bashrc_text)
             self.assertNotIn("--safe-mode", bashrc_text)
-            self.assertLess(output.index("[1/3]"), output.index("[2/3]"))
+            self.assertLess(
+                output.index("[1/3] Installing and initializing codex-provider"),
+                output.index("[2/3] Updating aliases, skills, and extension policy"),
+            )
             self.assertTrue((home / ".claude" / "settings.json").exists())
+
+    def test_existing_active_provider_is_adopted_and_initialized(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_home = home / ".codex"
+            codex_home.mkdir()
+            config = codex_home / "config.toml"
+            config.write_text(
+                'model_provider = "existing_route"\n'
+                'model = "gpt-5.6-terra"\n'
+                'model_reasoning_effort = "high"\n\n'
+                '[model_providers.existing_route]\n'
+                'name = "existing_route"\n'
+                'base_url = "https://example.invalid/openai"\n'
+                'wire_api = "responses"\n'
+                'requires_openai_auth = false\n'
+                'env_key = "EXISTING_ROUTE_KEY"\n',
+                encoding="utf-8",
+            )
+            migration_secrets = home / "migration-secrets.env"
+            migration_secrets.write_text(
+                "export EXISTING_ROUTE_KEY='test-secret'\n",
+                encoding="utf-8",
+            )
+            environment = os.environ.copy()
+            environment.pop("EXISTING_ROUTE_KEY", None)
+            environment.update(
+                {
+                    "HOME": str(home),
+                    "CODEX_HOME": str(codex_home),
+                    "CLAUDEX_NONINTERACTIVE": "1",
+                    "CLAUDEX_SKIP_SKILL_INSTALL": "1",
+                    "CLAUDEX_SECRETS_FILE": str(migration_secrets),
+                }
+            )
+
+            completed = subprocess.run(
+                ["bash", str(SETUP_SCRIPT)],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("Codex configured: provider=existing_route", completed.stdout)
+            self.assertIn('model_provider = "existing_route"', config.read_text(encoding="utf-8"))
+            profile = codex_home / "existing_route.config.toml"
+            self.assertTrue(profile.is_file())
+            profile_text = profile.read_text(encoding="utf-8")
+            self.assertIn('model_provider = "existing_route"', profile_text)
+            self.assertIn('model = "gpt-5.6-terra"', profile_text)
+            self.assertIn('model_reasoning_effort = "high"', profile_text)
 
 
 if __name__ == "__main__":

@@ -48,8 +48,8 @@ bash claude/install-codex-bridge.sh
 
 `install-codex-bridge.sh` 严格按以下顺序执行：
 
-1. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
-2. 安装并调用 `codex-provider`，创建或补全 `~/.codex/config.toml` 中的 provider URL、profile 和 Key 引用，并将 Key 写入私有的 `secrets.env`。
+1. 首先安装 `codex-provider`，再由它初始化 provider 的 `base_url`、profile 和 Key。如果 `~/.codex/config.toml` 已有有效的 `model_provider`，执行 `init-existing` 接管它；否则通过 `add` 和 `switch` 创建并选择回退 provider。Key 通过 `import-env` 或 `set-key` 写入私有的 `secrets.env`。
+2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
 3. 读取当前 Codex `model_provider` 的 `base_url`、`wire_api` 和 `env_key`，生成 CLIProxyAPI 配置，启动 `cli-proxy-api.service` 与 `claudex-manager.service`。
 4. 验证网关只暴露 `claudex-router`，然后即可使用 `codex-yolo`、`claude-yolo` 或 `claudex-yolo`。
 
@@ -61,7 +61,9 @@ alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
 alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 ```
 
-默认会提供 `crs`、`crs_local`、`sorryios`、`zskj` 四个 provider，并保留已有且有效的自定义 provider。默认项是 `crs_local`；新电脑没有本地 `127.0.0.1:3000` 服务时，可在安装时选择远程 `crs`：
+如果新电脑的 `~/.codex/config.toml` 已经配置了有效的 `model_provider` 及对应 `[model_providers.<name>]`，安装器会直接读取并采用它，再通过 `codex-provider init-existing` 创建缺失的 provider profile；无需传入 `CLAUDEX_DEFAULT_PROVIDER`。已有 provider 的 URL、模型和选择不会被四个内置 provider 覆盖。
+
+仅当 `config.toml` 不存在，或者当前 `model_provider` 没有对应配置段时，安装器才使用回退项。默认回退项是 `crs_local`；没有本地 `127.0.0.1:3000` 服务时，可显式选择远程 `crs`：
 
 ```bash
 CLAUDEX_DEFAULT_PROVIDER=crs \
