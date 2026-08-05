@@ -29,7 +29,8 @@ class CodexSetupTests(unittest.TestCase):
 
         self.assertIn("--prompt-suggestions false", installer)
         self.assertIn("--model 'claudex-router[1m]'", installer)
-        self.assertIn("--autocompact 250k", installer)
+        self.assertIn("compact_args+=(--autocompact 250k)", installer)
+        self.assertIn("grep -q -- '--autocompact'", installer)
         self.assertIn("ANTHROPIC_CUSTOM_MODEL_OPTION=claudex-router[1m]", installer)
         self.assertIn("ANTHROPIC_CUSTOM_MODEL_OPTION_NAME=GPT Router (1M)", installer)
         self.assertIn("127.0.0.1:8320", installer)
@@ -59,9 +60,59 @@ class CodexSetupTests(unittest.TestCase):
         self.assertIn('Restarting Codex Routing Desk with the installed web console', installer)
         self.assertIn('id="provider-config-open"', installer)
         self.assertIn('restarted with Provider config enabled', installer)
+        self.assertIn('Restarting Claude-to-Codex gateway on 127.0.0.1:8317', installer)
+        self.assertIn('Claude-to-Codex gateway restarted and ready on 127.0.0.1:8317', installer)
+        self.assertIn('cmp -s "${tmp_dir}/claudex" "${BIN_DIR}/claudex"', installer)
+        self.assertIn('cmp -s "${tmp_dir}/${SERVICE_NAME}" "${UNIT_FILE}"', installer)
+        self.assertIn('cmp -s "${tmp_dir}/${MANAGER_SERVICE_NAME}" "${MANAGER_UNIT_FILE}"', installer)
         self.assertIn('"${LIB_DIR}/codex_provider.py"', installer)
         self.assertIn('systemctl --user disable --now "${SERVICE_NAME}"', installer)
         self.assertNotIn('"${BIN_DIR}/codex-provider"', installer)
+
+    def test_claudex_only_uses_autocompact_when_claude_supports_it(self):
+        installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
+        marker = 'cat >"${tmp_dir}/claudex" <<\'EOF\'\n'
+        wrapper = installer.split(marker, 1)[1].split("\nEOF\n", 1)[0]
+
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            bin_dir = home / "bin"
+            local_bin = home / ".local" / "bin"
+            bin_dir.mkdir()
+            local_bin.mkdir(parents=True)
+            wrapper_path = bin_dir / "claudex"
+            wrapper_path.write_text(wrapper, encoding="utf-8")
+            wrapper_path.chmod(0o755)
+            sync = local_bin / "claude-codex-sync"
+            sync.write_text("#!/bin/sh\nprintf 'model\\neffort\\nprovider\\n'\n", encoding="utf-8")
+            sync.chmod(0o755)
+            claude = bin_dir / "claude"
+            claude.write_text(
+                "#!/bin/sh\n"
+                "if [ \"${1:-}\" = --help ]; then\n"
+                "  [ \"${FAKE_AUTOCOMPACT:-0}\" = 1 ] && printf '%s\\n' '  --autocompact <auto|tokens>'\n"
+                "  exit 0\n"
+                "fi\n"
+                "printf '%s\\n' \"$@\"\n",
+                encoding="utf-8",
+            )
+            claude.chmod(0o755)
+            environment = os.environ.copy()
+            environment.update({"HOME": str(home), "PATH": f"{bin_dir}:{environment['PATH']}"})
+
+            for supported in (False, True):
+                with self.subTest(supported=supported):
+                    environment["FAKE_AUTOCOMPACT"] = "1" if supported else "0"
+                    completed = subprocess.run(
+                        [str(wrapper_path)],
+                        capture_output=True,
+                        text=True,
+                        env=environment,
+                    )
+                    self.assertEqual(completed.returncode, 0, completed.stderr)
+                    arguments = completed.stdout.splitlines()
+                    self.assertEqual("--autocompact" in arguments, supported)
+                    self.assertEqual("250k" in arguments, supported)
 
     def test_default_skill_allowlist_preserves_claude_memory_files(self):
         setup = SETUP_SCRIPT.read_text(encoding="utf-8")

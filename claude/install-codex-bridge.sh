@@ -47,7 +47,7 @@ esac
 [[ $(uname -s) == "Linux" ]] || fail "only Linux is supported"
 systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user manager is unavailable"
 
-printf '[3/3] Installing services and the Claude-to-Codex relay\n'
+printf '[3/3] Installing or overwriting commands, website, and services\n'
 mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${STATE_DIR}" "${UNIT_DIR}"
 chmod 700 "${STATE_DIR}"
 
@@ -105,6 +105,7 @@ UMask=0077
 WantedBy=default.target
 EOF
 install -m 0644 "${tmp_dir}/${SERVICE_NAME}" "${UNIT_FILE}"
+cmp -s "${tmp_dir}/${SERVICE_NAME}" "${UNIT_FILE}" || fail "failed to overwrite ${SERVICE_NAME}"
 
 cat >"${tmp_dir}/claude-codex-sync" <<'EOF'
 #!/usr/bin/env bash
@@ -289,6 +290,12 @@ EOF
 install -m 0755 "${tmp_dir}/claude-codex-sync" "${BIN_DIR}/claude-codex-sync"
 install -m 0755 "${SCRIPT_DIR}/codex_bridge_manager.py" "${LIB_DIR}/codex_bridge_manager.py"
 install -m 0644 "${SCRIPT_DIR}/codex_provider.py" "${LIB_DIR}/codex_provider.py"
+cmp -s "${tmp_dir}/claude-codex-sync" "${BIN_DIR}/claude-codex-sync" \
+  || fail "failed to overwrite claude-codex-sync"
+cmp -s "${SCRIPT_DIR}/codex_bridge_manager.py" "${LIB_DIR}/codex_bridge_manager.py" \
+  || fail "failed to overwrite the Codex Routing Desk backend"
+cmp -s "${SCRIPT_DIR}/codex_provider.py" "${LIB_DIR}/codex_provider.py" \
+  || fail "failed to overwrite the provider backend"
 
 cat >"${tmp_dir}/claudex" <<'EOF'
 #!/usr/bin/env bash
@@ -303,6 +310,11 @@ fi
 extension_args=(--strict-mcp-config)
 if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
   extension_args=()
+fi
+compact_args=()
+claude_help="$(claude --help 2>&1 || true)"
+if grep -q -- '--autocompact' <<<"${claude_help}"; then
+  compact_args+=(--autocompact 250k)
 fi
 
 sync_output="$("${HOME}/.local/bin/claude-codex-sync")"
@@ -321,12 +333,15 @@ exec env \
   CLAUDE_CODE_SUBAGENT_MODEL=claudex-router \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
-  claude --model 'claudex-router[1m]' --autocompact 250k --effort medium \
+  claude --model 'claudex-router[1m]' "${compact_args[@]}" --effort medium \
     --settings "${session_settings}" \
     --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
 ln -sfn claudex "${BIN_DIR}/claudex-yolo"
+cmp -s "${tmp_dir}/claudex" "${BIN_DIR}/claudex" || fail "failed to overwrite claudex"
+[[ -L ${BIN_DIR}/claudex-yolo && $(readlink "${BIN_DIR}/claudex-yolo") == claudex ]] \
+  || fail "failed to overwrite claudex-yolo"
 
 cat >"${tmp_dir}/${MANAGER_SERVICE_NAME}" <<'EOF'
 [Unit]
@@ -350,6 +365,8 @@ UMask=0077
 WantedBy=default.target
 EOF
 install -m 0644 "${tmp_dir}/${MANAGER_SERVICE_NAME}" "${MANAGER_UNIT_FILE}"
+cmp -s "${tmp_dir}/${MANAGER_SERVICE_NAME}" "${MANAGER_UNIT_FILE}" \
+  || fail "failed to overwrite ${MANAGER_SERVICE_NAME}"
 
 cat >"${tmp_dir}/claudex-ui" <<'EOF'
 #!/usr/bin/env bash
@@ -366,6 +383,7 @@ else
 fi
 EOF
 install -m 0755 "${tmp_dir}/claudex-ui" "${BIN_DIR}/claudex-ui"
+cmp -s "${tmp_dir}/claudex-ui" "${BIN_DIR}/claudex-ui" || fail "failed to overwrite claudex-ui"
 
 systemctl --user daemon-reload
 systemctl --user enable "${MANAGER_SERVICE_NAME}" >/dev/null
@@ -390,6 +408,7 @@ printf 'Codex Routing Desk restarted with Provider config enabled.\n'
 if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync" 2>"${tmp_dir}/sync-error")"; then
   mapfile -t synced_route <<<"${sync_output}"
   systemctl --user enable "${SERVICE_NAME}" >/dev/null
+  printf 'Restarting Claude-to-Codex gateway on 127.0.0.1:8317...\n'
   systemctl --user restart "${SERVICE_NAME}"
 
   models_json=""
@@ -413,6 +432,7 @@ if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync" 2>"${tmp_
     printf 'Visible models:\n%s\n' "${actual_models}" >&2
     fail "unexpected model catalog"
   }
+  printf 'Claude-to-Codex gateway restarted and ready on 127.0.0.1:8317.\n'
   printf 'Installed Claude-to-Codex bridge with models:\n%s\n' "${actual_models}"
   printf 'Active route: provider=%s model=%s effort=%s\n' \
     "${synced_route[2]}" "${synced_route[0]}" "${synced_route[1]}"

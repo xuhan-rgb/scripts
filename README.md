@@ -60,7 +60,7 @@ bash claude/install-codex-bridge.sh
 4. 在右上角 `Provider config` 中新增、修改或切换 provider。保存时由网页内置后端更新 Codex 配置和私有 Key，再运行 `claude-codex-sync` 并重启 CLIProxyAPI，使 `codex-yolo` 与 `claudex-yolo` 使用同一个当前 provider。
 
 页面不会返回或显示已有 Key；Key 只允许设置或替换，并保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。页面只监听本机回环地址，不提供删除 provider 的操作。
-每次运行安装器都会覆盖服务目录中的网页后端、自动重启 `claudex-manager.service`，并检查返回页面确实包含 `Provider config`；无需再手动执行 `systemctl --user restart`。
+每次运行安装器都会以当前仓库文件覆盖 `claudex`、同步脚本、网页后端和 systemd unit，执行 `daemon-reload`，重启 8320 的 `claudex-manager.service`；Provider 已配置时还会重新生成网关配置、重启 8317 的 `cli-proxy-api.service`。两个服务都经过健康检查，无需再手动执行 `systemctl --user restart`。Provider、Key、模型选择和用量记录会保留，不会因重新安装被清空。
 
 安装精选 Skill 时会显示正在检查或下载的 Claude plugin 来源名称；这些插件只用于复制 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
 
@@ -130,7 +130,7 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 `claudex-ui` 打开的 Codex Routing Desk 只监听 `127.0.0.1:8320`。Instant switch 默认开启；在界面点击 Sol、Terra、Luna 或 reasoning effort 后会立即应用到下一次 Claude 请求。关闭 Instant switch 后可恢复 `Apply selection` 手动确认。所有已打开的 `claudex` 会话都会跟随新路由，不需要重启。
 
-`claudex` 默认传入 `--prompt-suggestions false`，避免 Claude Code 在主回答结束后再调用一次 GPT 生成“下一条建议”，减少每轮额外的上下文 Token 和后台等待；如确实需要该功能，可用 `claudex-yolo --prompt-suggestions true` 临时恢复。
+`claudex` 默认传入 `--prompt-suggestions false`，避免 Claude Code 在主回答结束后再调用一次 GPT 生成“下一条建议”，减少每轮额外的上下文 Token 和后台等待；如确实需要该功能，可用 `claudex-yolo --prompt-suggestions true` 临时恢复。启动时还会检查当前 Claude CLI 是否支持 `--autocompact`：支持时使用 `250k`，旧版本不支持时省略该参数并沿用 Claude 自身的默认自动压缩策略。
 
 `claudex-yolo` 还会通过当前进程的 `skillOverrides` 关闭 Claude Code 内置的 `claude-api` Skill，避免普通问题被误判为 Claude API 开发任务后加载额外上下文。该覆盖不写入 `~/.claude/settings.json`；`claude-yolo` 仍使用官方账号环境，并保留 `claude-api`。
 
