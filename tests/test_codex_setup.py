@@ -52,7 +52,13 @@ class CodexSetupTests(unittest.TestCase):
             installer.index(sync),
             installer.index('systemctl --user restart "${SERVICE_NAME}"'),
         )
-        self.assertIn('systemctl --user restart "${MANAGER_SERVICE_NAME}"', installer)
+        manager_install = 'install -m 0755 "${SCRIPT_DIR}/codex_bridge_manager.py"'
+        manager_restart = 'systemctl --user restart "${MANAGER_SERVICE_NAME}"'
+        self.assertIn(manager_restart, installer)
+        self.assertLess(installer.index(manager_install), installer.index(manager_restart))
+        self.assertIn('Restarting Codex Routing Desk with the installed web console', installer)
+        self.assertIn('id="provider-config-open"', installer)
+        self.assertIn('restarted with Provider config enabled', installer)
         self.assertIn('"${LIB_DIR}/codex_provider.py"', installer)
         self.assertIn('systemctl --user disable --now "${SERVICE_NAME}"', installer)
         self.assertNotIn('"${BIN_DIR}/codex-provider"', installer)

@@ -369,6 +369,7 @@ install -m 0755 "${tmp_dir}/claudex-ui" "${BIN_DIR}/claudex-ui"
 
 systemctl --user daemon-reload
 systemctl --user enable "${MANAGER_SERVICE_NAME}" >/dev/null
+printf 'Restarting Codex Routing Desk with the installed web console...\n'
 systemctl --user restart "${MANAGER_SERVICE_NAME}"
 
 manager_ready=false
@@ -380,6 +381,11 @@ for _ in {1..20}; do
   sleep 1
 done
 [[ ${manager_ready} == true ]] || fail "Codex Routing Desk did not become ready"
+manager_page="${tmp_dir}/manager.html"
+curl --fail --silent --show-error --output "${manager_page}" 'http://127.0.0.1:8320/'
+grep -Fq 'id="provider-config-open"' "${manager_page}" \
+  || fail "Codex Routing Desk is running without the Provider config interface"
+printf 'Codex Routing Desk restarted with Provider config enabled.\n'
 
 if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync" 2>"${tmp_dir}/sync-error")"; then
   mapfile -t synced_route <<<"${sync_output}"

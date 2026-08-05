@@ -60,6 +60,7 @@ bash claude/install-codex-bridge.sh
 4. 在右上角 `Provider config` 中新增、修改或切换 provider。保存时由网页内置后端更新 Codex 配置和私有 Key，再运行 `claude-codex-sync` 并重启 CLIProxyAPI，使 `codex-yolo` 与 `claudex-yolo` 使用同一个当前 provider。
 
 页面不会返回或显示已有 Key；Key 只允许设置或替换，并保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。页面只监听本机回环地址，不提供删除 provider 的操作。
+每次运行安装器都会覆盖服务目录中的网页后端、自动重启 `claudex-manager.service`，并检查返回页面确实包含 `Provider config`；无需再手动执行 `systemctl --user restart`。
 
 安装精选 Skill 时会显示正在检查或下载的 Claude plugin 来源名称；这些插件只用于复制 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
 
