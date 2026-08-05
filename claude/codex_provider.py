@@ -222,6 +222,15 @@ def upsert_secret(env_key: str, api_key: str) -> None:
     SECRETS.chmod(0o600)
 
 
+def remove_secret(env_key: str) -> None:
+    if not SECRETS.exists():
+        return
+    pattern = re.compile(rf"^\s*export\s+{re.escape(env_key)}=")
+    lines = [line for line in SECRETS.read_text().splitlines() if not pattern.match(line)]
+    SECRETS.write_text("\n".join(lines).rstrip() + "\n")
+    SECRETS.chmod(0o600)
+
+
 def parse_providers() -> dict[str, dict[str, str]]:
     text = read_config()
     providers: dict[str, dict[str, str]] = {}
@@ -532,15 +541,45 @@ def cmd_update(args: argparse.Namespace) -> None:
 def cmd_test(args: argparse.Namespace) -> None:
     providers = parse_providers()
     name = validate_name(args.name)
-    if name not in providers:
+    if name not in providers and not args.base_url:
         die(f"provider {name!r} not found")
-    data = providers[name]
-    env_key = data.get("env_key", default_env_key(name))
-    api_key = args.api_key or read_secret_value(env_key)
-    ok, messages = test_provider_connection(data.get("base_url", ""), api_key, timeout=args.timeout)
+    data = providers.get(name, {})
+    base_url = args.base_url or data.get("base_url", "")
+    env_key = args.env_key or data.get("env_key", default_env_key(name))
+    if args.stdin:
+        api_key = sys.stdin.read().rstrip("\r\n")
+    else:
+        api_key = args.api_key or read_secret_value(env_key)
+    ok, messages = test_provider_connection(base_url, api_key, timeout=args.timeout)
     print_test_result(ok, messages)
     if not ok:
         raise SystemExit(1)
+
+
+def cmd_delete(args: argparse.Namespace) -> None:
+    providers = parse_providers()
+    name = validate_name(args.name)
+    if name not in providers:
+        die(f"provider {name!r} not found")
+    if parse_top_level().get("model_provider") == name:
+        die("cannot delete the active provider; activate another provider first")
+    if not args.yes:
+        die("pass --yes to confirm provider deletion")
+
+    env_key = providers[name].get("env_key", default_env_key(name))
+    backup_config()
+    text = remove_table(read_config(), f"model_providers.{name}")
+    CONFIG.write_text(text.rstrip() + "\n")
+    CONFIG.chmod(0o600)
+    profile_file(name).unlink(missing_ok=True)
+    shared_key = any(
+        provider_name != name and data.get("env_key", default_env_key(provider_name)) == env_key
+        for provider_name, data in providers.items()
+    )
+    if not shared_key:
+        remove_secret(env_key)
+    print(f"provider {name!r} deleted")
+    print(f"key: {'kept because it is shared' if shared_key else 'deleted'}")
 
 
 def cmd_import_env(args: argparse.Namespace) -> None:
@@ -939,9 +978,18 @@ notes:
 """,
     )
     test.add_argument("name")
-    test.add_argument("--api-key")
+    test.add_argument("--base-url", help="test this URL instead of the saved provider URL")
+    test.add_argument("--env-key", help="read a stored Key using this environment variable name")
+    test_key = test.add_mutually_exclusive_group()
+    test_key.add_argument("--api-key")
+    test_key.add_argument("--stdin", action="store_true", help="read a temporary API Key from standard input")
     test.add_argument("--timeout", type=float, default=5.0)
     test.set_defaults(func=cmd_test)
+
+    delete = sub.add_parser("delete", help="delete an inactive provider and its unshared stored Key")
+    delete.add_argument("name")
+    delete.add_argument("--yes", action="store_true", help="confirm provider deletion")
+    delete.set_defaults(func=cmd_delete)
 
     switch = sub.add_parser(
         "switch",

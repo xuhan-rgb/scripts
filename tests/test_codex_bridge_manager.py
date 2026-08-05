@@ -66,10 +66,14 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn('id="provider-edit-key"', manager.HTML)
         self.assertIn("/api/providers/save", manager.HTML)
         self.assertIn("/api/providers/switch", manager.HTML)
+        self.assertIn("/api/providers/test", manager.HTML)
+        self.assertIn("/api/providers/delete", manager.HTML)
+        self.assertIn('id="provider-test"', manager.HTML)
+        self.assertIn('id="provider-delete"', manager.HTML)
         self.assertIn("The Key is stored locally with mode 0600", manager.HTML)
         self.assertIn("built-in provider backend", manager.HTML)
         self.assertIn("$('provider-edit-key').required = !provider?.key_set", manager.HTML)
-        self.assertIn("provider.active || !provider.key_set", manager.HTML)
+        self.assertIn("provider?.active", manager.HTML)
 
     def test_dashboard_renders_usage_periods_and_ttft_incrementally(self):
         self.assertIn('id="usage-day-total"', manager.HTML)
@@ -115,7 +119,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertTrue(provider_b["key_set"])
         self.assertNotIn("secret-never-return", json.dumps(providers))
 
-    def test_saves_and_activates_provider_without_key_in_process_arguments(self):
+    def test_saves_provider_without_activating_or_putting_key_in_process_arguments(self):
         commands = []
 
         def run(arguments, input_text=None):
@@ -140,9 +144,80 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertEqual(name, "new_route")
         self.assertEqual(commands[0][0][0], "add")
         self.assertEqual(commands[1], (["set-key", "new_route", "--stdin"], " secret-never-in-argv "))
-        self.assertEqual(commands[2], (["switch", "new_route"], None))
+        self.assertEqual(len(commands), 2)
         self.assertFalse(any("secret-never-in-argv" in argument for command, _ in commands for argument in command))
+        sync.assert_not_called()
+
+    def test_activates_and_syncs_a_saved_provider(self):
+        provider = {
+            "name": "saved_route",
+            "base_url": "https://gateway.example/openai",
+            "wire_api": "responses",
+            "env_key": "SAVED_ROUTE_KEY",
+            "key_set": True,
+            "active": True,
+        }
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=[provider]),
+            mock.patch.object(manager, "_run_provider_command") as run,
+            mock.patch.object(manager, "_sync_provider_gateway") as sync,
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            name = manager.switch_provider({"name": "saved_route"})
+
+        self.assertEqual(name, "saved_route")
+        run.assert_called_once_with(["switch", "saved_route"])
         sync.assert_called_once_with()
+
+    def test_tests_unsaved_provider_fields_without_putting_key_in_process_arguments(self):
+        with (
+            mock.patch.object(manager, "_run_provider_command", return_value="connection test:\nresult: ok\n") as run,
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            result = manager.test_provider(
+                {
+                    "name": "candidate",
+                    "base_url": "https://candidate.example/openai",
+                    "env_key": "CANDIDATE_KEY",
+                    "api_key": "candidate-secret",
+                }
+            )
+
+        self.assertEqual(result, "connection test:\nresult: ok")
+        run.assert_called_once_with(
+            [
+                "test",
+                "candidate",
+                "--base-url",
+                "https://candidate.example/openai",
+                "--env-key",
+                "CANDIDATE_KEY",
+                "--stdin",
+            ],
+            input_text="candidate-secret",
+        )
+
+    def test_deletes_only_an_inactive_provider(self):
+        providers = [
+            {"name": "active_route", "active": True, "key_set": True},
+            {"name": "old_route", "active": False, "key_set": True},
+        ]
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=providers),
+            mock.patch.object(manager, "_run_provider_command") as run,
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            name = manager.delete_provider({"name": "old_route", "confirm_name": "old_route"})
+
+        self.assertEqual(name, "old_route")
+        run.assert_called_once_with(["delete", "old_route", "--yes"])
+
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=providers),
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            with self.assertRaisesRegex(ValueError, "active provider"):
+                manager.delete_provider({"name": "active_route", "confirm_name": "active_route"})
 
     def test_internal_provider_backend_updates_config_without_installing_a_command(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -178,7 +253,40 @@ class CodexBridgeManagerTests(unittest.TestCase):
             self.assertNotIn(secret, output)
             self.assertFalse((home / ".local" / "bin" / "codex-provider").exists())
 
-    def test_refuses_to_activate_an_existing_provider_without_key(self):
+    def test_internal_provider_backend_deletes_only_an_inactive_provider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_home = home / ".codex"
+            environment = {"HOME": str(home), "CODEX_HOME": str(codex_home)}
+            with mock.patch.dict(os.environ, environment):
+                for name, env_key in (("active_route", "ACTIVE_KEY"), ("old_route", "OLD_KEY")):
+                    manager._run_provider_command(
+                        [
+                            "add",
+                            name,
+                            "--base-url",
+                            "https://gateway.example/openai",
+                            "--env-key",
+                            env_key,
+                            "--skip-test",
+                        ]
+                    )
+                    manager._run_provider_command(["set-key", name, "--stdin"], input_text=f"{name}-secret")
+                manager._run_provider_command(["switch", "active_route"])
+                manager._run_provider_command(["delete", "old_route", "--yes"])
+
+                with self.assertRaisesRegex(ValueError, "cannot delete the active provider"):
+                    manager._run_provider_command(["delete", "active_route", "--yes"])
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            secrets_text = (home / ".config" / "codex" / "secrets.env").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "active_route"', config_text)
+            self.assertNotIn("[model_providers.old_route]", config_text)
+            self.assertFalse((codex_home / "old_route.config.toml").exists())
+            self.assertNotIn("OLD_KEY", secrets_text)
+            self.assertIn("ACTIVE_KEY", secrets_text)
+
+    def test_refuses_to_save_an_existing_provider_without_key(self):
         providers = [
             {
                 "name": "missing_key",
@@ -223,7 +331,6 @@ class CodexBridgeManagerTests(unittest.TestCase):
         with (
             mock.patch.object(manager, "read_provider_catalog", return_value=providers),
             mock.patch.object(manager, "_run_provider_command", side_effect=run),
-            mock.patch.object(manager, "_sync_provider_gateway"),
             mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
         ):
             manager.save_provider(

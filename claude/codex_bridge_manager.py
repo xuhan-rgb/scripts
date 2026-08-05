@@ -538,9 +538,22 @@ def save_provider(payload):
         _run_provider_command(command)
         if api_key:
             _run_provider_command(["set-key", name, "--stdin"], input_text=api_key)
-        _run_provider_command(["switch", name])
-        _sync_provider_gateway()
     return name
+
+
+def test_provider(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("provider payload must be an object")
+    name = _payload_text(payload, "name", required=True, maximum=64)
+    base_url = _payload_text(payload, "base_url", required=True)
+    env_key = _payload_text(payload, "env_key", maximum=128) or _default_env_key(name)
+    api_key = _payload_text(payload, "api_key", maximum=8192, strip=False)
+    command = ["test", name, "--base-url", base_url, "--env-key", env_key]
+    if api_key:
+        command.append("--stdin")
+    with _provider_lock():
+        result = _run_provider_command(command, input_text=api_key or None)
+    return result.strip()
 
 
 def switch_provider(payload):
@@ -556,6 +569,24 @@ def switch_provider(payload):
             raise ValueError(f"provider {name!r} has no API key")
         _run_provider_command(["switch", name])
         _sync_provider_gateway()
+    return name
+
+
+def delete_provider(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("provider payload must be an object")
+    name = _payload_text(payload, "name", required=True, maximum=64)
+    confirm_name = _payload_text(payload, "confirm_name", required=True, maximum=64)
+    if confirm_name != name:
+        raise ValueError("provider deletion confirmation does not match")
+    with _provider_lock():
+        providers = {item["name"]: item for item in read_provider_catalog()}
+        provider = providers.get(name)
+        if provider is None:
+            raise ValueError(f"provider {name!r} not found")
+        if provider["active"]:
+            raise ValueError("cannot delete the active provider; activate another provider first")
+        _run_provider_command(["delete", name, "--yes"])
     return name
 
 
@@ -807,12 +838,14 @@ HTML = r'''<!doctype html>
     .key-state { display: inline-flex; width: fit-content; padding: 4px 8px; color: var(--bad); background: rgba(180,72,53,.08); border-radius: 999px; font: 800 10px "DejaVu Sans Mono", monospace; }
     .key-state.ready { color: var(--good); background: rgba(40,118,80,.1); }
     .provider-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
-    .provider-save, .provider-switch { padding: 12px; border-radius: 11px; cursor: pointer; font-weight: 900; }
+    .provider-save, .provider-switch, .provider-test, .provider-delete { padding: 12px; border-radius: 11px; cursor: pointer; font-weight: 900; }
+    .provider-test { color: var(--teal); background: transparent; border: 1px solid var(--teal); }
     .provider-save { color: #1c2527; background: var(--signal); border: 1px solid var(--signal); }
     .provider-switch { color: var(--panel); background: var(--ink); border: 1px solid var(--ink); }
-    .provider-save:disabled, .provider-switch:disabled { opacity: .45; cursor: wait; }
+    .provider-delete { color: var(--bad); background: transparent; border: 1px solid rgba(180,72,53,.65); }
+    .provider-save:disabled, .provider-switch:disabled, .provider-test:disabled, .provider-delete:disabled { opacity: .45; cursor: not-allowed; }
     .config-footnote { margin: 18px 0 0; padding-top: 15px; color: var(--ink-soft); border-top: 1px solid var(--line); font-size: 10px; line-height: 1.55; }
-    .toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); transform: translateY(90px); opacity: 0; transition: .25s ease; }
+    .toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); white-space: pre-line; transform: translateY(90px); opacity: 0; transition: .25s ease; }
     .toast.show { transform: translateY(0); opacity: 1; }
     .toast.error { background: var(--bad); }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
@@ -1012,11 +1045,13 @@ HTML = r'''<!doctype html>
           <span id="provider-key-state" class="key-state">Key missing</span>
         </div>
         <div class="provider-actions">
-          <button id="provider-switch" class="provider-switch" type="button">Switch & sync</button>
-          <button id="provider-save" class="provider-save" type="submit">Save & activate</button>
+          <button id="provider-test" class="provider-test" type="button">Test</button>
+          <button id="provider-save" class="provider-save" type="submit">Save</button>
+          <button id="provider-delete" class="provider-delete" type="button">Delete</button>
+          <button id="provider-switch" class="provider-switch" type="button">Activate</button>
         </div>
       </form>
-      <p class="config-footnote">Changes are written by the built-in provider backend. The Key is stored locally with mode 0600 and is never returned to this page. Saving or switching updates Codex, regenerates the claudex gateway, and restarts CLIProxyAPI.</p>
+      <p class="config-footnote">The built-in provider backend handles all actions. Save stores the provider without changing the active route. The Key is stored locally with mode 0600 and is never returned to this page. Test checks TCP and the /models endpoint without saving. Activate switches Codex, regenerates the claudex gateway, and restarts CLIProxyAPI. Delete is available only for inactive providers.</p>
     </aside>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -1031,6 +1066,7 @@ HTML = r'''<!doctype html>
       saving: false,
       saveTimer: null,
       providerSaving: false,
+      providerAction: '',
       providerIsNew: false,
     };
     const $ = (id) => document.getElementById(id);
@@ -1210,6 +1246,29 @@ HTML = r'''<!doctype html>
         : '<option value="">No providers configured</option>';
       if (selectedName && providerByName(selectedName)) $('provider-picker').value = selectedName;
     }
+    function providerFormChanged(provider) {
+      if (!provider) return true;
+      return $('provider-edit-name').value.trim() !== provider.name
+        || $('provider-edit-url').value.trim() !== provider.base_url
+        || $('provider-edit-env').value.trim() !== provider.env_key
+        || Boolean($('provider-edit-key').value);
+    }
+    function updateProviderActions(provider) {
+      const busy = app.providerSaving;
+      const changed = providerFormChanged(provider);
+      $('provider-picker').disabled = busy;
+      $('provider-new').disabled = busy;
+      $('provider-test').disabled = busy;
+      $('provider-save').disabled = busy || (!app.providerIsNew && !changed);
+      $('provider-switch').disabled = busy || !provider || !provider.key_set || changed;
+      $('provider-switch').title = changed ? 'Save changes before activation.' : '';
+      $('provider-delete').disabled = busy || !provider || provider.active;
+      $('provider-delete').title = provider?.active ? 'Activate another provider before deleting this one.' : '';
+      $('provider-test').textContent = app.providerAction === 'test' ? 'Testing...' : 'Test';
+      $('provider-save').textContent = app.providerAction === 'save' ? 'Saving...' : 'Save';
+      $('provider-delete').textContent = app.providerAction === 'delete' ? 'Deleting...' : 'Delete';
+      $('provider-switch').textContent = app.providerAction === 'activate' ? 'Activating...' : 'Activate';
+    }
     function editProvider(provider) {
       app.providerIsNew = !provider;
       $('provider-edit-name').value = provider?.name || '';
@@ -1221,12 +1280,7 @@ HTML = r'''<!doctype html>
       $('provider-edit-key').required = !provider?.key_set;
       $('provider-key-state').textContent = provider?.key_set ? 'Key stored' : 'Key missing';
       $('provider-key-state').classList.toggle('ready', Boolean(provider?.key_set));
-      $('provider-switch').disabled = app.providerSaving || !provider || provider.active || !provider.key_set;
-      $('provider-switch').textContent = provider?.active
-        ? 'Active provider'
-        : provider && !provider.key_set ? 'Set Key to switch' : 'Switch & sync';
-      $('provider-save').disabled = app.providerSaving;
-      $('provider-save').textContent = app.providerSaving ? 'Saving...' : 'Save & activate';
+      updateProviderActions(provider);
     }
     function openProviderConfig() {
       const current = app.state?.provider?.provider || app.state?.providers?.[0]?.name;
@@ -1247,43 +1301,79 @@ HTML = r'''<!doctype html>
       editProvider(null);
       $('provider-edit-name').focus();
     }
-    async function providerRequest(path, payload, successMessage) {
+    function providerFormPayload() {
+      return {
+        name: $('provider-edit-name').value,
+        base_url: $('provider-edit-url').value,
+        env_key: $('provider-edit-env').value,
+        api_key: $('provider-edit-key').value,
+      };
+    }
+    async function providerStateRequest(path, payload, action, successMessage, selectedName) {
       if (app.providerSaving) return;
-      let completed = false;
       app.providerSaving = true;
-      editProvider(app.providerIsNew ? null : providerByName($('provider-picker').value));
+      app.providerAction = action;
+      updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
       try {
         const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
         const state = await response.json();
         if (!response.ok) throw new Error(state.error || `HTTP ${response.status}`);
         app.state = state;
         if (!app.dirty) app.draft = {...state.selection};
-        populateProviderPicker(state.provider.provider);
-        editProvider(providerByName(state.provider.provider));
+        const nextName = typeof selectedName === 'function' ? selectedName(state) : selectedName;
+        populateProviderPicker(nextName);
+        editProvider(providerByName(nextName));
         render();
         notify(successMessage);
-        completed = true;
       } catch (error) {
-        notify(`Provider update failed: ${error.message}`, true);
+        notify(`Provider ${action} failed: ${error.message}`, true);
       } finally {
         app.providerSaving = false;
-        if (completed) closeProviderConfig();
-        else if (!$('provider-config-layer').hidden) editProvider(app.providerIsNew ? null : providerByName($('provider-picker').value));
+        app.providerAction = '';
+        if (!$('provider-config-layer').hidden) updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
+      }
+    }
+    async function testProviderConnection() {
+      if (app.providerSaving || !$('provider-form').reportValidity()) return;
+      app.providerSaving = true;
+      app.providerAction = 'test';
+      updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
+      try {
+        const response = await fetch('/api/providers/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(providerFormPayload())});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        notify(result.message || 'Provider connection test passed.');
+      } catch (error) {
+        notify(`Provider test failed: ${error.message}`, true);
+      } finally {
+        app.providerSaving = false;
+        app.providerAction = '';
+        if (!$('provider-config-layer').hidden) updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
       }
     }
     function saveProvider(event) {
       event.preventDefault();
       if (!$('provider-form').reportValidity()) return;
-      providerRequest('/api/providers/save', {
-        name: $('provider-edit-name').value,
-        base_url: $('provider-edit-url').value,
-        env_key: $('provider-edit-env').value,
-        api_key: $('provider-edit-key').value,
-      }, 'Provider saved. Codex and claudex now share the new route.');
+      const payload = providerFormPayload();
+      providerStateRequest('/api/providers/save', payload, 'save', 'Provider saved. Activate it to apply the route.', payload.name.trim());
     }
     function useSelectedProvider() {
       const provider = providerByName($('provider-picker').value);
-      if (provider) providerRequest('/api/providers/switch', {name: provider.name}, `Switched to ${provider.name}.`);
+      if (provider && !providerFormChanged(provider)) {
+        providerStateRequest('/api/providers/switch', {name: provider.name}, 'activate', `Activated ${provider.name}.`, provider.name);
+      }
+    }
+    function deleteSelectedProvider() {
+      const provider = providerByName($('provider-picker').value);
+      if (!provider || provider.active) return;
+      if (!window.confirm(`Delete provider "${provider.name}" and its unshared stored Key?`)) return;
+      providerStateRequest(
+        '/api/providers/delete',
+        {name: provider.name, confirm_name: provider.name},
+        'delete',
+        `Deleted ${provider.name}.`,
+        (state) => state.provider.provider,
+      );
     }
 
     async function refresh() {
@@ -1336,7 +1426,10 @@ HTML = r'''<!doctype html>
     $('provider-config-scrim').addEventListener('click', closeProviderConfig);
     $('provider-new').addEventListener('click', newProvider);
     $('provider-picker').addEventListener('change', () => editProvider(providerByName($('provider-picker').value)));
+    $('provider-form').addEventListener('input', () => updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value)));
     $('provider-form').addEventListener('submit', saveProvider);
+    $('provider-test').addEventListener('click', testProviderConnection);
+    $('provider-delete').addEventListener('click', deleteSelectedProvider);
     $('provider-switch').addEventListener('click', useSelectedProvider);
     document.addEventListener('keydown', (event) => {
       if (event.key === 'Escape' && !$('provider-config-layer').hidden) { closeProviderConfig(); return; }
@@ -1417,7 +1510,13 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path not in {"/api/selection", "/api/providers/save", "/api/providers/switch"}:
+        if self.path not in {
+            "/api/selection",
+            "/api/providers/save",
+            "/api/providers/test",
+            "/api/providers/switch",
+            "/api/providers/delete",
+        }:
             self.send_error(404)
             return
         try:
@@ -1426,8 +1525,13 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 apply_selection(payload.get("model"), payload.get("effort"))
             elif self.path == "/api/providers/save":
                 save_provider(payload)
-            else:
+            elif self.path == "/api/providers/test":
+                self._send_json(200, {"message": test_provider(payload)})
+                return
+            elif self.path == "/api/providers/switch":
                 switch_provider(payload)
+            else:
+                delete_provider(payload)
             time.sleep(0.35)
             self._send_json(200, build_state())
         except PermissionError as error:

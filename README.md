@@ -57,9 +57,9 @@ bash claude/install-codex-bridge.sh
 1. 初始化 `~/.codex/config.toml` 中的 provider；没有 Key 时只记录待配置状态，不中断安装，也不安装独立的 `codex-provider` 命令。
 2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。没有 `uv` 且 Agent Reach 尚未安装时，交互式询问是否使用 Python venv 安装；选择不使用只会关闭 Agent Reach。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
 3. 无条件启动只监听 `127.0.0.1:8320` 的 `claudex-manager.service`。如果当前 provider 和 Key 已经完整，同时生成 CLIProxyAPI 配置并启动网关；否则网页显示 `Provider setup required`。
-4. 在右上角 `Provider config` 中新增、修改或切换 provider。保存时由网页内置后端更新 Codex 配置和私有 Key，再运行 `claude-codex-sync` 并重启 CLIProxyAPI，使 `codex-yolo` 与 `claudex-yolo` 使用同一个当前 provider。
+4. 在右上角 `Provider config` 中管理 provider：`Save` 只保存配置和私有 Key，`Test` 使用当前表单测试 TCP 与 `/models`，`Activate` 切换 provider、运行 `claude-codex-sync` 并重启 CLIProxyAPI，`Delete` 删除非当前 provider。
 
-页面不会返回或显示已有 Key；Key 只允许设置或替换，并保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。页面只监听本机回环地址，不提供删除 provider 的操作。
+页面不会返回或显示已有 Key；Key 只允许设置或替换，并保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。页面只监听本机回环地址。当前 active provider 不能删除；删除非 active provider 时会同时删除其 profile，并在没有其他 provider 共用同一个 Env Key 时删除对应 Key。
 每次运行安装器都会以当前仓库文件覆盖 `claudex`、同步脚本、网页后端和 systemd unit，执行 `daemon-reload`，重启 8320 的 `claudex-manager.service`；Provider 已配置时还会重新生成网关配置、重启 8317 的 `cli-proxy-api.service`。两个服务都经过健康检查，无需再手动执行 `systemctl --user restart`。Provider、Key、模型选择和用量记录会保留，不会因重新安装被清空。
 
 安装精选 Skill 时会显示正在检查或下载的 Claude plugin 来源名称；这些插件只用于复制 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
@@ -124,7 +124,7 @@ claudex-ui        # 打开本地路由控制台
 
 Claude 始终只连接一个稳定的虚拟模型 `claudex-router[1m]`，客户端 effort 固定为 `medium`。`claudex` 通过进程级 `availableModels` 把 `/model` 收敛为 `Default` 和 `GPT Router (1M)`，两项都指向本地中转；该限制不会写入 `~/.claude/settings.json`，也不会影响 `claude-yolo` 的官方账号登录。真实的 GPT 模型和 reasoning effort 仍由 Codex Routing Desk 在网关层逐请求覆盖，独立保存在 `~/.cli-proxy-api/selection.conf`，不会反向修改 Codex 配置。
 
-当前部署使用 ChatGPT/Codex 订阅账号中转，而不是 OpenAI Platform API Key，因此按订阅产品的窗口和 usage 风险配置：Codex 的最大上下文写为 `372000`，但自动 compact 固定在 `244800`；`claudex` 的 auto-compact window 固定为 `250k`。运行 Codex `/status` 应看到 `372K` context window，运行 Claude `/context` 应看到 `claudex-router[1m]` 和 `250k` auto-compact window。
+当前部署使用 ChatGPT/Codex 订阅账号中转，而不是 OpenAI Platform API Key，因此按订阅产品的窗口和 usage 风险配置：Codex 的最大上下文写为 `372000`，但自动 compact 固定在 `244800`；Claude CLI 支持 `--autocompact` 时，`claudex` 的 auto-compact window 固定为 `250k`。运行 Codex `/status` 应看到 `372K` context window；在支持该参数的 Claude 版本中，运行 `/context` 应看到 `claudex-router[1m]` 和 `250k` auto-compact window。
 
 GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terra](https://developers.openai.com/api/docs/models/gpt-5.6-terra) 和 [Luna](https://developers.openai.com/api/docs/models/gpt-5.6-luna) 的模型 API 上限虽然是 1,050,000 Token（最大输入 922,000、最大输出 128,000），但官方同时规定：输入超过 272K 后，整次 API 请求的输入按 2 倍、输出按 1.5 倍计价。订阅账号中转不会直接产生相同形式的 API 账单，OpenAI 也没有公开完全等价的订阅 usage 换算规则；这里仍把 272K 作为保护线，避免长会话过快消耗账号或中转额度。如确实需要一次性使用更长上下文，应先手动 compact 或开启新会话，而不是长期提高默认阈值。
 
