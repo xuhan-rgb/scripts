@@ -49,7 +49,7 @@ bash claude/install-codex-bridge.sh
 `install-codex-bridge.sh` 严格按以下顺序执行：
 
 1. 首先安装 `codex-provider`，再由它初始化 provider 的 `base_url`、profile 和 Key。如果 `~/.codex/config.toml` 已有有效的 `model_provider`，执行 `init-existing` 接管它；否则通过 `add` 和 `switch` 创建并选择回退 provider。Key 通过 `import-env` 或 `set-key` 写入私有的 `secrets.env`。
-2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
+2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。没有 `uv` 且 Agent Reach 尚未安装时，交互式询问是否使用 Python venv 安装；选择不使用只会关闭 Agent Reach。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
 3. 读取当前 Codex `model_provider` 的 `base_url`、`wire_api` 和 `env_key`，生成 CLIProxyAPI 配置，启动 `cli-proxy-api.service` 与 `claudex-manager.service`。
 4. 验证网关只暴露 `claudex-router`，然后即可使用 `codex-yolo`、`claude-yolo` 或 `claudex-yolo`。
 
@@ -112,7 +112,7 @@ codex-provider test crs
 脚本最终会安装：
 
 - 安装 `codex-provider`、固定版本的 CLIProxyAPI user service、Claude 启动器和 Codex Routing Desk。
-- 从固定的官方 GitHub tag 安装 Agent Reach v1.5.0，并安装六个精选 Skill；插件整包仅作为 Skill 来源，复制完成后保持关闭。
+- 安装五个固定的精选 Skill；Agent Reach v1.5.0 从固定的官方 GitHub tag 安装，但在没有 `uv` 时可选择跳过。插件整包仅作为 Skill 来源，复制完成后保持关闭。
 - 创建 `claudex`、`claudex-yolo`、`claudex-ui` 命令。
 - 创建仅监听 `127.0.0.1` 的 `cli-proxy-api.service` 与 `claudex-manager.service`。
 - 创建权限为 `0600` 的 Codex 配置、provider secrets、网关配置和 usage 数据库。
@@ -129,16 +129,18 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 `claudex-yolo` 还会通过当前进程的 `skillOverrides` 关闭 Claude Code 内置的 `claude-api` Skill，避免普通问题被误判为 Claude API 开发任务后加载额外上下文。该覆盖不写入 `~/.claude/settings.json`；`claude-yolo` 仍使用官方账号环境，并保留 `claude-api`。
 
-为了降低新会话的固定上下文，安装器只开启六个精选 Skill：`agent-reach`、`brainstorming`、`grill-me`、`grill-with-docs`、`handoff`、`tdd`。`grilling` 和 `domain-modeling` 是两个 grill 命令内部调用的依赖，不作为主入口展示；其余自定义 Skill、plugins 和 MCP 默认关闭，但不会被卸载或删除。
+为了降低新会话的固定上下文，安装器固定开启五个精选 Skill：`brainstorming`、`grill-me`、`grill-with-docs`、`handoff`、`tdd`。`agent-reach` 在已安装、存在 `uv` 或用户同意使用 Python venv 时一并开启；选择跳过不会删除已有文件，但会在 Claude 和 Codex 中关闭它。`grilling` 和 `domain-modeling` 是两个 grill 命令内部调用的依赖，不作为主入口展示；其余自定义 Skill、plugins 和 MCP 默认关闭，但不会被卸载或删除。
+
+无 `uv` 时，交互式安装会询问是否启用 Agent Reach。非交互安装默认跳过；可设置 `CLAUDEX_AGENT_REACH=1` 强制使用 Python venv（要求系统已安装 `python3-venv`），或设置 `CLAUDEX_AGENT_REACH=0` 明确关闭。
 
 | 命令 | 可用的精选 Skill | 额外差异 |
 | --- | --- | --- |
-| `codex-yolo` | 六个主 Skill；两个内部依赖也启用 | 读取 `~/.agents/skills`；Codex MCP/plugin 全部关闭；不经过 GPT 中转和 8320 usage 统计 |
-| `claude-yolo` | 六个主 Skill；两个依赖以 `name-only` 提供 | 使用官方 Claude 账号；保留 Claude 内置 `claude-api`；严格关闭 MCP |
+| `codex-yolo` | 五个固定主 Skill 和可选 Agent Reach；两个内部依赖也启用 | 读取 `~/.agents/skills`；Codex MCP/plugin 全部关闭；不经过 GPT 中转和 8320 usage 统计 |
+| `claude-yolo` | 五个固定主 Skill 和可选 Agent Reach；两个依赖以 `name-only` 提供 | 使用官方 Claude 账号；保留 Claude 内置 `claude-api`；严格关闭 MCP |
 | `claudex-yolo` | 与 `claude-yolo` 相同 | 使用 GPT 中转，并只在该进程额外关闭内置 `claude-api`；严格关闭 MCP |
 
-- Codex 的每个 MCP/plugin section 都写为 `enabled = false`。六个主 Skill 和两个内部依赖只启用 `~/.agents/skills` 中的一份；`~/.claude/skills` 的重复副本以及其他已发现 Skill 都写为 `enabled = false`。
-- Claude 的已安装插件会通过官方 `claude plugin disable` 关闭，包括用于提供 Skill 源文件的 `mattpocock-skills` 和 `superpowers`。`~/.claude/settings.json` 的 `skillOverrides` 将六个主 Skill 设为 `on`、两个内部依赖设为 `name-only`、其余用户 Skill 设为 `off`。
+- Codex 的每个 MCP/plugin section 都写为 `enabled = false`。五个固定主 Skill、按选择启用的 Agent Reach 和两个内部依赖只启用 `~/.agents/skills` 中的一份；`~/.claude/skills` 的重复副本以及其他已发现 Skill 都写为 `enabled = false`。
+- Claude 的已安装插件会通过官方 `claude plugin disable` 关闭，包括用于提供 Skill 源文件的 `mattpocock-skills` 和 `superpowers`。`~/.claude/settings.json` 的 `skillOverrides` 将五个固定主 Skill 和按选择启用的 Agent Reach 设为 `on`、两个内部依赖设为 `name-only`、其余用户 Skill 设为 `off`。
 - Claude 启动器使用 `--strict-mcp-config`，不会读取用户、项目或全局 MCP 配置，但不会使用 `--safe-mode`，所以 `~/.claude/CLAUDE.md` 与项目层级的 `CLAUDE.md` 仍然生效。
 - 临时需要 Claude 读取已有 MCP 配置时，使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`；这会取消本地中转进程的严格 MCP 限制，Skill 仍以 `skillOverrides` 为准。
 - Claude 需要临时打开其他 Skill 时，在 `~/.claude/settings.json` 的 `skillOverrides` 中将对应名称改为 `on`；Codex 则在 `~/.codex/config.toml` 中将对应 `[[skills.config]]` 的 `enabled` 改为 `true`，然后启动新会话。

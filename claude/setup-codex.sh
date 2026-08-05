@@ -15,6 +15,7 @@ readonly DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-d
 readonly INTERNAL_SKILLS="domain-modeling grilling"
 readonly AGENT_REACH_VERSION="1.5.0"
 readonly AGENT_REACH_SOURCE="https://github.com/Panniantong/Agent-Reach/archive/refs/tags/v${AGENT_REACH_VERSION}.zip"
+ENABLED_SKILLS="${DEFAULT_ENABLED_SKILLS}"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -113,6 +114,8 @@ install_agent_reach() {
     if command -v uv >/dev/null 2>&1; then
       UV_TOOL_BIN_DIR="${BIN_DIR}" uv tool install --force "${AGENT_REACH_SOURCE}" >/dev/null
     else
+      python3 -c 'import ensurepip, venv' >/dev/null 2>&1 \
+        || fail "Agent Reach requires uv or python3-venv; install python3-venv or rerun with CLAUDEX_AGENT_REACH=0"
       python3 -m venv "${venv_dir}"
       "${venv_dir}/bin/python" -m pip install --upgrade "${AGENT_REACH_SOURCE}" >/dev/null
       install -m 0755 "${venv_dir}/bin/agent-reach" "${BIN_DIR}/agent-reach"
@@ -141,6 +144,52 @@ install_agent_reach() {
     || fail "Agent Reach skill installation failed"
 }
 
+configure_agent_reach_choice() {
+  local choice="${CLAUDEX_AGENT_REACH:-}"
+  local executable
+
+  case "${choice}" in
+    0)
+      ENABLED_SKILLS="${ENABLED_SKILLS#agent-reach }"
+      printf 'Agent Reach disabled by CLAUDEX_AGENT_REACH=0\n'
+      return
+      ;;
+    1 | "") ;;
+    *) fail "CLAUDEX_AGENT_REACH must be 0 or 1" ;;
+  esac
+
+  executable="$(command -v agent-reach || true)"
+  if [[ -n ${executable} ]] \
+    && [[ $("${executable}" --version 2>/dev/null || true) == "Agent Reach v${AGENT_REACH_VERSION}" ]]; then
+    return
+  fi
+  command -v uv >/dev/null 2>&1 && return
+  [[ ${CLAUDEX_SKIP_SKILL_INSTALL:-0} == 1 ]] && return
+
+  if [[ -z ${choice} ]]; then
+    if [[ -t 0 && -t 1 && ${CLAUDEX_NONINTERACTIVE:-0} != 1 ]]; then
+      printf 'uv is not installed. Enable Agent Reach using a Python virtual environment? [y/N] '
+      IFS= read -r choice || choice=""
+      case "${choice,,}" in
+        y | yes) choice=1 ;;
+        *) choice=0 ;;
+      esac
+    else
+      choice=0
+      printf 'uv is not installed; skipping optional Agent Reach in non-interactive mode.\n'
+    fi
+  fi
+
+  if [[ ${choice} == 0 ]]; then
+    ENABLED_SKILLS="${ENABLED_SKILLS#agent-reach }"
+    printf 'Agent Reach will not be enabled; the other selected skills are unchanged.\n'
+    return
+  fi
+
+  python3 -c 'import ensurepip, venv' >/dev/null 2>&1 \
+    || fail "Agent Reach requires python3-venv when uv is unavailable; install it or rerun and choose no"
+}
+
 install_selected_skills() {
   local matt_path
   local superpowers_path
@@ -148,7 +197,9 @@ install_selected_skills() {
   command -v claude >/dev/null 2>&1 || fail "missing required command: claude"
 
   mkdir -p "${BIN_DIR}"
-  install_agent_reach
+  if [[ " ${ENABLED_SKILLS} " == *" agent-reach "* ]]; then
+    install_agent_reach
+  fi
   matt_path="$(ensure_claude_plugin_source mattpocock-skills@claude-plugins-official)"
   superpowers_path="$(ensure_claude_plugin_source superpowers@claude-plugins-official)"
 
@@ -199,7 +250,7 @@ configure_claude_skill_overrides() {
 
   settings_tmp="$(mktemp "${settings_file}.tmp.XXXXXX")"
   python3 - "${settings_file}" "${settings_tmp}" \
-    "${DEFAULT_ENABLED_SKILLS}" "${INTERNAL_SKILLS}" <<'PY'
+    "${ENABLED_SKILLS}" "${INTERNAL_SKILLS}" <<'PY'
 import json
 import re
 import sys
@@ -420,7 +471,7 @@ configure_codex_skills() {
     skill_name="$(basename "$(dirname "${skill_path}")")"
     enabled=false
     if [[ ${skill_path} == "${HOME}/.agents/skills/"* ]] \
-      && [[ " ${DEFAULT_ENABLED_SKILLS} ${INTERNAL_SKILLS} " == *" ${skill_name} "* ]]; then
+      && [[ " ${ENABLED_SKILLS} ${INTERNAL_SKILLS} " == *" ${skill_name} "* ]]; then
       enabled=true
     fi
     printf '[[skills.config]]\npath = "%s"\nenabled = %s\n\n' \
@@ -486,6 +537,7 @@ printf 'Codex configured: provider=%s config=%s\n' "${active_provider}" "${CODEX
 printf 'Provider manager: %s\n' "${CODEX_PROVIDER}"
 
 printf '[2/3] Updating aliases, skills, and extension policy\n'
+configure_agent_reach_choice
 update_bashrc
 install_selected_skills
 disable_claude_plugins

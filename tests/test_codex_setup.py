@@ -53,6 +53,13 @@ class CodexSetupTests(unittest.TestCase):
             'DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-docs handoff tdd"',
             setup,
         )
+        self.assertIn('ENABLED_SKILLS="${DEFAULT_ENABLED_SKILLS}"', setup)
+        self.assertIn("CLAUDEX_AGENT_REACH", setup)
+        self.assertIn(
+            "Enable Agent Reach using a Python virtual environment? [y/N]",
+            setup,
+        )
+        self.assertIn("import ensurepip, venv", setup)
         self.assertIn('INTERNAL_SKILLS="domain-modeling grilling"', setup)
         self.assertIn('readonly AGENT_REACH_VERSION="1.5.0"', setup)
         self.assertIn(
@@ -107,6 +114,7 @@ class CodexSetupTests(unittest.TestCase):
                     "HOME": str(home),
                     "CODEX_HOME": str(home / ".codex"),
                     "CLAUDEX_NONINTERACTIVE": "1",
+                    "CLAUDEX_AGENT_REACH": "0",
                     "CLAUDEX_SKIP_SKILL_INSTALL": "1",
                     "CLAUDEX_SECRETS_FILE": str(migration_secrets),
                 }
@@ -151,10 +159,11 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn(str(skill), config_text)
             self.assertIn("[[skills.config]]", config_text)
             for skill_name in self.enabled_skills + self.internal_skills:
+                expected = "false" if skill_name == "agent-reach" else "true"
                 self.assertIn(
                     'path = "'
                     + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
-                    + '"\nenabled = true',
+                    + f'"\nenabled = {expected}',
                     config_text,
                 )
             for skill_name in self.disabled_skills:
@@ -171,7 +180,8 @@ class CodexSetupTests(unittest.TestCase):
             settings = home / ".claude" / "settings.json"
             settings_data = json.loads(settings.read_text(encoding="utf-8"))
             for skill_name in self.enabled_skills:
-                self.assertEqual(settings_data["skillOverrides"][skill_name], "on")
+                expected = "off" if skill_name == "agent-reach" else "on"
+                self.assertEqual(settings_data["skillOverrides"][skill_name], expected)
             for skill_name in self.internal_skills:
                 self.assertEqual(
                     settings_data["skillOverrides"][skill_name],
@@ -200,6 +210,7 @@ class CodexSetupTests(unittest.TestCase):
                 output.index("[1/3] Installing and initializing codex-provider"),
                 output.index("[2/3] Updating aliases, skills, and extension policy"),
             )
+            self.assertIn("Agent Reach disabled by CLAUDEX_AGENT_REACH=0", output)
             self.assertTrue((home / ".claude" / "settings.json").exists())
 
     def test_existing_active_provider_is_adopted_and_initialized(self):
@@ -232,6 +243,7 @@ class CodexSetupTests(unittest.TestCase):
                     "HOME": str(home),
                     "CODEX_HOME": str(codex_home),
                     "CLAUDEX_NONINTERACTIVE": "1",
+                    "CLAUDEX_AGENT_REACH": "0",
                     "CLAUDEX_SKIP_SKILL_INSTALL": "1",
                     "CLAUDEX_SECRETS_FILE": str(migration_secrets),
                 }
