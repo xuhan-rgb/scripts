@@ -471,7 +471,7 @@ def _run_provider_command(arguments, input_text=None):
         input=input_text,
         capture_output=True,
         text=True,
-        timeout=20,
+        timeout=60,
         check=False,
     )
     if result.returncode != 0:
@@ -548,7 +548,10 @@ def test_provider(payload):
     base_url = _payload_text(payload, "base_url", required=True)
     env_key = _payload_text(payload, "env_key", maximum=128) or _default_env_key(name)
     api_key = _payload_text(payload, "api_key", maximum=8192, strip=False)
-    command = ["test", name, "--base-url", base_url, "--env-key", env_key]
+    model = _payload_text(payload, "model", required=True, maximum=64)
+    if model not in MODEL_IDS:
+        raise ValueError("model is not available")
+    command = ["test", name, "--base-url", base_url, "--env-key", env_key, "--model", model]
     if api_key:
         command.append("--stdin")
     with _provider_lock():
@@ -1076,7 +1079,7 @@ HTML = r'''<!doctype html>
           <span id="provider-test-detail"></span>
         </div>
       </form>
-      <p class="config-footnote">The built-in provider backend handles all actions. Save stores the provider without changing the active route. The Key is stored locally with mode 0600 and is never returned to this page. Test checks TCP and the /models endpoint without saving. Activate switches Codex, regenerates the claudex gateway, and restarts CLIProxyAPI. Delete is available only for inactive providers.</p>
+      <p class="config-footnote">The built-in provider backend handles all actions. Save stores the provider without changing the active route. The Key is stored locally with mode 0600 and is never returned to this page. Test sends a minimal live Responses request with the model currently selected on this page, which uses a small amount of Provider tokens. Activate switches Codex, regenerates the claudex gateway, and restarts CLIProxyAPI. Delete is available only for inactive providers.</p>
     </aside>
   </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
@@ -1378,10 +1381,10 @@ HTML = r'''<!doctype html>
       if (app.providerSaving || !$('provider-form').reportValidity()) return;
       app.providerSaving = true;
       app.providerAction = 'test';
-      setProviderTestResult('running', 'Testing provider...', 'Checking TCP, HTTP, and /models compatibility.');
+      setProviderTestResult('running', `Testing ${app.draft.model}...`, 'Sending a minimal live Responses request.');
       updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
       try {
-        const response = await fetch('/api/providers/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(providerFormPayload())});
+        const response = await fetch('/api/providers/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify({...providerFormPayload(), model: app.draft.model})});
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
         const warning = result.status === 'warning';

@@ -6,6 +6,7 @@ from __future__ import annotations
 import argparse
 import curses
 import getpass
+import json
 import os
 import re
 import shlex
@@ -277,7 +278,12 @@ def read_secret_value(env_key: str) -> str | None:
     return None
 
 
-def test_provider_connection(base_url: str, api_key: str | None = None, timeout: float = 5.0) -> tuple[bool, list[str]]:
+def test_provider_connection(
+    base_url: str,
+    api_key: str | None = None,
+    timeout: float = 5.0,
+    model: str | None = None,
+) -> tuple[bool, list[str]]:
     base_url = validate_base_url(base_url)
     parsed = urlparse(base_url)
     host = parsed.hostname
@@ -290,6 +296,95 @@ def test_provider_connection(base_url: str, api_key: str | None = None, timeout:
     except OSError as exc:
         messages.append(f"tcp: failed ({host}:{port}) - {exc}")
         return False, messages
+
+    if model:
+        responses_url = f"{base_url}/responses"
+        headers = {"Accept": "text/event-stream", "Content-Type": "application/json"}
+        if api_key:
+            headers["Authorization"] = f"Bearer {api_key}"
+        payload = json.dumps(
+            {
+                "model": model,
+                "input": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "input_text", "text": "Reply with exactly OK."}],
+                    }
+                ],
+                "stream": True,
+                "max_output_tokens": 16,
+            }
+        ).encode()
+        request = Request(responses_url, data=payload, headers=headers, method="POST")
+        messages.append(f"model: {model}")
+        try:
+            with urlopen(request, timeout=timeout) as response:
+                status = response.getcode()
+                content_type = response.headers.get("Content-Type", "")
+                answer_parts = []
+                completed_text = ""
+                if "text/event-stream" in content_type:
+                    for raw_line in response:
+                        line = raw_line.decode(errors="replace").strip()
+                        if not line.startswith("data:"):
+                            continue
+                        data = line[5:].strip()
+                        if data == "[DONE]":
+                            break
+                        try:
+                            event = json.loads(data)
+                        except json.JSONDecodeError:
+                            continue
+                        if not isinstance(event, dict):
+                            continue
+                        event_type = event.get("type")
+                        if event_type == "response.output_text.delta":
+                            answer_parts.append(str(event.get("delta", "")))
+                        elif event_type == "response.output_text.done":
+                            completed_text = str(event.get("text", ""))
+                        elif event_type == "response.completed":
+                            break
+                else:
+                    data = json.load(response)
+                    if isinstance(data.get("output_text"), str):
+                        completed_text = data["output_text"]
+                    for item in data.get("output", []):
+                        for part in item.get("content", []):
+                            if part.get("type") == "output_text" and part.get("text"):
+                                answer_parts.append(str(part["text"]))
+            answer = "".join(answer_parts).strip() or completed_text.strip()
+            messages.append(f"responses: ok POST {responses_url} -> {status}")
+            if not (200 <= status < 300):
+                return False, messages
+            if not answer:
+                messages.append("answer: missing output text")
+                return False, messages
+            answer = re.sub(r"\s+", " ", answer)[:240]
+            messages.append(f"answer: {answer}")
+            return True, messages
+        except HTTPError as exc:
+            messages.append(f"responses: POST {responses_url} -> {exc.code}")
+            if exc.code in {401, 403}:
+                messages.append("auth: rejected; check the API key")
+            else:
+                try:
+                    error_data = json.loads(exc.read(4096))
+                    detail = error_data.get("detail") or error_data.get("error", {}).get("message")
+                except (json.JSONDecodeError, AttributeError, UnicodeDecodeError):
+                    detail = None
+                if detail:
+                    detail = re.sub(r"\s+", " ", str(detail))[:240]
+                    messages.append(f"response: {detail}")
+            return False, messages
+        except URLError as exc:
+            messages.append(f"responses: failed POST {responses_url} - {exc.reason}")
+            return False, messages
+        except OSError as exc:
+            messages.append(f"responses: failed POST {responses_url} - {exc}")
+            return False, messages
+        except (json.JSONDecodeError, TypeError, AttributeError):
+            messages.append("responses: returned an unreadable response")
+            return False, messages
 
     models_url = f"{base_url}/models"
     headers = {"Accept": "application/json"}
@@ -553,7 +648,7 @@ def cmd_test(args: argparse.Namespace) -> None:
         api_key = sys.stdin.read().rstrip("\r\n")
     else:
         api_key = args.api_key or read_secret_value(env_key)
-    ok, messages = test_provider_connection(base_url, api_key, timeout=args.timeout)
+    ok, messages = test_provider_connection(base_url, api_key, timeout=args.timeout, model=args.model)
     print_test_result(ok, messages)
     if not ok:
         raise SystemExit(1)
@@ -972,21 +1067,23 @@ notes:
 
     test = sub.add_parser(
         "test",
-        help="test a provider with TCP and HTTP /models",
+        help="test a provider with TCP, /models, and an optional live Responses request",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""examples:
   codex-provider test crs
   codex-provider test zskj
+  codex-provider test crs --model gpt-5.6-sol
   codex-provider test crs --api-key sk-xxx
 """,
     )
     test.add_argument("name")
     test.add_argument("--base-url", help="test this URL instead of the saved provider URL")
     test.add_argument("--env-key", help="read a stored Key using this environment variable name")
+    test.add_argument("--model", help="send a minimal live Responses request using this model")
     test_key = test.add_mutually_exclusive_group()
     test_key.add_argument("--api-key")
     test_key.add_argument("--stdin", action="store_true", help="read a temporary API Key from standard input")
-    test.add_argument("--timeout", type=float, default=5.0)
+    test.add_argument("--timeout", type=float, default=30.0)
     test.set_defaults(func=cmd_test)
 
     delete = sub.add_parser("delete", help="delete an inactive provider and its unshared stored Key")

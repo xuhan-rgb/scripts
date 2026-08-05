@@ -183,6 +183,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
                     "base_url": "https://candidate.example/openai",
                     "env_key": "CANDIDATE_KEY",
                     "api_key": "candidate-secret",
+                    "model": "gpt-5.6-sol",
                 }
             )
 
@@ -198,6 +199,8 @@ class CodexBridgeManagerTests(unittest.TestCase):
                 "https://candidate.example/openai",
                 "--env-key",
                 "CANDIDATE_KEY",
+                "--model",
+                "gpt-5.6-sol",
                 "--stdin",
             ],
             input_text="candidate-secret",
@@ -221,6 +224,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
                     "base_url": "http://127.0.0.1:3000/openai",
                     "env_key": "CANDIDATE_KEY",
                     "api_key": "candidate-secret",
+                    "model": "gpt-5.6-sol",
                 }
             )
 
@@ -230,6 +234,8 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("setProviderTestResult('running'", manager.HTML)
         self.assertIn("setProviderTestResult(result.status", manager.HTML)
         self.assertIn("setProviderTestResult('error'", manager.HTML)
+        self.assertIn("model: app.draft.model", manager.HTML)
+        self.assertIn("minimal live Responses request", manager.HTML)
         self.assertRegex(manager.HTML, r"\.toast \{[^}]*z-index: 30;")
 
     def test_deletes_only_an_inactive_provider(self):

@@ -1,15 +1,38 @@
+import importlib.util
+import io
 import json
 import os
 import subprocess
 import tempfile
 import unittest
+from contextlib import nullcontext
 from pathlib import Path
+from unittest import mock
 
 
 REPOSITORY = Path(__file__).parents[1]
 SETUP_SCRIPT = REPOSITORY / "claude" / "setup-codex.sh"
 INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-bridge.sh"
 PROVIDER_SCRIPT = REPOSITORY / "claude" / "codex_provider.py"
+PROVIDER_SPEC = importlib.util.spec_from_file_location("codex_provider", PROVIDER_SCRIPT)
+provider = importlib.util.module_from_spec(PROVIDER_SPEC)
+PROVIDER_SPEC.loader.exec_module(provider)
+
+
+class FakeResponse(io.BytesIO):
+    def __init__(self, body, status=200, content_type="application/json"):
+        super().__init__(body)
+        self.status = status
+        self.headers = {"Content-Type": content_type}
+
+    def getcode(self):
+        return self.status
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        self.close()
 
 
 class CodexSetupTests(unittest.TestCase):
@@ -23,6 +46,34 @@ class CodexSetupTests(unittest.TestCase):
     )
     internal_skills = ("domain-modeling", "grilling")
     disabled_skills = ("dev-plan", "project-audit", "document-project", "unused")
+
+    def test_provider_live_test_uses_the_selected_model_and_reads_streamed_answer(self):
+        stream = (
+            b'data: {"type":"response.output_text.delta","delta":"O"}\n\n'
+            b'data: {"type":"response.output_text.delta","delta":"K"}\n\n'
+            b'data: {"type":"response.completed"}\n\n'
+        )
+        response = FakeResponse(stream, content_type="text/event-stream")
+        with (
+            mock.patch.object(provider.socket, "create_connection", return_value=nullcontext()),
+            mock.patch.object(provider, "urlopen", return_value=response) as open_url,
+        ):
+            ok, messages = provider.test_provider_connection(
+                "http://127.0.0.1:3000/openai",
+                "secret-never-logged",
+                model="gpt-5.6-sol",
+            )
+
+        self.assertTrue(ok)
+        self.assertIn("model: gpt-5.6-sol", messages)
+        self.assertIn("answer: OK", messages)
+        open_url.assert_called_once()
+        request = open_url.call_args.args[0]
+        payload = json.loads(request.data)
+        self.assertEqual(payload["model"], "gpt-5.6-sol")
+        self.assertTrue(payload["stream"])
+        self.assertNotIn("secret-never-logged", request.data.decode())
+        self.assertNotIn("secret-never-logged", json.dumps(messages))
 
     def test_claudex_disables_background_prompt_suggestions(self):
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
