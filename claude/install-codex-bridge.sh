@@ -47,7 +47,7 @@ esac
 [[ $(uname -s) == "Linux" ]] || fail "only Linux is supported"
 systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user manager is unavailable"
 
-printf '[bridge] Installing and starting the Claude-to-Codex relay\n'
+printf '[3/3] Installing services and the Claude-to-Codex relay\n'
 mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${STATE_DIR}" "${UNIT_DIR}"
 chmod 700 "${STATE_DIR}"
 
@@ -288,6 +288,7 @@ printf '%s\n%s\n%s\n' "${model}" "${effort}" "${provider}"
 EOF
 install -m 0755 "${tmp_dir}/claude-codex-sync" "${BIN_DIR}/claude-codex-sync"
 install -m 0755 "${SCRIPT_DIR}/codex_bridge_manager.py" "${LIB_DIR}/codex_bridge_manager.py"
+install -m 0644 "${SCRIPT_DIR}/codex_provider.py" "${LIB_DIR}/codex_provider.py"
 
 cat >"${tmp_dir}/claudex" <<'EOF'
 #!/usr/bin/env bash
@@ -330,8 +331,8 @@ ln -sfn claudex "${BIN_DIR}/claudex-yolo"
 cat >"${tmp_dir}/${MANAGER_SERVICE_NAME}" <<'EOF'
 [Unit]
 Description=Codex Routing Desk
-After=cli-proxy-api.service
-Wants=cli-proxy-api.service
+After=network-online.target
+Wants=network-online.target
 
 [Service]
 Type=simple
@@ -367,23 +368,8 @@ EOF
 install -m 0755 "${tmp_dir}/claudex-ui" "${BIN_DIR}/claudex-ui"
 
 systemctl --user daemon-reload
-sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync")"
-mapfile -t synced_route <<<"${sync_output}"
-systemctl --user enable "${SERVICE_NAME}" >/dev/null
-systemctl --user restart "${SERVICE_NAME}"
 systemctl --user enable "${MANAGER_SERVICE_NAME}" >/dev/null
 systemctl --user restart "${MANAGER_SERVICE_NAME}"
-
-models_json=""
-for _ in {1..20}; do
-  if models_json="$(curl --fail --silent --show-error \
-    -H 'Authorization: Bearer claudex-local' \
-    'http://127.0.0.1:8317/v1/models?limit=1000' 2>/dev/null)"; then
-    break
-  fi
-  sleep 1
-done
-[[ -n ${models_json} ]] || fail "CLIProxyAPI did not become ready"
 
 manager_ready=false
 for _ in {1..20}; do
@@ -395,20 +381,40 @@ for _ in {1..20}; do
 done
 [[ ${manager_ready} == true ]] || fail "Codex Routing Desk did not become ready"
 
-actual_models="$(printf '%s' "${models_json}" \
-  | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
-  | sed -E 's/.*"([^"]+)"$/\1/' \
-  | sort)"
-expected_models="claudex-router"
-[[ ${actual_models} == "${expected_models}" ]] || {
-  printf 'Expected models:\n%s\n' "${expected_models}" >&2
-  printf 'Visible models:\n%s\n' "${actual_models}" >&2
-  fail "unexpected model catalog"
-}
+if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync" 2>"${tmp_dir}/sync-error")"; then
+  mapfile -t synced_route <<<"${sync_output}"
+  systemctl --user enable "${SERVICE_NAME}" >/dev/null
+  systemctl --user restart "${SERVICE_NAME}"
 
-printf 'Installed Claude-to-Codex bridge with models:\n%s\n' "${actual_models}"
-printf 'Active route: provider=%s model=%s effort=%s\n' \
-  "${synced_route[2]}" "${synced_route[0]}" "${synced_route[1]}"
+  models_json=""
+  for _ in {1..20}; do
+    if models_json="$(curl --fail --silent --show-error \
+      -H 'Authorization: Bearer claudex-local' \
+      'http://127.0.0.1:8317/v1/models?limit=1000' 2>/dev/null)"; then
+      break
+    fi
+    sleep 1
+  done
+  [[ -n ${models_json} ]] || fail "CLIProxyAPI did not become ready"
+
+  actual_models="$(printf '%s' "${models_json}" \
+    | grep -oE '"id"[[:space:]]*:[[:space:]]*"[^"]+"' \
+    | sed -E 's/.*"([^"]+)"$/\1/' \
+    | sort)"
+  expected_models="claudex-router"
+  [[ ${actual_models} == "${expected_models}" ]] || {
+    printf 'Expected models:\n%s\n' "${expected_models}" >&2
+    printf 'Visible models:\n%s\n' "${actual_models}" >&2
+    fail "unexpected model catalog"
+  }
+  printf 'Installed Claude-to-Codex bridge with models:\n%s\n' "${actual_models}"
+  printf 'Active route: provider=%s model=%s effort=%s\n' \
+    "${synced_route[2]}" "${synced_route[0]}" "${synced_route[1]}"
+else
+  systemctl --user disable --now "${SERVICE_NAME}" >/dev/null 2>&1 || true
+  printf 'Provider setup is pending: %s\n' "$(<"${tmp_dir}/sync-error")" >&2
+  printf 'Open http://127.0.0.1:8320 and use Provider config to finish setup.\n'
+fi
 if ! command -v claude >/dev/null 2>&1; then
   printf 'warning: Claude Code is not installed; install it before running claudex.\n' >&2
 fi

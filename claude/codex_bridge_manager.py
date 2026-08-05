@@ -5,6 +5,7 @@ import os
 import re
 import sqlite3
 import subprocess
+import sys
 import tempfile
 import threading
 import time
@@ -35,6 +36,10 @@ USAGE_DB = STATE_DIR / "usage.sqlite3"
 MANAGEMENT_PASSWORD = os.environ.get("MANAGEMENT_PASSWORD", "")
 CODEX_DIR = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex"))
 CODEX_CONFIG = CODEX_DIR / "config.toml"
+CODEX_PROVIDER_BACKEND = Path(__file__).with_name("codex_provider.py")
+CODEX_SYNC = Path.home() / ".local" / "bin" / "claude-codex-sync"
+CODEX_SECRETS = Path.home() / ".config" / "codex" / "secrets.env"
+PROVIDER_LOCK = STATE_DIR / "provider.lock"
 
 
 def parse_top_level_strings(text):
@@ -79,6 +84,41 @@ def read_codex_state(path=CODEX_CONFIG):
         "codex_model": top_level.get("model", ""),
         "codex_effort": top_level.get("model_reasoning_effort", ""),
     }
+
+
+def _secret_env_names(path=CODEX_SECRETS):
+    try:
+        text = Path(path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return set()
+    return set(re.findall(r"(?m)^\s*export\s+([A-Za-z_][A-Za-z0-9_]*)=", text))
+
+
+def read_provider_catalog(config_path=CODEX_CONFIG, secrets_path=CODEX_SECRETS):
+    try:
+        text = Path(config_path).read_text(encoding="utf-8")
+    except FileNotFoundError:
+        return []
+    current = parse_top_level_strings(text).get("model_provider", "")
+    secret_names = _secret_env_names(secrets_path)
+    providers = []
+    for match in re.finditer(r"(?ms)^\[model_providers\.([^]]+)]\s*\n(.*?)(?=^\[[^\n]+]\s*$|\Z)", text):
+        name, body = match.group(1), match.group(2)
+        values = {}
+        for key, value in re.findall(r'^([A-Za-z0-9_]+)\s*=\s*"([^"]*)"\s*$', body, re.M):
+            values[key] = value
+        env_key = values.get("env_key", "")
+        providers.append(
+            {
+                "name": name,
+                "base_url": values.get("base_url", ""),
+                "wire_api": values.get("wire_api", ""),
+                "env_key": env_key,
+                "key_set": bool(env_key and (env_key in secret_names or os.environ.get(env_key))),
+                "active": name == current,
+            }
+        )
+    return sorted(providers, key=lambda item: (not item["active"], item["name"]))
 
 
 def _valid_model(value):
@@ -406,12 +446,126 @@ def service_state():
     return result.stdout.strip() == "active"
 
 
+def _payload_text(payload, name, required=False, maximum=2048, strip=True):
+    value = payload.get(name, "")
+    if not isinstance(value, str):
+        raise ValueError(f"{name} must be a string")
+    if strip:
+        value = value.strip()
+    if required and not value:
+        raise ValueError(f"{name} is required")
+    if len(value) > maximum or "\n" in value or "\r" in value:
+        raise ValueError(f"{name} is invalid")
+    return value
+
+
+def _default_env_key(name):
+    return f"{re.sub(r'[^A-Za-z0-9]', '_', name).upper()}_OPENAI_KEY"
+
+
+def _run_provider_command(arguments, input_text=None):
+    if not CODEX_PROVIDER_BACKEND.is_file():
+        raise ValueError(f"provider backend is unavailable: {CODEX_PROVIDER_BACKEND}")
+    result = subprocess.run(
+        [sys.executable, str(CODEX_PROVIDER_BACKEND), *arguments],
+        input=input_text,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "provider update failed"
+        raise ValueError(message)
+    return result.stdout
+
+
+def _sync_provider_gateway():
+    if not CODEX_SYNC.is_file():
+        raise ValueError(f"gateway sync command is unavailable: {CODEX_SYNC}")
+    result = subprocess.run(
+        [str(CODEX_SYNC)],
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or "gateway sync failed")
+    subprocess.run(
+        ["systemctl", "--user", "enable", "cli-proxy-api.service"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+    subprocess.run(
+        ["systemctl", "--user", "restart", "cli-proxy-api.service"],
+        check=True,
+        capture_output=True,
+        text=True,
+        timeout=10,
+    )
+
+
+def _provider_lock(path=PROVIDER_LOCK):
+    path = Path(path)
+    path.parent.mkdir(parents=True, exist_ok=True, mode=0o700)
+    lock = path.open("a", encoding="utf-8")
+    os.chmod(path, 0o600)
+    fcntl.flock(lock, fcntl.LOCK_EX)
+    return lock
+
+
+def save_provider(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("provider payload must be an object")
+    name = _payload_text(payload, "name", required=True, maximum=64)
+    base_url = _payload_text(payload, "base_url", required=True)
+    env_key = _payload_text(payload, "env_key", maximum=128) or _default_env_key(name)
+    api_key = _payload_text(payload, "api_key", maximum=8192, strip=False)
+
+    with _provider_lock():
+        providers = {item["name"]: item for item in read_provider_catalog()}
+        existing = providers.get(name)
+        if (existing is None or not existing["key_set"]) and not api_key:
+            raise ValueError("api_key is required when the provider has no stored Key")
+        if existing is not None and env_key and env_key != existing["env_key"] and not api_key:
+            raise ValueError("api_key is required when env_key changes")
+        command = ["update" if existing else "add", name, "--base-url", base_url]
+        command.extend(["--env-key", env_key])
+        command.extend(["--wire-api", "responses", "--skip-test"])
+        _run_provider_command(command)
+        if api_key:
+            _run_provider_command(["set-key", name, "--stdin"], input_text=api_key)
+        _run_provider_command(["switch", name])
+        _sync_provider_gateway()
+    return name
+
+
+def switch_provider(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("provider payload must be an object")
+    name = _payload_text(payload, "name", required=True, maximum=64)
+    with _provider_lock():
+        providers = {item["name"]: item for item in read_provider_catalog()}
+        provider = providers.get(name)
+        if provider is None:
+            raise ValueError(f"provider {name!r} not found")
+        if not provider["key_set"]:
+            raise ValueError(f"provider {name!r} has no API key")
+        _run_provider_command(["switch", name])
+        _sync_provider_gateway()
+    return name
+
+
 def build_state():
     codex = read_codex_state()
     return {
         "selection": read_selection(codex_state=codex),
         "client_route": {"model": CLIENT_MODEL, "effort": CLIENT_EFFORT},
         "provider": codex,
+        "providers": read_provider_catalog(),
         "models": MODELS,
         "efforts": EFFORTS,
         "gateway": gateway_state(),
@@ -459,7 +613,7 @@ HTML = r'''<!doctype html>
         var(--paper);
       background-size: auto, auto, 28px 28px, 28px 28px, auto;
     }
-    button { font: inherit; }
+    button, input, select { font: inherit; }
     .shell { width: min(1480px, calc(100% - 40px)); margin: 0 auto; padding: 34px 0 48px; }
     .topbar { display: flex; align-items: flex-end; justify-content: space-between; gap: 24px; margin-bottom: 22px; }
     .eyebrow, .mono {
@@ -469,9 +623,25 @@ HTML = r'''<!doctype html>
     }
     .eyebrow { margin: 0 0 7px; color: var(--signal); font-size: 12px; font-weight: 800; }
     h1 { margin: 0; font-size: clamp(31px, 4vw, 55px); line-height: .98; letter-spacing: -.045em; }
-    .status-line { display: flex; align-items: center; gap: 9px; padding-bottom: 5px; color: var(--ink-soft); font-size: 13px; }
+    .top-actions { display: flex; align-items: center; gap: 14px; padding-bottom: 1px; }
+    .status-line { display: flex; align-items: center; gap: 9px; color: var(--ink-soft); font-size: 13px; }
     .pulse { width: 10px; height: 10px; border-radius: 50%; background: var(--bad); box-shadow: 0 0 0 5px rgba(180,72,53,.12); }
     .pulse.good { background: var(--good); box-shadow: 0 0 0 5px rgba(40,118,80,.13); }
+    .config-open {
+      display: inline-flex;
+      align-items: center;
+      gap: 8px;
+      padding: 9px 13px;
+      color: var(--ink);
+      background: rgba(251,248,240,.72);
+      border: 1px solid var(--line);
+      border-radius: 999px;
+      cursor: pointer;
+      font: 800 11px "DejaVu Sans Mono", monospace;
+      letter-spacing: .02em;
+    }
+    .config-open::before { color: var(--signal); content: "//"; }
+    .config-open:hover { border-color: var(--signal); }
     .workspace { display: grid; grid-template-columns: minmax(0, 1.7fr) minmax(290px, .8fr); gap: 18px; }
     .panel { background: rgba(251, 248, 240, .94); border: 1px solid var(--line); border-radius: 20px; box-shadow: var(--shadow); overflow: hidden; }
     .panel-head { display: flex; align-items: center; justify-content: space-between; padding: 18px 20px; border-bottom: 1px solid var(--line); }
@@ -494,7 +664,7 @@ HTML = r'''<!doctype html>
     .model-card:nth-child(2) { animation-delay: .06s; }
     .model-card:nth-child(3) { animation-delay: .12s; }
     .model-card:hover { transform: translateY(-3px); border-color: var(--ink); }
-    .model-card:focus-visible, .effort button:focus-visible, .instant:focus-visible, .save:focus-visible { outline: 3px solid rgba(25,125,120,.32); outline-offset: 2px; }
+    button:focus-visible, input:focus-visible, select:focus-visible { outline: 3px solid rgba(25,125,120,.32); outline-offset: 2px; }
     .model-card.active { color: var(--panel); background: var(--ink); border-color: var(--ink); }
     .model-index { color: var(--signal); font: 800 11px "DejaVu Sans Mono", monospace; }
     .model-name { display: block; margin-top: 27px; font-size: 28px; font-weight: 800; letter-spacing: -.04em; }
@@ -599,13 +769,57 @@ HTML = r'''<!doctype html>
     .status.failed::before { background: var(--bad); }
     .empty-row td { height: 110px; color: var(--ink-soft); text-align: center; }
     .foot { display: flex; justify-content: space-between; gap: 20px; margin-top: 17px; color: var(--ink-soft); font-size: 11px; }
+    .config-layer { position: fixed; inset: 0; z-index: 20; }
+    .config-layer[hidden] { display: none; }
+    .config-scrim { position: absolute; inset: 0; width: 100%; border: 0; background: rgba(20,33,38,.42); backdrop-filter: blur(3px); cursor: default; }
+    .config-drawer {
+      position: absolute;
+      top: 0;
+      right: 0;
+      width: min(470px, 100%);
+      height: 100%;
+      overflow: auto;
+      padding: 28px;
+      background: var(--panel);
+      border-left: 1px solid var(--line);
+      box-shadow: -24px 0 70px rgba(20,33,38,.22);
+      animation: drawer-in .24s ease both;
+    }
+    .config-head { display: flex; align-items: flex-start; justify-content: space-between; gap: 18px; padding-bottom: 20px; border-bottom: 1px solid var(--line); }
+    .config-head h2 { margin: 2px 0 0; font-size: 26px; letter-spacing: -.04em; }
+    .config-close { width: 36px; height: 36px; color: var(--ink); background: transparent; border: 1px solid var(--line); border-radius: 50%; cursor: pointer; font-size: 20px; }
+    .provider-picker { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 22px; }
+    .provider-picker select, .provider-form input {
+      width: 100%;
+      min-width: 0;
+      padding: 11px 12px;
+      color: var(--ink);
+      background: #f6f1e7;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    .secondary-action { padding: 10px 13px; color: var(--teal); background: transparent; border: 1px solid var(--teal); border-radius: 10px; cursor: pointer; font-weight: 800; }
+    .provider-form { display: grid; gap: 15px; margin-top: 22px; }
+    .field { display: grid; gap: 7px; }
+    .field label { color: var(--ink-soft); font: 800 10px "DejaVu Sans Mono", monospace; letter-spacing: .05em; text-transform: uppercase; }
+    .field-note { color: var(--ink-soft); font-size: 10px; line-height: 1.45; }
+    .key-state { display: inline-flex; width: fit-content; padding: 4px 8px; color: var(--bad); background: rgba(180,72,53,.08); border-radius: 999px; font: 800 10px "DejaVu Sans Mono", monospace; }
+    .key-state.ready { color: var(--good); background: rgba(40,118,80,.1); }
+    .provider-actions { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; margin-top: 6px; }
+    .provider-save, .provider-switch { padding: 12px; border-radius: 11px; cursor: pointer; font-weight: 900; }
+    .provider-save { color: #1c2527; background: var(--signal); border: 1px solid var(--signal); }
+    .provider-switch { color: var(--panel); background: var(--ink); border: 1px solid var(--ink); }
+    .provider-save:disabled, .provider-switch:disabled { opacity: .45; cursor: wait; }
+    .config-footnote { margin: 18px 0 0; padding-top: 15px; color: var(--ink-soft); border-top: 1px solid var(--line); font-size: 10px; line-height: 1.55; }
     .toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); transform: translateY(90px); opacity: 0; transition: .25s ease; }
     .toast.show { transform: translateY(0); opacity: 1; }
     .toast.error { background: var(--bad); }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
+    @keyframes drawer-in { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
     @media (max-width: 820px) {
       .shell { width: min(100% - 22px, 680px); padding-top: 22px; }
       .topbar { align-items: flex-start; flex-direction: column; }
+      .top-actions { width: 100%; align-items: flex-start; justify-content: space-between; }
       .workspace { grid-template-columns: 1fr; }
       .model-grid { grid-template-columns: 1fr; }
       .model-card { min-height: 135px; }
@@ -618,6 +832,7 @@ HTML = r'''<!doctype html>
       .ledger-head { align-items: flex-start; flex-direction: column; }
       .table-scroll { max-height: 520px; }
       .foot { flex-direction: column; }
+      .config-drawer { padding: 22px; }
     }
     @media (prefers-reduced-motion: reduce) {
       *, *::before, *::after { scroll-behavior: auto !important; animation-duration: .01ms !important; transition-duration: .01ms !important; }
@@ -628,7 +843,10 @@ HTML = r'''<!doctype html>
   <main class="shell">
     <header class="topbar">
       <div><p class="eyebrow">Local inference control</p><h1>Codex Routing Desk</h1></div>
-      <div class="status-line"><span id="pulse" class="pulse"></span><span id="health">Connecting to gateway...</span></div>
+      <div class="top-actions">
+        <div class="status-line"><span id="pulse" class="pulse"></span><span id="health">Connecting to gateway...</span></div>
+        <button id="provider-config-open" class="config-open" type="button">Provider config</button>
+      </div>
     </header>
     <div class="workspace">
       <section class="panel" aria-labelledby="model-heading">
@@ -727,6 +945,49 @@ HTML = r'''<!doctype html>
     </section>
     <footer class="foot"><span>Only request metadata is stored locally; prompts and responses are not recorded.</span><span class="mono">Ctrl+S save · auto refresh 3s</span></footer>
   </main>
+  <div id="provider-config-layer" class="config-layer" hidden>
+    <button id="provider-config-scrim" class="config-scrim" type="button" aria-label="Close provider configuration"></button>
+    <aside class="config-drawer" role="dialog" aria-modal="true" aria-labelledby="provider-config-title">
+      <header class="config-head">
+        <div><p class="eyebrow">Shared Codex route</p><h2 id="provider-config-title">Provider config</h2></div>
+        <button id="provider-config-close" class="config-close" type="button" aria-label="Close">x</button>
+      </header>
+      <div class="provider-picker">
+        <select id="provider-picker" aria-label="Installed providers"></select>
+        <button id="provider-new" class="secondary-action" type="button">New</button>
+      </div>
+      <form id="provider-form" class="provider-form">
+        <div class="field">
+          <label for="provider-edit-name">Provider name</label>
+          <input id="provider-edit-name" name="name" maxlength="64" required autocomplete="off">
+          <span class="field-note">Existing provider names cannot be renamed. Create a new provider instead.</span>
+        </div>
+        <div class="field">
+          <label for="provider-edit-url">Base URL</label>
+          <input id="provider-edit-url" name="base_url" type="url" maxlength="2048" placeholder="https://gateway.example/openai" required autocomplete="url">
+        </div>
+        <div class="field">
+          <label for="provider-edit-env">Environment key</label>
+          <input id="provider-edit-env" name="env_key" maxlength="128" placeholder="MY_PROVIDER_OPENAI_KEY" autocomplete="off">
+          <span class="field-note">Leave blank to derive PROVIDER_NAME_OPENAI_KEY.</span>
+        </div>
+        <div class="field">
+          <label for="provider-edit-wire">Wire API</label>
+          <input id="provider-edit-wire" value="responses" readonly>
+        </div>
+        <div class="field">
+          <label for="provider-edit-key">API Key</label>
+          <input id="provider-edit-key" name="api_key" type="password" maxlength="8192" placeholder="Leave blank to keep the existing Key" autocomplete="new-password">
+          <span id="provider-key-state" class="key-state">Key missing</span>
+        </div>
+        <div class="provider-actions">
+          <button id="provider-switch" class="provider-switch" type="button">Switch & sync</button>
+          <button id="provider-save" class="provider-save" type="submit">Save & activate</button>
+        </div>
+      </form>
+      <p class="config-footnote">Changes are written by the built-in provider backend. The Key is stored locally with mode 0600 and is never returned to this page. Saving or switching updates Codex, regenerates the claudex gateway, and restarts CLIProxyAPI.</p>
+    </aside>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>
     const app = {
@@ -738,6 +999,8 @@ HTML = r'''<!doctype html>
       autoApply: localStorage.getItem('claudex-instant-switch') !== 'false',
       saving: false,
       saveTimer: null,
+      providerSaving: false,
+      providerIsNew: false,
     };
     const $ = (id) => document.getElementById(id);
     const escapeText = (value) => value || '—';
@@ -861,8 +1124,11 @@ HTML = r'''<!doctype html>
       $('env-key').textContent = escapeText(state.provider.env_key);
       $('catalog').textContent = state.gateway.models.length ? state.gateway.models.join(' · ') : 'Unavailable';
       const healthy = state.service_active && state.gateway.reachable;
+      const activeProvider = (state.providers || []).find((provider) => provider.active);
       $('pulse').classList.toggle('good', healthy);
-      $('health').textContent = healthy ? 'Gateway online · 127.0.0.1:8317' : 'Gateway unavailable';
+      $('health').textContent = healthy
+        ? 'Gateway online · 127.0.0.1:8317'
+        : activeProvider && !activeProvider.key_set ? 'Provider setup required' : 'Gateway unavailable';
       $('instant').setAttribute('aria-pressed', String(app.autoApply));
       $('save').hidden = app.autoApply;
       $('save').disabled = app.saving || !app.dirty;
@@ -901,6 +1167,92 @@ HTML = r'''<!doctype html>
     function notify(message, error = false) {
       const toast = $('toast'); toast.textContent = message; toast.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove('show'), 3200);
+    }
+
+    function providerByName(name) {
+      return (app.state?.providers || []).find((provider) => provider.name === name);
+    }
+    function populateProviderPicker(selectedName) {
+      const providers = app.state?.providers || [];
+      $('provider-picker').innerHTML = providers.length
+        ? providers.map((provider) => `<option value="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}${provider.active ? ' · active' : ''}</option>`).join('')
+        : '<option value="">No providers configured</option>';
+      if (selectedName && providerByName(selectedName)) $('provider-picker').value = selectedName;
+    }
+    function editProvider(provider) {
+      app.providerIsNew = !provider;
+      $('provider-edit-name').value = provider?.name || '';
+      $('provider-edit-name').readOnly = Boolean(provider);
+      $('provider-edit-url').value = provider?.base_url || '';
+      $('provider-edit-env').value = provider?.env_key || '';
+      $('provider-edit-key').value = '';
+      $('provider-edit-key').placeholder = provider?.key_set ? 'Leave blank to keep the existing Key' : 'API Key required';
+      $('provider-edit-key').required = !provider?.key_set;
+      $('provider-key-state').textContent = provider?.key_set ? 'Key stored' : 'Key missing';
+      $('provider-key-state').classList.toggle('ready', Boolean(provider?.key_set));
+      $('provider-switch').disabled = app.providerSaving || !provider || provider.active || !provider.key_set;
+      $('provider-switch').textContent = provider?.active
+        ? 'Active provider'
+        : provider && !provider.key_set ? 'Set Key to switch' : 'Switch & sync';
+      $('provider-save').disabled = app.providerSaving;
+      $('provider-save').textContent = app.providerSaving ? 'Saving...' : 'Save & activate';
+    }
+    function openProviderConfig() {
+      const current = app.state?.provider?.provider || app.state?.providers?.[0]?.name;
+      populateProviderPicker(current);
+      editProvider(providerByName(current));
+      $('provider-config-layer').hidden = false;
+      document.body.style.overflow = 'hidden';
+      $('provider-picker').focus();
+    }
+    function closeProviderConfig() {
+      if (app.providerSaving) return;
+      $('provider-config-layer').hidden = true;
+      document.body.style.overflow = '';
+      $('provider-config-open').focus();
+    }
+    function newProvider() {
+      $('provider-picker').value = '';
+      editProvider(null);
+      $('provider-edit-name').focus();
+    }
+    async function providerRequest(path, payload, successMessage) {
+      if (app.providerSaving) return;
+      let completed = false;
+      app.providerSaving = true;
+      editProvider(app.providerIsNew ? null : providerByName($('provider-picker').value));
+      try {
+        const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+        const state = await response.json();
+        if (!response.ok) throw new Error(state.error || `HTTP ${response.status}`);
+        app.state = state;
+        if (!app.dirty) app.draft = {...state.selection};
+        populateProviderPicker(state.provider.provider);
+        editProvider(providerByName(state.provider.provider));
+        render();
+        notify(successMessage);
+        completed = true;
+      } catch (error) {
+        notify(`Provider update failed: ${error.message}`, true);
+      } finally {
+        app.providerSaving = false;
+        if (completed) closeProviderConfig();
+        else if (!$('provider-config-layer').hidden) editProvider(app.providerIsNew ? null : providerByName($('provider-picker').value));
+      }
+    }
+    function saveProvider(event) {
+      event.preventDefault();
+      if (!$('provider-form').reportValidity()) return;
+      providerRequest('/api/providers/save', {
+        name: $('provider-edit-name').value,
+        base_url: $('provider-edit-url').value,
+        env_key: $('provider-edit-env').value,
+        api_key: $('provider-edit-key').value,
+      }, 'Provider saved. Codex and claudex now share the new route.');
+    }
+    function useSelectedProvider() {
+      const provider = providerByName($('provider-picker').value);
+      if (provider) providerRequest('/api/providers/switch', {name: provider.name}, `Switched to ${provider.name}.`);
     }
 
     async function refresh() {
@@ -948,7 +1300,18 @@ HTML = r'''<!doctype html>
 
     $('instant').addEventListener('click', toggleInstantSwitch);
     $('save').addEventListener('click', save);
+    $('provider-config-open').addEventListener('click', openProviderConfig);
+    $('provider-config-close').addEventListener('click', closeProviderConfig);
+    $('provider-config-scrim').addEventListener('click', closeProviderConfig);
+    $('provider-new').addEventListener('click', newProvider);
+    $('provider-picker').addEventListener('change', () => editProvider(providerByName($('provider-picker').value)));
+    $('provider-form').addEventListener('submit', saveProvider);
+    $('provider-switch').addEventListener('click', useSelectedProvider);
     document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('provider-config-layer').hidden) { closeProviderConfig(); return; }
+      if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && !$('provider-config-layer').hidden) {
+        event.preventDefault(); $('provider-form').requestSubmit(); return;
+      }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's') { event.preventDefault(); save(); return; }
       if (event.target.matches('input, textarea, select')) return;
       const index = Number(event.key) - 1;
@@ -978,6 +1341,14 @@ class ManagerHandler(BaseHTTPRequestHandler):
     def _same_origin(self):
         origin = self.headers.get("Origin")
         return not origin or origin in {f"http://127.0.0.1:{PORT}", f"http://localhost:{PORT}"}
+
+    def _read_json(self):
+        if not self._same_origin() or self.headers.get_content_type() != "application/json":
+            raise PermissionError("request origin or content type is not allowed")
+        length = int(self.headers.get("Content-Length", "0"))
+        if length <= 0 or length > 16384:
+            raise ValueError("invalid request size")
+        return json.loads(self.rfile.read(length))
 
     def do_GET(self):
         if self.path == "/":
@@ -1015,20 +1386,21 @@ class ManagerHandler(BaseHTTPRequestHandler):
         self.send_error(404)
 
     def do_POST(self):
-        if self.path != "/api/selection":
+        if self.path not in {"/api/selection", "/api/providers/save", "/api/providers/switch"}:
             self.send_error(404)
             return
-        if not self._same_origin() or self.headers.get_content_type() != "application/json":
-            self._send_json(403, {"error": "request origin or content type is not allowed"})
-            return
         try:
-            length = int(self.headers.get("Content-Length", "0"))
-            if length <= 0 or length > 4096:
-                raise ValueError("invalid request size")
-            payload = json.loads(self.rfile.read(length))
-            apply_selection(payload.get("model"), payload.get("effort"))
+            payload = self._read_json()
+            if self.path == "/api/selection":
+                apply_selection(payload.get("model"), payload.get("effort"))
+            elif self.path == "/api/providers/save":
+                save_provider(payload)
+            else:
+                switch_provider(payload)
             time.sleep(0.35)
             self._send_json(200, build_state())
+        except PermissionError as error:
+            self._send_json(403, {"error": str(error)})
         except (json.JSONDecodeError, OSError, ValueError, sqlite3.Error, subprocess.SubprocessError) as error:
             self._send_json(400, {"error": str(error)})
 

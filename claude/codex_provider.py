@@ -455,7 +455,12 @@ def cmd_set_key(args: argparse.Namespace) -> None:
     if name not in providers:
         die(f"provider {name!r} not found")
     env_key = providers[name].get("env_key") or default_env_key(name)
-    api_key = args.api_key or getpass.getpass(f"API key for {env_key}: ")
+    if args.stdin:
+        api_key = sys.stdin.read().rstrip("\r\n")
+    else:
+        api_key = args.api_key or getpass.getpass(f"API key for {env_key}: ")
+    if not api_key or "\n" in api_key or "\r" in api_key:
+        die("API key must be a non-empty single line")
     upsert_secret(env_key, api_key)
     print(f"key saved for {name!r} in {SECRETS}")
     print(f"run: source {SECRETS}")
@@ -973,7 +978,9 @@ notes:
 """,
     )
     set_key.add_argument("name")
-    set_key.add_argument("--api-key")
+    key_source = set_key.add_mutually_exclusive_group()
+    key_source.add_argument("--api-key")
+    key_source.add_argument("--stdin", action="store_true", help="read the API key from standard input")
     set_key.set_defaults(func=cmd_set_key)
 
     import_env = sub.add_parser(

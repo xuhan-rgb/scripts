@@ -1,8 +1,14 @@
 import importlib.util
+import io
+import json
+import os
 import tempfile
 import unittest
+from contextlib import nullcontext
 from datetime import datetime, timezone
+from email.message import Message
 from pathlib import Path
+from unittest import mock
 
 
 MODULE_PATH = Path(__file__).parents[1] / "claude" / "codex_bridge_manager.py"
@@ -54,6 +60,17 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("$('save').hidden = app.autoApply", manager.HTML)
         self.assertNotIn("Claude keeps one stable client model", manager.HTML)
 
+    def test_dashboard_exposes_provider_config_without_rendering_keys(self):
+        self.assertIn('id="provider-config-open"', manager.HTML)
+        self.assertIn('id="provider-config-layer"', manager.HTML)
+        self.assertIn('id="provider-edit-key"', manager.HTML)
+        self.assertIn("/api/providers/save", manager.HTML)
+        self.assertIn("/api/providers/switch", manager.HTML)
+        self.assertIn("The Key is stored locally with mode 0600", manager.HTML)
+        self.assertIn("built-in provider backend", manager.HTML)
+        self.assertIn("$('provider-edit-key').required = !provider?.key_set", manager.HTML)
+        self.assertIn("provider.active || !provider.key_set", manager.HTML)
+
     def test_dashboard_renders_usage_periods_and_ttft_incrementally(self):
         self.assertIn('id="usage-day-total"', manager.HTML)
         self.assertIn('id="usage-week-total"', manager.HTML)
@@ -83,6 +100,173 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertEqual(state["provider"], "provider_b")
         self.assertEqual(state["base_url"], "http://127.0.0.1:3000/openai")
         self.assertEqual(state["env_key"], "B_KEY")
+
+    def test_provider_catalog_reports_key_state_without_exposing_secret(self):
+        with tempfile.TemporaryDirectory() as directory:
+            config = Path(directory) / "config.toml"
+            secrets = Path(directory) / "secrets.env"
+            config.write_text(SAMPLE_CONFIG, encoding="utf-8")
+            secrets.write_text("export B_KEY='secret-never-return'\n", encoding="utf-8")
+
+            providers = manager.read_provider_catalog(config, secrets)
+
+        provider_b = next(provider for provider in providers if provider["name"] == "provider_b")
+        self.assertTrue(provider_b["active"])
+        self.assertTrue(provider_b["key_set"])
+        self.assertNotIn("secret-never-return", json.dumps(providers))
+
+    def test_saves_and_activates_provider_without_key_in_process_arguments(self):
+        commands = []
+
+        def run(arguments, input_text=None):
+            commands.append((arguments, input_text))
+            return ""
+
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=[]),
+            mock.patch.object(manager, "_run_provider_command", side_effect=run),
+            mock.patch.object(manager, "_sync_provider_gateway") as sync,
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            name = manager.save_provider(
+                {
+                    "name": "new_route",
+                    "base_url": "https://gateway.example/openai",
+                    "env_key": "NEW_ROUTE_KEY",
+                    "api_key": " secret-never-in-argv ",
+                }
+            )
+
+        self.assertEqual(name, "new_route")
+        self.assertEqual(commands[0][0][0], "add")
+        self.assertEqual(commands[1], (["set-key", "new_route", "--stdin"], " secret-never-in-argv "))
+        self.assertEqual(commands[2], (["switch", "new_route"], None))
+        self.assertFalse(any("secret-never-in-argv" in argument for command, _ in commands for argument in command))
+        sync.assert_called_once_with()
+
+    def test_internal_provider_backend_updates_config_without_installing_a_command(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_home = home / ".codex"
+            environment = {"HOME": str(home), "CODEX_HOME": str(codex_home)}
+            secret = "internal-backend-secret"
+            with mock.patch.dict(os.environ, environment):
+                manager._run_provider_command(
+                    [
+                        "add",
+                        "web_route",
+                        "--base-url",
+                        "https://gateway.example/openai",
+                        "--env-key",
+                        "WEB_ROUTE_KEY",
+                        "--wire-api",
+                        "responses",
+                        "--skip-test",
+                    ]
+                )
+                output = manager._run_provider_command(
+                    ["set-key", "web_route", "--stdin"],
+                    input_text=secret,
+                )
+                manager._run_provider_command(["switch", "web_route"])
+
+            config_text = (codex_home / "config.toml").read_text(encoding="utf-8")
+            secrets_text = (home / ".config" / "codex" / "secrets.env").read_text(encoding="utf-8")
+            self.assertIn('model_provider = "web_route"', config_text)
+            self.assertNotIn(secret, config_text)
+            self.assertIn(secret, secrets_text)
+            self.assertNotIn(secret, output)
+            self.assertFalse((home / ".local" / "bin" / "codex-provider").exists())
+
+    def test_refuses_to_activate_an_existing_provider_without_key(self):
+        providers = [
+            {
+                "name": "missing_key",
+                "base_url": "https://gateway.example/openai",
+                "wire_api": "responses",
+                "env_key": "MISSING_KEY",
+                "key_set": False,
+                "active": True,
+            }
+        ]
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=providers),
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            with self.assertRaisesRegex(ValueError, "provider has no stored Key"):
+                manager.save_provider(
+                    {
+                        "name": "missing_key",
+                        "base_url": "https://gateway.example/openai",
+                        "env_key": "MISSING_KEY",
+                        "api_key": "",
+                    }
+                )
+
+    def test_derives_an_environment_key_for_an_older_provider_without_one(self):
+        providers = [
+            {
+                "name": "older-route",
+                "base_url": "https://gateway.example/openai",
+                "wire_api": "responses",
+                "env_key": "",
+                "key_set": False,
+                "active": True,
+            }
+        ]
+        commands = []
+
+        def run(arguments, input_text=None):
+            commands.append((arguments, input_text))
+            return ""
+
+        with (
+            mock.patch.object(manager, "read_provider_catalog", return_value=providers),
+            mock.patch.object(manager, "_run_provider_command", side_effect=run),
+            mock.patch.object(manager, "_sync_provider_gateway"),
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            manager.save_provider(
+                {
+                    "name": "older-route",
+                    "base_url": "https://gateway.example/openai",
+                    "env_key": "",
+                    "api_key": "secret",
+                }
+            )
+
+        self.assertIn("OLDER_ROUTE_OPENAI_KEY", commands[0][0])
+
+    def test_refuses_to_switch_to_provider_without_key(self):
+        providers = [
+            {
+                "name": "missing_key",
+                "base_url": "https://gateway.example/openai",
+                "wire_api": "responses",
+                "env_key": "MISSING_KEY",
+                "key_set": False,
+                "active": False,
+            }
+        ]
+        with mock.patch.object(manager, "read_provider_catalog", return_value=providers):
+            with self.assertRaisesRegex(ValueError, "has no API key"):
+                manager.switch_provider({"name": "missing_key"})
+
+    def test_provider_posts_require_same_origin_json(self):
+        handler = object.__new__(manager.ManagerHandler)
+        handler.rfile = io.BytesIO(b'{"name":"provider_a"}')
+        handler.headers = Message()
+        handler.headers["Origin"] = "https://attacker.example"
+        handler.headers["Content-Type"] = "application/json"
+        handler.headers["Content-Length"] = "21"
+        with self.assertRaisesRegex(PermissionError, "origin or content type"):
+            handler._read_json()
+
+        handler.rfile = io.BytesIO(b'{"name":"provider_a"}')
+        handler.headers.replace_header("Origin", "http://127.0.0.1:8320")
+        handler.headers.replace_header("Content-Type", "text/plain")
+        with self.assertRaisesRegex(PermissionError, "origin or content type"):
+            handler._read_json()
 
     def test_selection_is_independent_from_codex_defaults(self):
         with tempfile.TemporaryDirectory() as directory:

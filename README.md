@@ -36,7 +36,7 @@ CLAUDEX_SECRETS_FILE=/secure/path/secrets.env \
 bash claude/install-codex-bridge.sh
 ```
 
-没有旧密钥文件时，直接运行安装器；终端会针对当前 provider 无回显地询问 Key：
+没有旧密钥文件时也可以直接运行安装器。安装器先启动 8320 控制台，不在终端阻塞等待 Key；安装完成后在网页右上角打开 `Provider config` 设置：
 
 ```bash
 bash claude/install-codex-bridge.sh
@@ -44,25 +44,9 @@ bash claude/install-codex-bridge.sh
 
 也可以预先导出对应环境变量实现零交互安装，例如当前 `crs`/`crs_local` 使用 `CRS_OPENAI_KEY`。不要把真实 Key 直接写进命令历史。
 
-#### 2. 两步部署与一键入口
+#### 2. 单脚本部署与网页配置
 
-推荐在新电脑上分两步执行。第一步只安装 `codex-provider`，初始化 provider 的 Base URL、profile 和 Key，不修改 Claude Skills 或 alias：
-
-```bash
-bash claude/install-codex-provider.sh
-```
-
-确认 `codex-provider list` 正常后，再执行第二步，配置 `codex-yolo`、`claude-yolo`、`claudex-yolo`、精选 Skills 和本地桥接服务：
-
-```bash
-bash claude/install-claudex-yolo.sh
-```
-
-两步之间可以先用 `codex-provider switch <name>` 修改 `~/.codex/config.toml` 中的当前 `model_provider`。第二步会重新读取该文件，运行 `claude-codex-sync` 生成网关配置，然后重启 `cli-proxy-api.service` 和 `claudex-manager.service`；重复执行第二步也会重新同步并重启，不使用第一阶段进程里缓存的 provider。
-
-第二步检查和安装 Claude plugin 来源时会显示正在处理的插件名称；这些插件只用于复制精选 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
-
-原来的一键入口继续保留，它依次执行上述两个阶段：
+新电脑只使用一个安装入口：
 
 ```bash
 bash claude/install-codex-bridge.sh
@@ -70,10 +54,14 @@ bash claude/install-codex-bridge.sh
 
 `install-codex-bridge.sh` 严格按以下顺序执行：
 
-1. 首先安装 `codex-provider`，再由它初始化 provider 的 `base_url`、profile 和 Key。如果 `~/.codex/config.toml` 已有有效的 `model_provider`，执行 `init-existing` 接管它；否则通过 `add` 和 `switch` 创建并选择回退 provider。Key 通过 `import-env` 或 `set-key` 写入私有的 `secrets.env`。
+1. 初始化 `~/.codex/config.toml` 中的 provider；没有 Key 时只记录待配置状态，不中断安装，也不安装独立的 `codex-provider` 命令。
 2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。没有 `uv` 且 Agent Reach 尚未安装时，交互式询问是否使用 Python venv 安装；选择不使用只会关闭 Agent Reach。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
-3. 读取当前 Codex `model_provider` 的 `base_url`、`wire_api` 和 `env_key`，生成 CLIProxyAPI 配置，并重启 `cli-proxy-api.service` 与 `claudex-manager.service`。单独执行第二步时不会重新初始化 provider，但每次都会重新读取配置并重启服务。
-4. 验证网关只暴露 `claudex-router`，然后即可使用 `codex-yolo`、`claude-yolo` 或 `claudex-yolo`。
+3. 无条件启动只监听 `127.0.0.1:8320` 的 `claudex-manager.service`。如果当前 provider 和 Key 已经完整，同时生成 CLIProxyAPI 配置并启动网关；否则网页显示 `Provider setup required`。
+4. 在右上角 `Provider config` 中新增、修改或切换 provider。保存时由网页内置后端更新 Codex 配置和私有 Key，再运行 `claude-codex-sync` 并重启 CLIProxyAPI，使 `codex-yolo` 与 `claudex-yolo` 使用同一个当前 provider。
+
+页面不会返回或显示已有 Key；Key 只允许设置或替换，并保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。页面只监听本机回环地址，不提供删除 provider 的操作。
+
+安装精选 Skill 时会显示正在检查或下载的 Claude plugin 来源名称；这些插件只用于复制 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
 
 安装器写入的 alias 为：
 
@@ -83,9 +71,9 @@ alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
 alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 ```
 
-如果新电脑的 `~/.codex/config.toml` 已经配置了有效的 `model_provider` 及对应 `[model_providers.<name>]`，安装器会直接读取并采用它，再通过 `codex-provider init-existing` 创建缺失的 provider profile；无需传入 `CLAUDEX_DEFAULT_PROVIDER`。已有 provider 的 URL、模型和选择不会被四个内置 provider 覆盖。
+如果新电脑的 `~/.codex/config.toml` 已经配置了有效的 `model_provider` 及对应 `[model_providers.<name>]`，安装器会直接读取并采用它，再由内部 Provider 后端创建缺失的 profile。已有 provider 的 URL、模型和选择不会被四个内置 provider 覆盖。
 
-仅当 `config.toml` 不存在，或者当前 `model_provider` 没有对应配置段时，安装器才使用回退项。默认回退项是 `crs_local`；没有本地 `127.0.0.1:3000` 服务时，可显式选择远程 `crs`：
+仅当 `config.toml` 不存在，或者当前 `model_provider` 没有对应配置段时，安装器才使用 `crs_local` 作为初始待配置项。安装完成后可直接在网页新增或切换到实际 provider；也可在安装前用 `CLAUDEX_DEFAULT_PROVIDER` 改变初始项：
 
 ```bash
 CLAUDEX_DEFAULT_PROVIDER=crs \
@@ -100,12 +88,11 @@ bash claude/install-codex-bridge.sh
 ```bash
 source ~/.bashrc
 type codex-yolo claude-yolo claudex-yolo
-codex-provider list
 systemctl --user is-active cli-proxy-api.service claudex-manager.service
 curl --fail http://127.0.0.1:8320/healthz
 ```
 
-预期两个 service 都输出 `active`，健康检查返回成功。日常启动命令：
+`claudex-manager.service` 和健康检查应始终成功；完成 Provider 与 Key 配置后，`cli-proxy-api.service` 也应为 `active`。尚未配置 Key 时网关保持停止属于正常的首次安装状态。日常启动命令：
 
 ```bash
 codex-yolo        # 当前 Codex provider，跳过确认
@@ -119,21 +106,16 @@ claudex-ui        # 打开本地路由控制台
 
 #### 4. Provider 日常管理
 
-```bash
-codex-provider list
-codex-provider show crs
-codex-provider switch crs
-codex-provider set-key crs
-codex-provider test crs
-```
+打开 `http://127.0.0.1:8320`，在右上角 `Provider config` 中完成新增、修改和切换。项目不再向 `~/.local/bin` 安装独立的 `codex-provider` 命令。
+重复执行新版安装器时，会清理旧版安装器曾写入该路径的命令。
 
-切换 provider 后，新启动的 `codex-yolo` 直接使用该 provider；新启动的 `claudex`/`claudex-yolo` 会先同步连接配置再启动中转客户端。真实 Key 不会写入 `~/.codex/config.toml` 或 Git。
+切换 provider 后，新启动的 `codex-yolo` 直接使用该 provider；网页会立即同步并重启网关，因此新启动的 `claudex`/`claudex-yolo` 使用同一个 provider。真实 Key 不会写入 `~/.codex/config.toml` 或 Git。
 
 已有 Codex 配置不会被整体覆盖。重复执行安装器是幂等的：alias 会替换而非累加，已有 Key 和模型选择会保留，版本匹配的 CLIProxyAPI 不会重复下载。
 
 脚本最终会安装：
 
-- 安装 `codex-provider`、固定版本的 CLIProxyAPI user service、Claude 启动器和 Codex Routing Desk。
+- 安装固定版本的 CLIProxyAPI user service、Claude 启动器和带内置 Provider 后端的 Codex Routing Desk。
 - 安装五个固定的精选 Skill；Agent Reach v1.5.0 从固定的官方 GitHub tag 安装，但在没有 `uv` 时可选择跳过。插件整包仅作为 Skill 来源，复制完成后保持关闭。
 - 创建 `claudex`、`claudex-yolo`、`claudex-ui` 命令。
 - 创建仅监听 `127.0.0.1` 的 `cli-proxy-api.service` 与 `claudex-manager.service`。

@@ -6,7 +6,6 @@ readonly BIN_DIR="${HOME}/.local/bin"
 readonly CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_CONFIG="${CODEX_DIR}/config.toml"
 readonly CODEX_PROVIDER_SOURCE="${SCRIPT_DIR}/codex_provider.py"
-readonly CODEX_PROVIDER="${BIN_DIR}/codex-provider"
 readonly SECRETS_DIR="${HOME}/.config/codex"
 readonly SECRETS_FILE="${SECRETS_DIR}/secrets.env"
 readonly BASHRC="${HOME}/.bashrc"
@@ -15,7 +14,6 @@ readonly DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-d
 readonly INTERNAL_SKILLS="domain-modeling grilling"
 readonly AGENT_REACH_VERSION="1.5.0"
 readonly AGENT_REACH_SOURCE="https://github.com/Panniantong/Agent-Reach/archive/refs/tags/v${AGENT_REACH_VERSION}.zip"
-readonly SETUP_PHASE="${CLAUDEX_SETUP_PHASE:-all}"
 ENABLED_SKILLS="${DEFAULT_ENABLED_SKILLS}"
 
 fail() {
@@ -34,11 +32,6 @@ done
 case "${DEFAULT_PROVIDER}" in
   crs | crs_local | sorryios | zskj) ;;
   *) fail "CLAUDEX_DEFAULT_PROVIDER must be crs, crs_local, sorryios, or zskj" ;;
-esac
-
-case "${SETUP_PHASE}" in
-  all | provider | extensions) ;;
-  *) fail "CLAUDEX_SETUP_PHASE must be all, provider, or extensions" ;;
 esac
 
 [[ -f ${CODEX_PROVIDER_SOURCE} ]] || fail "missing provider manager: ${CODEX_PROVIDER_SOURCE}"
@@ -308,12 +301,14 @@ PY
   mv "${settings_tmp}" "${settings_file}"
 }
 
-if [[ ${SETUP_PHASE} != extensions ]]; then
-  printf '[provider] Installing and initializing codex-provider\n'
-  mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}"
-  chmod 700 "${CODEX_DIR}" "${SECRETS_DIR}"
-  install -m 0755 "${CODEX_PROVIDER_SOURCE}" "${CODEX_PROVIDER}"
-fi
+provider_manager() {
+  python3 "${CODEX_PROVIDER_SOURCE}" "$@"
+}
+
+printf '[1/3] Initializing Codex providers\n'
+mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}"
+chmod 700 "${CODEX_DIR}" "${SECRETS_DIR}"
+rm -f -- "${BIN_DIR}/codex-provider"
 
 toml_top_value() {
   awk -v wanted="$1" '
@@ -376,10 +371,9 @@ upsert_top_level_number() {
   fi
 }
 
-if [[ ${SETUP_PHASE} != extensions ]]; then
-  if [[ ! -f ${CODEX_CONFIG} ]]; then
-    config_tmp="$(mktemp "${CODEX_DIR}/config.toml.tmp.XXXXXX")"
-    cat >"${config_tmp}" <<EOF
+if [[ ! -f ${CODEX_CONFIG} ]]; then
+  config_tmp="$(mktemp "${CODEX_DIR}/config.toml.tmp.XXXXXX")"
+  cat >"${config_tmp}" <<EOF
 approval_policy = "on-request"
 sandbox_mode = "danger-full-access"
 personality = "pragmatic"
@@ -403,13 +397,12 @@ network_access = true
 [mcp_servers.openaiDeveloperDocs]
 url = "https://developers.openai.com/mcp"
 EOF
-    chmod 600 "${config_tmp}"
-    mv "${config_tmp}" "${CODEX_CONFIG}"
-  fi
-  chmod 600 "${CODEX_CONFIG}"
-  upsert_top_level_number model_context_window 372000
-  upsert_top_level_number model_auto_compact_token_limit 244800
+  chmod 600 "${config_tmp}"
+  mv "${config_tmp}" "${CODEX_CONFIG}"
 fi
+chmod 600 "${CODEX_CONFIG}"
+upsert_top_level_number model_context_window 372000
+upsert_top_level_number model_auto_compact_token_limit 244800
 
 ensure_provider() {
   local name="$1"
@@ -417,8 +410,8 @@ ensure_provider() {
   local env_key="$3"
   local model="$4"
   local effort="$5"
-  if ! "${CODEX_PROVIDER}" show "${name}" >/dev/null 2>&1; then
-    "${CODEX_PROVIDER}" add "${name}" \
+  if ! provider_manager show "${name}" >/dev/null 2>&1; then
+    provider_manager add "${name}" \
       --base-url "${base_url}" \
       --env-key "${env_key}" \
       --wire-api responses \
@@ -430,12 +423,10 @@ ensure_provider() {
   fi
 }
 
-if [[ ${SETUP_PHASE} != extensions ]]; then
-  ensure_provider crs "http://81.70.201.249:3000/openai" CRS_OPENAI_KEY gpt-5.5 medium
-  ensure_provider crs_local "http://127.0.0.1:3000/openai" CRS_OPENAI_KEY gpt-5.6-sol xhigh
-  ensure_provider sorryios "https://sorryios.ai/codex" SORRYIOS_OPENAI_KEY gpt-5.5 xhigh
-  ensure_provider zskj "http://10.1.6.27/v1" ZSKJ_OPENAI_KEY gpt-5.4 xhigh
-fi
+ensure_provider crs "http://81.70.201.249:3000/openai" CRS_OPENAI_KEY gpt-5.5 medium
+ensure_provider crs_local "http://127.0.0.1:3000/openai" CRS_OPENAI_KEY gpt-5.6-sol xhigh
+ensure_provider sorryios "https://sorryios.ai/codex" SORRYIOS_OPENAI_KEY gpt-5.5 xhigh
+ensure_provider zskj "http://10.1.6.27/v1" ZSKJ_OPENAI_KEY gpt-5.4 xhigh
 
 disable_extension_tables() {
   local config_file="$1"
@@ -504,72 +495,58 @@ configure_codex_skills() {
   fi
 }
 
-if [[ ${SETUP_PHASE} != extensions ]]; then
-  active_provider="$(toml_top_value model_provider)"
-  if [[ -z ${active_provider} ]] || ! grep -Fqx "[model_providers.${active_provider}]" "${CODEX_CONFIG}"; then
-    "${CODEX_PROVIDER}" switch "${DEFAULT_PROVIDER}" >/dev/null
-    active_provider="${DEFAULT_PROVIDER}"
+active_provider="$(toml_top_value model_provider)"
+if [[ -z ${active_provider} ]] || ! grep -Fqx "[model_providers.${active_provider}]" "${CODEX_CONFIG}"; then
+  provider_manager switch "${DEFAULT_PROVIDER}" >/dev/null
+  active_provider="${DEFAULT_PROVIDER}"
+fi
+provider_manager init-existing >/dev/null
+
+if [[ -n ${CLAUDEX_SECRETS_FILE:-} ]]; then
+  [[ -r ${CLAUDEX_SECRETS_FILE} ]] || fail "CLAUDEX_SECRETS_FILE is not readable: ${CLAUDEX_SECRETS_FILE}"
+  if [[ $(readlink -f "${CLAUDEX_SECRETS_FILE}") != $(readlink -f "${SECRETS_FILE}") ]]; then
+    install -m 0600 "${CLAUDEX_SECRETS_FILE}" "${SECRETS_FILE}"
   fi
-  "${CODEX_PROVIDER}" init-existing >/dev/null
-
-  if [[ -n ${CLAUDEX_SECRETS_FILE:-} ]]; then
-    [[ -r ${CLAUDEX_SECRETS_FILE} ]] || fail "CLAUDEX_SECRETS_FILE is not readable: ${CLAUDEX_SECRETS_FILE}"
-    if [[ $(readlink -f "${CLAUDEX_SECRETS_FILE}") != $(readlink -f "${SECRETS_FILE}") ]]; then
-      install -m 0600 "${CLAUDEX_SECRETS_FILE}" "${SECRETS_FILE}"
-    fi
-  fi
-
-  if [[ ! -f ${SECRETS_FILE} ]]; then
-    secrets_tmp="$(mktemp "${SECRETS_DIR}/secrets.env.tmp.XXXXXX")"
-    printf '# Codex provider API keys. Managed by codex-provider.\n' >"${secrets_tmp}"
-    install -m 0600 "${secrets_tmp}" "${SECRETS_FILE}"
-    rm -f -- "${secrets_tmp}"
-  fi
-  chmod 600 "${SECRETS_FILE}"
-
-  "${CODEX_PROVIDER}" import-env >/dev/null
-  set -a
-  # shellcheck disable=SC1090
-  source "${SECRETS_FILE}"
-  set +a
-
-  active_env_key="$(toml_provider_value "${active_provider}" env_key)"
-  [[ ${active_env_key} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]] \
-    || fail "active provider ${active_provider} has no valid env_key"
-
-  if [[ -z $(printenv "${active_env_key}" || true) ]]; then
-    if [[ -t 0 && -t 1 && ${CLAUDEX_NONINTERACTIVE:-0} != 1 ]]; then
-      "${CODEX_PROVIDER}" set-key "${active_provider}"
-      set -a
-      # shellcheck disable=SC1090
-      source "${SECRETS_FILE}"
-      set +a
-    else
-      fail "${active_env_key} is missing; export it or pass CLAUDEX_SECRETS_FILE=/path/to/secrets.env"
-    fi
-  fi
-
-  printf 'Codex configured: provider=%s config=%s\n' "${active_provider}" "${CODEX_CONFIG}"
-  printf 'Provider manager: %s\n' "${CODEX_PROVIDER}"
 fi
 
-if [[ ${SETUP_PHASE} != provider ]]; then
-  [[ -x ${CODEX_PROVIDER} && -r ${CODEX_CONFIG} && -r ${SECRETS_FILE} ]] \
-    || fail "Codex provider setup is incomplete; run claude/install-codex-provider.sh first"
-  printf '[yolo] Updating aliases, skills, and extension policy\n'
-  configure_agent_reach_choice
-  update_bashrc
-  install_selected_skills
-  disable_claude_plugins
-  configure_claude_skill_overrides
-  for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
-    [[ -f ${config_file} ]] || continue
-    [[ -f ${config_file}.before-disabled-extensions ]] \
-      || cp -p "${config_file}" "${config_file}.before-disabled-extensions"
-    chmod 600 "${config_file}.before-disabled-extensions"
-    disable_extension_tables "${config_file}"
-  done
-  configure_codex_skills
-
-  printf 'Shell aliases installed in: %s\n' "${BASHRC}"
+if [[ ! -f ${SECRETS_FILE} ]]; then
+  secrets_tmp="$(mktemp "${SECRETS_DIR}/secrets.env.tmp.XXXXXX")"
+  printf '# Codex provider API keys. Managed by the local routing desk.\n' >"${secrets_tmp}"
+  install -m 0600 "${secrets_tmp}" "${SECRETS_FILE}"
+  rm -f -- "${secrets_tmp}"
 fi
+chmod 600 "${SECRETS_FILE}"
+
+provider_manager import-env >/dev/null
+set -a
+# shellcheck disable=SC1090
+source "${SECRETS_FILE}"
+set +a
+
+active_env_key="$(toml_provider_value "${active_provider}" env_key)"
+if [[ ! ${active_env_key} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+  printf 'Provider %s has no valid env_key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
+    "${active_provider}"
+elif [[ -z $(printenv "${active_env_key}" || true) ]]; then
+  printf 'Provider %s has no Key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
+    "${active_provider}"
+fi
+
+printf 'Codex configured: provider=%s config=%s\n' "${active_provider}" "${CODEX_CONFIG}"
+
+printf '[2/3] Updating aliases, skills, and extension policy\n'
+configure_agent_reach_choice
+update_bashrc
+install_selected_skills
+disable_claude_plugins
+configure_claude_skill_overrides
+for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
+  [[ -f ${config_file} ]] || continue
+  [[ -f ${config_file}.before-disabled-extensions ]] \
+    || cp -p "${config_file}" "${config_file}.before-disabled-extensions"
+  chmod 600 "${config_file}.before-disabled-extensions"
+  disable_extension_tables "${config_file}"
+done
+configure_codex_skills
+
+printf 'Shell aliases installed in: %s\n' "${BASHRC}"

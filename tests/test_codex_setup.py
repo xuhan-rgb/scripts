@@ -9,8 +9,7 @@ from pathlib import Path
 REPOSITORY = Path(__file__).parents[1]
 SETUP_SCRIPT = REPOSITORY / "claude" / "setup-codex.sh"
 INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-bridge.sh"
-PROVIDER_INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-provider.sh"
-YOLO_INSTALL_SCRIPT = REPOSITORY / "claude" / "install-claudex-yolo.sh"
+PROVIDER_SCRIPT = REPOSITORY / "claude" / "codex_provider.py"
 
 
 class CodexSetupTests(unittest.TestCase):
@@ -27,8 +26,6 @@ class CodexSetupTests(unittest.TestCase):
 
     def test_claudex_disables_background_prompt_suggestions(self):
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
-        provider_installer = PROVIDER_INSTALL_SCRIPT.read_text(encoding="utf-8")
-        yolo_installer = YOLO_INSTALL_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn("--prompt-suggestions false", installer)
         self.assertIn("--model 'claudex-router[1m]'", installer)
@@ -49,16 +46,16 @@ class CodexSetupTests(unittest.TestCase):
         )
         self.assertIn('--settings "${session_settings}"', installer)
         self.assertEqual(installer.count('skillOverrides\":{\"claude-api'), 1)
-        self.assertIn("CLAUDEX_SETUP_PHASE=provider", provider_installer)
-        self.assertIn("CLAUDEX_SETUP_PHASE=extensions", yolo_installer)
-        self.assertIn('install-codex-bridge.sh', yolo_installer)
-        sync = 'sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync")"'
+        sync = 'if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync"'
         self.assertIn(sync, installer)
         self.assertLess(
             installer.index(sync),
             installer.index('systemctl --user restart "${SERVICE_NAME}"'),
         )
         self.assertIn('systemctl --user restart "${MANAGER_SERVICE_NAME}"', installer)
+        self.assertIn('"${LIB_DIR}/codex_provider.py"', installer)
+        self.assertIn('systemctl --user disable --now "${SERVICE_NAME}"', installer)
+        self.assertNotIn('"${BIN_DIR}/codex-provider"', installer)
 
     def test_default_skill_allowlist_preserves_claude_memory_files(self):
         setup = SETUP_SCRIPT.read_text(encoding="utf-8")
@@ -92,6 +89,9 @@ class CodexSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             bashrc = home / ".bashrc"
+            legacy_provider = home / ".local" / "bin" / "codex-provider"
+            legacy_provider.parent.mkdir(parents=True)
+            legacy_provider.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
             skill = home / ".agents" / "skills" / "example" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("---\nname: example\n---\n", encoding="utf-8")
@@ -223,9 +223,10 @@ class CodexSetupTests(unittest.TestCase):
             self.assertNotIn("claude-api", bashrc_text)
             self.assertNotIn("--safe-mode", bashrc_text)
             self.assertLess(
-                output.index("[provider] Installing and initializing codex-provider"),
-                output.index("[yolo] Updating aliases, skills, and extension policy"),
+                output.index("[1/3] Initializing Codex providers"),
+                output.index("[2/3] Updating aliases, skills, and extension policy"),
             )
+            self.assertFalse(legacy_provider.exists())
             self.assertIn("Agent Reach disabled by CLAUDEX_AGENT_REACH=0", output)
             self.assertTrue((home / ".claude" / "settings.json").exists())
 
@@ -282,14 +283,9 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn('model = "gpt-5.6-terra"', profile_text)
             self.assertIn('model_reasoning_effort = "high"', profile_text)
 
-    def test_provider_and_yolo_configuration_can_run_as_separate_steps(self):
+    def test_setup_defers_a_missing_provider_key_to_the_web_console(self):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
-            migration_secrets = home / "migration-secrets.env"
-            migration_secrets.write_text(
-                "export CRS_OPENAI_KEY='test-secret'\n",
-                encoding="utf-8",
-            )
             environment = os.environ.copy()
             environment.pop("CRS_OPENAI_KEY", None)
             environment.update(
@@ -297,41 +293,51 @@ class CodexSetupTests(unittest.TestCase):
                     "HOME": str(home),
                     "CODEX_HOME": str(home / ".codex"),
                     "CLAUDEX_NONINTERACTIVE": "1",
-                    "CLAUDEX_SECRETS_FILE": str(migration_secrets),
-                }
-            )
-
-            provider = subprocess.run(
-                ["bash", str(PROVIDER_INSTALL_SCRIPT)],
-                capture_output=True,
-                text=True,
-                env=environment,
-            )
-
-            self.assertEqual(provider.returncode, 0, provider.stderr)
-            self.assertIn("[provider] Installing and initializing codex-provider", provider.stdout)
-            self.assertFalse((home / ".bashrc").exists())
-            self.assertFalse((home / ".claude" / "settings.json").exists())
-
-            environment.update(
-                {
-                    "CLAUDEX_SETUP_PHASE": "extensions",
                     "CLAUDEX_AGENT_REACH": "0",
                     "CLAUDEX_SKIP_SKILL_INSTALL": "1",
                 }
             )
-            yolo = subprocess.run(
+
+            completed = subprocess.run(
                 ["bash", str(SETUP_SCRIPT)],
                 capture_output=True,
                 text=True,
                 env=environment,
             )
 
-            self.assertEqual(yolo.returncode, 0, yolo.stderr)
-            self.assertIn("[yolo] Updating aliases, skills, and extension policy", yolo.stdout)
-            self.assertNotIn("[provider]", yolo.stdout)
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn("has no Key yet; configure it at http://127.0.0.1:8320", completed.stdout)
             self.assertTrue((home / ".bashrc").is_file())
-            self.assertTrue((home / ".claude" / "settings.json").is_file())
+            self.assertTrue((home / ".codex" / "config.toml").is_file())
+
+    def test_codex_provider_accepts_a_key_over_stdin_without_echoing_it(self):
+        with tempfile.TemporaryDirectory() as directory:
+            home = Path(directory)
+            codex_home = home / ".codex"
+            codex_home.mkdir()
+            (codex_home / "config.toml").write_text(
+                '[model_providers.test_route]\n'
+                'base_url = "https://gateway.example/openai"\n'
+                'wire_api = "responses"\n'
+                'env_key = "TEST_ROUTE_KEY"\n',
+                encoding="utf-8",
+            )
+            secret = "secret-never-echo"
+            environment = os.environ.copy()
+            environment.update({"HOME": str(home), "CODEX_HOME": str(codex_home)})
+
+            completed = subprocess.run(
+                ["python3", str(PROVIDER_SCRIPT), "set-key", "test_route", "--stdin"],
+                input=secret,
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertNotIn(secret, completed.stdout + completed.stderr)
+            secrets = home / ".config" / "codex" / "secrets.env"
+            self.assertIn(secret, secrets.read_text(encoding="utf-8"))
 
 
 if __name__ == "__main__":
