@@ -47,7 +47,7 @@ esac
 [[ $(uname -s) == "Linux" ]] || fail "only Linux is supported"
 systemctl --user show-environment >/dev/null 2>&1 || fail "systemd user manager is unavailable"
 
-printf '[3/3] Installing and starting the Claude-to-Codex relay\n'
+printf '[bridge] Installing and starting the Claude-to-Codex relay\n'
 mkdir -p "${BIN_DIR}" "${LIB_DIR}" "${STATE_DIR}" "${UNIT_DIR}"
 chmod 700 "${STATE_DIR}"
 

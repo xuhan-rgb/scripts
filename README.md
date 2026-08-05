@@ -44,13 +44,35 @@ bash claude/install-codex-bridge.sh
 
 也可以预先导出对应环境变量实现零交互安装，例如当前 `crs`/`crs_local` 使用 `CRS_OPENAI_KEY`。不要把真实 Key 直接写进命令历史。
 
-#### 2. 自动部署顺序
+#### 2. 两步部署与一键入口
+
+推荐在新电脑上分两步执行。第一步只安装 `codex-provider`，初始化 provider 的 Base URL、profile 和 Key，不修改 Claude Skills 或 alias：
+
+```bash
+bash claude/install-codex-provider.sh
+```
+
+确认 `codex-provider list` 正常后，再执行第二步，配置 `codex-yolo`、`claude-yolo`、`claudex-yolo`、精选 Skills 和本地桥接服务：
+
+```bash
+bash claude/install-claudex-yolo.sh
+```
+
+两步之间可以先用 `codex-provider switch <name>` 修改 `~/.codex/config.toml` 中的当前 `model_provider`。第二步会重新读取该文件，运行 `claude-codex-sync` 生成网关配置，然后重启 `cli-proxy-api.service` 和 `claudex-manager.service`；重复执行第二步也会重新同步并重启，不使用第一阶段进程里缓存的 provider。
+
+第二步检查和安装 Claude plugin 来源时会显示正在处理的插件名称；这些插件只用于复制精选 Skill，随后保持关闭。网络较慢时可以据此区分正在下载和 provider 配置问题。
+
+原来的一键入口继续保留，它依次执行上述两个阶段：
+
+```bash
+bash claude/install-codex-bridge.sh
+```
 
 `install-codex-bridge.sh` 严格按以下顺序执行：
 
 1. 首先安装 `codex-provider`，再由它初始化 provider 的 `base_url`、profile 和 Key。如果 `~/.codex/config.toml` 已有有效的 `model_provider`，执行 `init-existing` 接管它；否则通过 `add` 和 `switch` 创建并选择回退 provider。Key 通过 `import-env` 或 `set-key` 写入私有的 `secrets.env`。
 2. 检查 `~/.bashrc` 中的 `codex-yolo`、`claude-yolo`、`claudex-yolo`，然后安装精选 Skills 并关闭其余扩展。没有 `uv` 且 Agent Reach 尚未安装时，交互式询问是否使用 Python venv 安装；选择不使用只会关闭 Agent Reach。已有 alias 会删除旧定义并直接替换，没有则新增；重复安装始终只保留一份。
-3. 读取当前 Codex `model_provider` 的 `base_url`、`wire_api` 和 `env_key`，生成 CLIProxyAPI 配置，启动 `cli-proxy-api.service` 与 `claudex-manager.service`。
+3. 读取当前 Codex `model_provider` 的 `base_url`、`wire_api` 和 `env_key`，生成 CLIProxyAPI 配置，并重启 `cli-proxy-api.service` 与 `claudex-manager.service`。单独执行第二步时不会重新初始化 provider，但每次都会重新读取配置并重启服务。
 4. 验证网关只暴露 `claudex-router`，然后即可使用 `codex-yolo`、`claude-yolo` 或 `claudex-yolo`。
 
 安装器写入的 alias 为：
