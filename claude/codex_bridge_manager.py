@@ -734,7 +734,6 @@ HTML = r'''<!doctype html>
       draft: null,
       dirty: false,
       requests: [],
-      lastRefreshAt: null,
       rendered: {models: '', efforts: '', requests: ''},
       autoApply: localStorage.getItem('claudex-instant-switch') !== 'false',
       saving: false,
@@ -753,13 +752,15 @@ HTML = r'''<!doctype html>
       const date = new Date(value);
       return Number.isNaN(date.getTime()) ? '—' : date.toLocaleString('zh-CN', {hour12: false});
     };
-    function refreshDashboardAge() {
-      if (!app.lastRefreshAt) {
-        $('refresh-age').textContent = '等待刷新';
+    function refreshRequestAge() {
+      const timestamp = app.requests[0]?.timestamp;
+      const requestedAt = timestamp ? new Date(timestamp).getTime() : NaN;
+      if (!Number.isFinite(requestedAt)) {
+        $('refresh-age').textContent = '暂无请求';
         return;
       }
-      const seconds = Math.max(0, Math.floor((Date.now() - app.lastRefreshAt) / 1000));
-      $('refresh-age').textContent = seconds === 0 ? '刚刚刷新' : `${seconds} 秒前刷新`;
+      const seconds = Math.max(0, Math.floor((Date.now() - requestedAt) / 1000));
+      $('refresh-age').textContent = seconds === 0 ? '刚刚请求' : `${seconds} 秒前请求`;
     }
 
     function renderUsage() {
@@ -781,7 +782,7 @@ HTML = r'''<!doctype html>
       $('last-request-cache-read').textContent = formatTokens(cacheRead);
       $('last-request-cache-hit').textContent = totalInput > 0 ? `${(cacheRead / totalInput * 100).toFixed(1)}%` : '—';
       $('last-request-meta').textContent = last ? `${formatTime(last.timestamp)} · ${last.model || 'unknown model'}` : 'No requests captured';
-      refreshDashboardAge();
+      refreshRequestAge();
     }
 
     function renderRequests() {
@@ -912,7 +913,6 @@ HTML = r'''<!doctype html>
         const [state, requestPayload] = await Promise.all([response.json(), requestsResponse.json()]);
         app.state = state;
         app.requests = requestPayload.requests;
-        app.lastRefreshAt = Date.now();
         if (!app.dirty) app.draft = {...state.selection};
         render();
       } catch (error) { notify(`Cannot read service state: ${error.message}`, true); }
@@ -956,7 +956,7 @@ HTML = r'''<!doctype html>
       if (event.altKey && index >= 0 && index < 5 && app.state) { event.preventDefault(); chooseEffort(app.state.efforts[index]); }
     });
     refresh();
-    setInterval(refreshDashboardAge, 1000);
+    setInterval(refreshRequestAge, 1000);
     setInterval(() => { if (!app.dirty) refresh(); }, 3000);
   </script>
 </body>

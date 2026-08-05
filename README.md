@@ -58,7 +58,7 @@ bash claude/install-codex-bridge.sh
 ```bash
 alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
 alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
-alias claudex-yolo='claudex --dangerously-skip-permissions'
+alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 ```
 
 默认会提供 `crs`、`crs_local`、`sorryios`、`zskj` 四个 provider，并保留已有且有效的自定义 provider。默认项是 `crs_local`；新电脑没有本地 `127.0.0.1:3000` 服务时，可在安装时选择远程 `crs`：
@@ -110,6 +110,7 @@ codex-provider test crs
 脚本最终会安装：
 
 - 安装 `codex-provider`、固定版本的 CLIProxyAPI user service、Claude 启动器和 Codex Routing Desk。
+- 从固定的官方 GitHub tag 安装 Agent Reach v1.5.0，并安装六个精选 Skill；插件整包仅作为 Skill 来源，复制完成后保持关闭。
 - 创建 `claudex`、`claudex-yolo`、`claudex-ui` 命令。
 - 创建仅监听 `127.0.0.1` 的 `cli-proxy-api.service` 与 `claudex-manager.service`。
 - 创建权限为 `0600` 的 Codex 配置、provider secrets、网关配置和 usage 数据库。
@@ -124,16 +125,25 @@ GPT-5.6 [Sol](https://developers.openai.com/api/docs/models/gpt-5.6-sol)、[Terr
 
 `claudex` 默认传入 `--prompt-suggestions false`，避免 Claude Code 在主回答结束后再调用一次 GPT 生成“下一条建议”，减少每轮额外的上下文 Token 和后台等待；如确实需要该功能，可用 `claudex-yolo --prompt-suggestions true` 临时恢复。
 
-为了降低新会话的固定上下文，安装器默认关闭不需要的 Codex 与 Claude 自定义 skills、plugins 和 MCP，但不会卸载或删除它们。默认只开启三个通用编程 Skill：`dev-plan`、`project-audit`、`document-project`：
+`claudex-yolo` 还会通过当前进程的 `skillOverrides` 关闭 Claude Code 内置的 `claude-api` Skill，避免普通问题被误判为 Claude API 开发任务后加载额外上下文。该覆盖不写入 `~/.claude/settings.json`；`claude-yolo` 仍使用官方账号环境，并保留 `claude-api`。
 
-- Codex 的每个 MCP/plugin section 会写为 `enabled = false`，默认 Skill 会通过 `[[skills.config]]` 按绝对路径只开启上述三个；修改 `~/.codex/config.toml` 后重启 Codex 即可生效。
-- Claude 的已安装插件会通过官方 `claude plugin disable` 关闭；`~/.claude/settings.json` 的 `skillOverrides` 会把上述三个设为 `on`，其余已发现 Skill 设为 `off`。Claude 启动器使用 `--strict-mcp-config`，不会读取用户、项目或全局 MCP 配置，但不会使用 `--safe-mode`，所以两层 `CLAUDE.md` 仍然生效。
+为了降低新会话的固定上下文，安装器只开启六个精选 Skill：`agent-reach`、`brainstorming`、`grill-me`、`grill-with-docs`、`handoff`、`tdd`。`grilling` 和 `domain-modeling` 是两个 grill 命令内部调用的依赖，不作为主入口展示；其余自定义 Skill、plugins 和 MCP 默认关闭，但不会被卸载或删除。
+
+| 命令 | 可用的精选 Skill | 额外差异 |
+| --- | --- | --- |
+| `codex-yolo` | 六个主 Skill；两个内部依赖也启用 | 读取 `~/.agents/skills`；Codex MCP/plugin 全部关闭；不经过 GPT 中转和 8320 usage 统计 |
+| `claude-yolo` | 六个主 Skill；两个依赖以 `name-only` 提供 | 使用官方 Claude 账号；保留 Claude 内置 `claude-api`；严格关闭 MCP |
+| `claudex-yolo` | 与 `claude-yolo` 相同 | 使用 GPT 中转，并只在该进程额外关闭内置 `claude-api`；严格关闭 MCP |
+
+- Codex 的每个 MCP/plugin section 都写为 `enabled = false`。六个主 Skill 和两个内部依赖只启用 `~/.agents/skills` 中的一份；`~/.claude/skills` 的重复副本以及其他已发现 Skill 都写为 `enabled = false`。
+- Claude 的已安装插件会通过官方 `claude plugin disable` 关闭，包括用于提供 Skill 源文件的 `mattpocock-skills` 和 `superpowers`。`~/.claude/settings.json` 的 `skillOverrides` 将六个主 Skill 设为 `on`、两个内部依赖设为 `name-only`、其余用户 Skill 设为 `off`。
+- Claude 启动器使用 `--strict-mcp-config`，不会读取用户、项目或全局 MCP 配置，但不会使用 `--safe-mode`，所以 `~/.claude/CLAUDE.md` 与项目层级的 `CLAUDE.md` 仍然生效。
 - 临时需要 Claude 读取已有 MCP 配置时，使用 `CLAUDEX_EXTENSIONS=1 claudex-yolo`；这会取消本地中转进程的严格 MCP 限制，Skill 仍以 `skillOverrides` 为准。
 - Claude 需要临时打开其他 Skill 时，在 `~/.claude/settings.json` 的 `skillOverrides` 中将对应名称改为 `on`；Codex 则在 `~/.codex/config.toml` 中将对应 `[[skills.config]]` 的 `enabled` 改为 `true`，然后启动新会话。
 
 首次关闭扩展前，安装器会各保留一份固定备份：Codex 配置使用 `*.before-disabled-extensions`，Claude 设置使用 `~/.claude/settings.json.before-disabled-extensions`。重复安装不会继续堆积备份。
 
-控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次请求的输入、输出、缓存读取、缓存命中率，以及“刚刚刷新 / N 秒前刷新”标记。请求数据每 3 秒增量更新，每次成功轮询都会重新开始计时；标记由浏览器每秒更新，不会额外请求服务或重新创建界面节点。
+控制台的 Token usage 按电脑本地时区统计：Today 从当天 00:00 开始，This week 从周一 00:00 开始，This month 从每月 1 日 00:00 开始。三个周期都分别显示非缓存输入、缓存读取、输出和请求数；下方的 Last request 额外显示最后一次中转请求的输入、输出、缓存读取、缓存命中率，以及“刚刚请求 / N 秒前请求”标记。请求数据每 3 秒增量更新，但后台轮询不会重置该标记；标记始终基于最后一条请求的时间戳，由浏览器每秒更新。`codex-yolo` 不经过中转，因此不会进入这份统计。
 
 Request ledger 从 CLIProxyAPI usage queue 采集每次请求的真实上游模型、reasoning effort、接口、非缓存输入、输出 token、推理 token、缓存读取/创建、命中率、首 Token 时间（TTFT）、总耗时和状态，并持久化到权限为 `0600` 的 `~/.cli-proxy-api/usage.sqlite3`。其中“输入”始终按 `input_tokens - cache_read_tokens` 计算，避免与单独展示的缓存读取重复。最多保留最近 5000 条元数据，不开启完整 request log，也不保存提示词或回答正文。
 

@@ -12,6 +12,17 @@ INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-bridge.sh"
 
 
 class CodexSetupTests(unittest.TestCase):
+    enabled_skills = (
+        "agent-reach",
+        "brainstorming",
+        "grill-me",
+        "grill-with-docs",
+        "handoff",
+        "tdd",
+    )
+    internal_skills = ("domain-modeling", "grilling")
+    disabled_skills = ("dev-plan", "project-audit", "document-project", "unused")
+
     def test_claudex_disables_background_prompt_suggestions(self):
         installer = INSTALL_SCRIPT.read_text(encoding="utf-8")
 
@@ -27,15 +38,31 @@ class CodexSetupTests(unittest.TestCase):
         self.assertIn("extension_args=(--strict-mcp-config)", installer)
         self.assertNotIn("--safe-mode", installer)
         self.assertIn("CLAUDEX_EXTENSIONS", installer)
+        self.assertIn('${CLAUDEX_YOLO:-0} == 1', installer)
+        self.assertIn(
+            '"skillOverrides":{"claude-api":"off"}',
+            installer,
+        )
+        self.assertIn('--settings "${session_settings}"', installer)
+        self.assertEqual(installer.count('skillOverrides\":{\"claude-api'), 1)
 
     def test_default_skill_allowlist_preserves_claude_memory_files(self):
         setup = SETUP_SCRIPT.read_text(encoding="utf-8")
 
-        self.assertIn('DEFAULT_CLAUDE_SKILLS="dev-plan project-audit document-project"', setup)
+        self.assertIn(
+            'DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-docs handoff tdd"',
+            setup,
+        )
+        self.assertIn('INTERNAL_SKILLS="domain-modeling grilling"', setup)
+        self.assertIn('readonly AGENT_REACH_VERSION="1.5.0"', setup)
+        self.assertIn(
+            "Panniantong/Agent-Reach/archive/refs/tags/v${AGENT_REACH_VERSION}.zip",
+            setup,
+        )
+        self.assertNotIn('uv tool install "agent-reach==', setup)
         self.assertIn('alias claude-yolo=\'claude --dangerously-skip-permissions --strict-mcp-config\'', setup)
         self.assertIn('settings["skillOverrides"] = overrides', setup)
-        self.assertIn("enabled = true", setup)
-        self.assertIn("codex_skill_is_default", setup)
+        self.assertIn('"name-only" if name in internal_skills', setup)
         self.assertNotIn("--safe-mode", setup)
 
     def test_fresh_setup_is_idempotent_and_keeps_claude_login_separate(self):
@@ -45,14 +72,14 @@ class CodexSetupTests(unittest.TestCase):
             skill = home / ".agents" / "skills" / "example" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("---\nname: example\n---\n", encoding="utf-8")
-            for skill_name in ("dev-plan", "project-audit", "document-project", "unused"):
+            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
                 skill_file = home / ".agents" / "skills" / skill_name / "SKILL.md"
                 skill_file.parent.mkdir(parents=True, exist_ok=True)
                 skill_file.write_text(
                     f"---\nname: {skill_name}\n---\n",
                     encoding="utf-8",
                 )
-            for skill_name in ("dev-plan", "project-audit", "document-project", "unused"):
+            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
                 skill_file = home / ".claude" / "skills" / skill_name / "SKILL.md"
                 skill_file.parent.mkdir(parents=True, exist_ok=True)
                 skill_file.write_text(
@@ -80,6 +107,7 @@ class CodexSetupTests(unittest.TestCase):
                     "HOME": str(home),
                     "CODEX_HOME": str(home / ".codex"),
                     "CLAUDEX_NONINTERACTIVE": "1",
+                    "CLAUDEX_SKIP_SKILL_INSTALL": "1",
                     "CLAUDEX_SECRETS_FILE": str(migration_secrets),
                 }
             )
@@ -122,32 +150,35 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn("enabled = false", config_text)
             self.assertIn(str(skill), config_text)
             self.assertIn("[[skills.config]]", config_text)
-            self.assertIn(
-                'path = "' + str(home / ".agents" / "skills" / "dev-plan" / "SKILL.md") + '"\nenabled = true',
-                config_text,
-            )
-            self.assertIn(
-                'path = "' + str(home / ".agents" / "skills" / "project-audit" / "SKILL.md") + '"\nenabled = true',
-                config_text,
-            )
-            self.assertIn(
-                'path = "' + str(home / ".agents" / "skills" / "document-project" / "SKILL.md") + '"\nenabled = true',
-                config_text,
-            )
-            self.assertNotIn(
-                'path = "' + str(home / ".agents" / "skills" / "unused" / "SKILL.md") + '"\nenabled = true',
-                config_text,
-            )
+            for skill_name in self.enabled_skills + self.internal_skills:
+                self.assertIn(
+                    'path = "'
+                    + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
+                    + '"\nenabled = true',
+                    config_text,
+                )
+            for skill_name in self.disabled_skills:
+                self.assertIn(
+                    'path = "'
+                    + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
+                    + '"\nenabled = false',
+                    config_text,
+                )
             self.assertNotIn(secret_value, config_text)
             self.assertIn(secret_value, secrets.read_text(encoding="utf-8"))
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertEqual(secrets.stat().st_mode & 0o777, 0o600)
             settings = home / ".claude" / "settings.json"
             settings_data = json.loads(settings.read_text(encoding="utf-8"))
-            self.assertEqual(settings_data["skillOverrides"]["dev-plan"], "on")
-            self.assertEqual(settings_data["skillOverrides"]["project-audit"], "on")
-            self.assertEqual(settings_data["skillOverrides"]["document-project"], "on")
-            self.assertEqual(settings_data["skillOverrides"]["unused"], "off")
+            for skill_name in self.enabled_skills:
+                self.assertEqual(settings_data["skillOverrides"][skill_name], "on")
+            for skill_name in self.internal_skills:
+                self.assertEqual(
+                    settings_data["skillOverrides"][skill_name],
+                    "name-only",
+                )
+            for skill_name in self.disabled_skills:
+                self.assertEqual(settings_data["skillOverrides"][skill_name], "off")
             self.assertEqual(bashrc_text.count("alias codex-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claude-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claudex-yolo="), 1)
@@ -162,6 +193,8 @@ class CodexSetupTests(unittest.TestCase):
                 1,
             )
             self.assertIn("alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'", bashrc_text)
+            self.assertIn("alias claudex-yolo='CLAUDEX_YOLO=1 claudex'", bashrc_text)
+            self.assertNotIn("claude-api", bashrc_text)
             self.assertNotIn("--safe-mode", bashrc_text)
             self.assertLess(output.index("[1/3]"), output.index("[2/3]"))
             self.assertTrue((home / ".claude" / "settings.json").exists())

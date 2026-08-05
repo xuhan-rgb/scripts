@@ -11,7 +11,10 @@ readonly SECRETS_DIR="${HOME}/.config/codex"
 readonly SECRETS_FILE="${SECRETS_DIR}/secrets.env"
 readonly BASHRC="${HOME}/.bashrc"
 readonly DEFAULT_PROVIDER="${CLAUDEX_DEFAULT_PROVIDER:-crs_local}"
-readonly DEFAULT_CLAUDE_SKILLS="dev-plan project-audit document-project"
+readonly DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-docs handoff tdd"
+readonly INTERNAL_SKILLS="domain-modeling grilling"
+readonly AGENT_REACH_VERSION="1.5.0"
+readonly AGENT_REACH_SOURCE="https://github.com/Panniantong/Agent-Reach/archive/refs/tags/v${AGENT_REACH_VERSION}.zip"
 
 fail() {
   printf 'error: %s\n' "$*" >&2
@@ -55,7 +58,7 @@ update_bashrc() {
 [ -f "$HOME/.config/codex/secrets.env" ] && source "$HOME/.config/codex/secrets.env"
 alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
 alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
-alias claudex-yolo='claudex --dangerously-skip-permissions'
+alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 # <<< scripts AI yolo aliases <<<
 EOF
   chmod "${mode}" "${bashrc_tmp}"
@@ -65,12 +68,111 @@ EOF
 printf '[1/3] Updating AI yolo aliases in %s\n' "${BASHRC}"
 update_bashrc
 
+plugin_install_path() {
+  claude plugin list --json 2>/dev/null | python3 -c '
+import json
+import sys
+
+wanted = sys.argv[1]
+for plugin in json.load(sys.stdin):
+    if plugin.get("id") == wanted and plugin.get("installPath"):
+        print(plugin["installPath"])
+        break
+' "$1"
+}
+
+ensure_claude_plugin_source() {
+  local plugin="$1"
+  local plugin_path
+  plugin_path="$(plugin_install_path "${plugin}" || true)"
+  if [[ -z ${plugin_path} ]]; then
+    claude plugin install "${plugin}" --scope user >/dev/null
+    plugin_path="$(plugin_install_path "${plugin}" || true)"
+  fi
+  [[ -d ${plugin_path} ]] || fail "Claude plugin source is unavailable: ${plugin}"
+  printf '%s\n' "${plugin_path}"
+}
+
+copy_skill_if_missing() {
+  local source="$1"
+  local name="$2"
+  local skill_root
+  local target
+  [[ -f ${source}/SKILL.md ]] || fail "Skill source is incomplete: ${source}"
+  for skill_root in "${HOME}/.agents/skills" "${HOME}/.claude/skills"; do
+    target="${skill_root}/${name}"
+    [[ -f ${target}/SKILL.md ]] && continue
+    mkdir -p "${skill_root}"
+    cp -R "${source}" "${target}"
+  done
+}
+
+install_agent_reach() {
+  local venv_dir="${HOME}/.local/share/agent-reach-venv"
+  local executable
+  executable="$(command -v agent-reach || true)"
+  if [[ -z ${executable} ]] \
+    || [[ $("${executable}" --version 2>/dev/null || true) != "Agent Reach v${AGENT_REACH_VERSION}" ]]; then
+    if command -v uv >/dev/null 2>&1; then
+      UV_TOOL_BIN_DIR="${BIN_DIR}" uv tool install --force "${AGENT_REACH_SOURCE}" >/dev/null
+    else
+      python3 -m venv "${venv_dir}"
+      "${venv_dir}/bin/python" -m pip install --upgrade "${AGENT_REACH_SOURCE}" >/dev/null
+      install -m 0755 "${venv_dir}/bin/agent-reach" "${BIN_DIR}/agent-reach"
+    fi
+  fi
+  if [[ -x ${BIN_DIR}/agent-reach ]]; then
+    executable="${BIN_DIR}/agent-reach"
+  else
+    executable="$(command -v agent-reach || true)"
+  fi
+  [[ -n ${executable} ]] \
+    && [[ $("${executable}" --version 2>/dev/null || true) == "Agent Reach v${AGENT_REACH_VERSION}" ]] \
+    || fail "Agent Reach v${AGENT_REACH_VERSION} installation failed"
+
+  if [[ ! -f ${HOME}/.agents/skills/agent-reach/SKILL.md \
+    && ! -f ${HOME}/.claude/skills/agent-reach/SKILL.md ]]; then
+    mkdir -p "${HOME}/.agents/skills" "${HOME}/.claude/skills"
+    "${executable}" skill --install >/dev/null
+  elif [[ ! -f ${HOME}/.agents/skills/agent-reach/SKILL.md ]]; then
+    copy_skill_if_missing "${HOME}/.claude/skills/agent-reach" agent-reach
+  elif [[ ! -f ${HOME}/.claude/skills/agent-reach/SKILL.md ]]; then
+    copy_skill_if_missing "${HOME}/.agents/skills/agent-reach" agent-reach
+  fi
+  [[ -f ${HOME}/.agents/skills/agent-reach/SKILL.md \
+    && -f ${HOME}/.claude/skills/agent-reach/SKILL.md ]] \
+    || fail "Agent Reach skill installation failed"
+}
+
+install_selected_skills() {
+  local matt_path
+  local superpowers_path
+  [[ ${CLAUDEX_SKIP_SKILL_INSTALL:-0} == 1 ]] && return 0
+  command -v claude >/dev/null 2>&1 || fail "missing required command: claude"
+
+  mkdir -p "${BIN_DIR}"
+  install_agent_reach
+  matt_path="$(ensure_claude_plugin_source mattpocock-skills@claude-plugins-official)"
+  superpowers_path="$(ensure_claude_plugin_source superpowers@claude-plugins-official)"
+
+  copy_skill_if_missing "${matt_path}/skills/productivity/grill-me" grill-me
+  copy_skill_if_missing "${matt_path}/skills/engineering/tdd" tdd
+  copy_skill_if_missing "${matt_path}/skills/productivity/handoff" handoff
+  copy_skill_if_missing "${matt_path}/skills/engineering/grill-with-docs" grill-with-docs
+  copy_skill_if_missing "${matt_path}/skills/productivity/grilling" grilling
+  copy_skill_if_missing "${matt_path}/skills/engineering/domain-modeling" domain-modeling
+  copy_skill_if_missing "${superpowers_path}/skills/brainstorming" brainstorming
+}
+
+install_selected_skills
+
 disable_claude_plugins() {
-  [[ -f ${HOME}/.claude/settings.json ]] || return 0
   command -v claude >/dev/null 2>&1 || return 0
-  [[ -f ${HOME}/.claude/settings.json.before-disabled-extensions ]] \
-    || cp -p "${HOME}/.claude/settings.json" "${HOME}/.claude/settings.json.before-disabled-extensions"
-  chmod 600 "${HOME}/.claude/settings.json.before-disabled-extensions"
+  if [[ -f ${HOME}/.claude/settings.json ]]; then
+    [[ -f ${HOME}/.claude/settings.json.before-disabled-extensions ]] \
+      || cp -p "${HOME}/.claude/settings.json" "${HOME}/.claude/settings.json.before-disabled-extensions"
+    chmod 600 "${HOME}/.claude/settings.json.before-disabled-extensions"
+  fi
   while IFS= read -r plugin; do
     [[ -n ${plugin} ]] || continue
     claude plugin disable "${plugin}" >/dev/null
@@ -103,7 +205,8 @@ configure_claude_skill_overrides() {
   fi
 
   settings_tmp="$(mktemp "${settings_file}.tmp.XXXXXX")"
-  python3 - "${settings_file}" "${settings_tmp}" "${DEFAULT_CLAUDE_SKILLS}" <<'PY'
+  python3 - "${settings_file}" "${settings_tmp}" \
+    "${DEFAULT_ENABLED_SKILLS}" "${INTERNAL_SKILLS}" <<'PY'
 import json
 import re
 import sys
@@ -111,7 +214,8 @@ from pathlib import Path
 
 settings_path = Path(sys.argv[1])
 output_path = Path(sys.argv[2])
-default_skills = set(sys.argv[3].split())
+enabled_skills = set(sys.argv[3].split())
+internal_skills = set(sys.argv[4].split())
 settings = {}
 if settings_path.is_file():
     with settings_path.open(encoding="utf-8") as stream:
@@ -137,7 +241,10 @@ overrides = settings.get("skillOverrides")
 if not isinstance(overrides, dict):
     overrides = {}
 for name in sorted(skill_names):
-    overrides[name] = "on" if name in default_skills else "off"
+    if name in enabled_skills:
+        overrides[name] = "on"
+    else:
+        overrides[name] = "name-only" if name in internal_skills else "off"
 settings["skillOverrides"] = overrides
 
 with output_path.open("w", encoding="utf-8") as stream:
@@ -332,19 +439,12 @@ disable_extension_tables() {
   fi
 }
 
-codex_skill_is_default() {
-  case " ${DEFAULT_CLAUDE_SKILLS} " in
-    *" $1 "*) return 0 ;;
-    *) return 1 ;;
-  esac
-}
-
 configure_codex_skills() {
   local config_tmp
   local skill_path
   local escaped_path
   local skill_name
-  declare -A enabled_skill_names=()
+  local enabled
   config_tmp="$(mktemp "${CODEX_CONFIG}.skills.XXXXXX")"
   awk '
     $0 == "# >>> scripts disabled Codex skills >>>" { managed = 1; next }
@@ -356,12 +456,13 @@ configure_codex_skills() {
     escaped_path="${skill_path//\\/\\\\}"
     escaped_path="${escaped_path//\"/\\\"}"
     skill_name="$(basename "$(dirname "${skill_path}")")"
-    if codex_skill_is_default "${skill_name}" && [[ -z ${enabled_skill_names[${skill_name}]+x} ]]; then
-      printf '[[skills.config]]\npath = "%s"\nenabled = true\n\n' "${escaped_path}" >>"${config_tmp}"
-      enabled_skill_names[${skill_name}]=1
-    else
-      printf '[[skills.config]]\npath = "%s"\nenabled = false\n\n' "${escaped_path}" >>"${config_tmp}"
+    enabled=false
+    if [[ ${skill_path} == "${HOME}/.agents/skills/"* ]] \
+      && [[ " ${DEFAULT_ENABLED_SKILLS} ${INTERNAL_SKILLS} " == *" ${skill_name} "* ]]; then
+      enabled=true
     fi
+    printf '[[skills.config]]\npath = "%s"\nenabled = %s\n\n' \
+      "${escaped_path}" "${enabled}" >>"${config_tmp}"
   done < <(
     find "${CODEX_DIR}/skills" "${HOME}/.agents/skills" "${HOME}/.claude/skills" \
       -type f -name SKILL.md -print0 2>/dev/null | sort -zu

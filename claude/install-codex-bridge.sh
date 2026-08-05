@@ -294,8 +294,10 @@ cat >"${tmp_dir}/claudex" <<'EOF'
 set -euo pipefail
 
 extra_args=()
-if [[ $(basename "$0") == "claudex-yolo" ]]; then
+session_settings='{"availableModels":["claudex-router[1m]"]}'
+if [[ $(basename "$0") == "claudex-yolo" || ${CLAUDEX_YOLO:-0} == 1 ]]; then
   extra_args+=(--dangerously-skip-permissions)
+  session_settings='{"availableModels":["claudex-router[1m]"],"skillOverrides":{"claude-api":"off"}}'
 fi
 extension_args=(--strict-mcp-config)
 if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
@@ -319,7 +321,7 @@ exec env \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
   claude --model 'claudex-router[1m]' --autocompact 250k --effort medium \
-    --settings '{"availableModels":["claudex-router[1m]"]}' \
+    --settings "${session_settings}" \
     --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
@@ -417,4 +419,4 @@ printf 'Launch with: claudex or claudex-yolo\n'
 printf 'Open the visual model switcher with: claudex-ui\n'
 printf 'Reload aliases with: source ~/.bashrc\n'
 printf 'Normal claude login is unchanged; claude-yolo uses the normal account, claudex-yolo uses the GPT bridge.\n'
-printf 'MCP and unused skills default to disabled; dev-plan, project-audit, and document-project are enabled.\n'
+printf 'MCP and plugins are disabled; only the selected programming skills are enabled.\n'
