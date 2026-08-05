@@ -552,8 +552,9 @@ def test_provider(payload):
     if api_key:
         command.append("--stdin")
     with _provider_lock():
-        result = _run_provider_command(command, input_text=api_key or None)
-    return result.strip()
+        message = _run_provider_command(command, input_text=api_key or None).strip()
+    status = "warning" if "API compatibility was not confirmed" in message else "success"
+    return {"status": status, "message": message}
 
 
 def switch_provider(payload):
@@ -844,12 +845,32 @@ HTML = r'''<!doctype html>
     .provider-switch { color: var(--panel); background: var(--ink); border: 1px solid var(--ink); }
     .provider-delete { color: var(--bad); background: transparent; border: 1px solid rgba(180,72,53,.65); }
     .provider-save:disabled, .provider-switch:disabled, .provider-test:disabled, .provider-delete:disabled { opacity: .45; cursor: not-allowed; }
+    .provider-test-result {
+      position: relative;
+      display: grid;
+      gap: 7px;
+      min-width: 0;
+      padding: 13px 14px 13px 38px;
+      color: var(--teal);
+      background: rgba(25,125,120,.07);
+      border: 1px solid rgba(25,125,120,.32);
+      border-radius: 11px;
+    }
+    .provider-test-result[hidden] { display: none; }
+    .provider-test-result::before { position: absolute; top: 17px; left: 15px; width: 10px; height: 10px; border-radius: 50%; background: currentColor; content: ""; }
+    .provider-test-result strong { font-size: 12px; }
+    .provider-test-result span { color: var(--ink-soft); font: 10px/1.55 "DejaVu Sans Mono", monospace; overflow-wrap: anywhere; white-space: pre-wrap; }
+    .provider-test-result.success { color: var(--good); background: rgba(40,118,80,.08); border-color: rgba(40,118,80,.32); }
+    .provider-test-result.warning { color: #a84a20; background: rgba(237,106,58,.09); border-color: rgba(237,106,58,.4); }
+    .provider-test-result.error { color: var(--bad); background: rgba(180,72,53,.08); border-color: rgba(180,72,53,.34); }
+    .provider-test-result.running::before { animation: test-pulse 1s ease-in-out infinite alternate; }
     .config-footnote { margin: 18px 0 0; padding-top: 15px; color: var(--ink-soft); border-top: 1px solid var(--line); font-size: 10px; line-height: 1.55; }
-    .toast { position: fixed; right: 22px; bottom: 22px; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); white-space: pre-line; transform: translateY(90px); opacity: 0; transition: .25s ease; }
+    .toast { position: fixed; right: 22px; bottom: 22px; z-index: 30; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); white-space: pre-line; transform: translateY(90px); opacity: 0; transition: .25s ease; }
     .toast.show { transform: translateY(0); opacity: 1; }
     .toast.error { background: var(--bad); }
     @keyframes rise { from { opacity: 0; transform: translateY(10px); } to { opacity: 1; transform: translateY(0); } }
     @keyframes drawer-in { from { opacity: 0; transform: translateX(28px); } to { opacity: 1; transform: translateX(0); } }
+    @keyframes test-pulse { from { opacity: .35; transform: scale(.78); } to { opacity: 1; transform: scale(1); } }
     @media (max-width: 900px) {
       .shell { width: calc(100% - 28px); }
       .model-card { min-height: 132px; padding: 12px; }
@@ -1050,6 +1071,10 @@ HTML = r'''<!doctype html>
           <button id="provider-delete" class="provider-delete" type="button">Delete</button>
           <button id="provider-switch" class="provider-switch" type="button">Activate</button>
         </div>
+        <div id="provider-test-result" class="provider-test-result" role="status" aria-live="polite" hidden>
+          <strong id="provider-test-title"></strong>
+          <span id="provider-test-detail"></span>
+        </div>
       </form>
       <p class="config-footnote">The built-in provider backend handles all actions. Save stores the provider without changing the active route. The Key is stored locally with mode 0600 and is never returned to this page. Test checks TCP and the /models endpoint without saving. Activate switches Codex, regenerates the claudex gateway, and restarts CLIProxyAPI. Delete is available only for inactive providers.</p>
     </aside>
@@ -1235,6 +1260,21 @@ HTML = r'''<!doctype html>
       const toast = $('toast'); toast.textContent = message; toast.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove('show'), 3200);
     }
+    function clearProviderTestResult() {
+      const result = $('provider-test-result');
+      result.hidden = true;
+      result.className = 'provider-test-result';
+      $('provider-test-title').textContent = '';
+      $('provider-test-detail').textContent = '';
+    }
+    function setProviderTestResult(status, title, detail = '') {
+      const result = $('provider-test-result');
+      result.className = `provider-test-result ${status}`;
+      $('provider-test-title').textContent = title;
+      $('provider-test-detail').textContent = detail;
+      result.hidden = false;
+      result.scrollIntoView({block: 'nearest'});
+    }
 
     function providerByName(name) {
       return (app.state?.providers || []).find((provider) => provider.name === name);
@@ -1270,6 +1310,7 @@ HTML = r'''<!doctype html>
       $('provider-switch').textContent = app.providerAction === 'activate' ? 'Activating...' : 'Activate';
     }
     function editProvider(provider) {
+      clearProviderTestResult();
       app.providerIsNew = !provider;
       $('provider-edit-name').value = provider?.name || '';
       $('provider-edit-name').readOnly = Boolean(provider);
@@ -1337,14 +1378,16 @@ HTML = r'''<!doctype html>
       if (app.providerSaving || !$('provider-form').reportValidity()) return;
       app.providerSaving = true;
       app.providerAction = 'test';
+      setProviderTestResult('running', 'Testing provider...', 'Checking TCP, HTTP, and /models compatibility.');
       updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
       try {
         const response = await fetch('/api/providers/test', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(providerFormPayload())});
         const result = await response.json();
         if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
-        notify(result.message || 'Provider connection test passed.');
+        const warning = result.status === 'warning';
+        setProviderTestResult(result.status, warning ? 'Reachable with warning' : 'Connection passed', result.message);
       } catch (error) {
-        notify(`Provider test failed: ${error.message}`, true);
+        setProviderTestResult('error', 'Connection failed', error.message);
       } finally {
         app.providerSaving = false;
         app.providerAction = '';
@@ -1426,7 +1469,10 @@ HTML = r'''<!doctype html>
     $('provider-config-scrim').addEventListener('click', closeProviderConfig);
     $('provider-new').addEventListener('click', newProvider);
     $('provider-picker').addEventListener('change', () => editProvider(providerByName($('provider-picker').value)));
-    $('provider-form').addEventListener('input', () => updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value)));
+    $('provider-form').addEventListener('input', () => {
+      clearProviderTestResult();
+      updateProviderActions(app.providerIsNew ? null : providerByName($('provider-picker').value));
+    });
     $('provider-form').addEventListener('submit', saveProvider);
     $('provider-test').addEventListener('click', testProviderConnection);
     $('provider-delete').addEventListener('click', deleteSelectedProvider);
@@ -1526,7 +1572,7 @@ class ManagerHandler(BaseHTTPRequestHandler):
             elif self.path == "/api/providers/save":
                 save_provider(payload)
             elif self.path == "/api/providers/test":
-                self._send_json(200, {"message": test_provider(payload)})
+                self._send_json(200, test_provider(payload))
                 return
             elif self.path == "/api/providers/switch":
                 switch_provider(payload)

@@ -69,6 +69,9 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("/api/providers/test", manager.HTML)
         self.assertIn("/api/providers/delete", manager.HTML)
         self.assertIn('id="provider-test"', manager.HTML)
+        self.assertIn('id="provider-test-result"', manager.HTML)
+        self.assertIn('id="provider-test-title"', manager.HTML)
+        self.assertIn('id="provider-test-detail"', manager.HTML)
         self.assertIn('id="provider-delete"', manager.HTML)
         self.assertIn("The Key is stored locally with mode 0600", manager.HTML)
         self.assertIn("built-in provider backend", manager.HTML)
@@ -183,7 +186,10 @@ class CodexBridgeManagerTests(unittest.TestCase):
                 }
             )
 
-        self.assertEqual(result, "connection test:\nresult: ok")
+        self.assertEqual(
+            result,
+            {"status": "success", "message": "connection test:\nresult: ok"},
+        )
         run.assert_called_once_with(
             [
                 "test",
@@ -196,6 +202,35 @@ class CodexBridgeManagerTests(unittest.TestCase):
             ],
             input_text="candidate-secret",
         )
+
+    def test_provider_test_reports_reachable_unconfirmed_endpoint_as_warning(self):
+        output = (
+            "connection test:\n"
+            "  - tcp: ok (127.0.0.1:3000)\n"
+            "  - http: GET http://127.0.0.1:3000/openai/models -> 404\n"
+            "  - endpoint: /models not found; network is reachable but API compatibility was not confirmed\n"
+            "result: ok\n"
+        )
+        with (
+            mock.patch.object(manager, "_run_provider_command", return_value=output),
+            mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
+        ):
+            result = manager.test_provider(
+                {
+                    "name": "candidate",
+                    "base_url": "http://127.0.0.1:3000/openai",
+                    "env_key": "CANDIDATE_KEY",
+                    "api_key": "candidate-secret",
+                }
+            )
+
+        self.assertEqual(result, {"status": "warning", "message": output.strip()})
+
+    def test_provider_test_feedback_is_inline_and_above_the_config_drawer(self):
+        self.assertIn("setProviderTestResult('running'", manager.HTML)
+        self.assertIn("setProviderTestResult(result.status", manager.HTML)
+        self.assertIn("setProviderTestResult('error'", manager.HTML)
+        self.assertRegex(manager.HTML, r"\.toast \{[^}]*z-index: 30;")
 
     def test_deletes_only_an_inactive_provider(self):
         providers = [

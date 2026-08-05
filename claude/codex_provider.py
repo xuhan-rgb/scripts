@@ -309,7 +309,10 @@ def test_provider_connection(base_url: str, api_key: str | None = None, timeout:
         if exc.code == 404:
             messages.append("endpoint: /models not found; network is reachable but API compatibility was not confirmed")
             return True, messages
-        return 200 <= exc.code < 500, messages
+        if exc.code < 500:
+            messages.append("endpoint: server responded, but API compatibility was not confirmed")
+            return True, messages
+        return False, messages
     except URLError as exc:
         messages.append(f"http: failed GET {models_url} - {exc.reason}")
         return False, messages
