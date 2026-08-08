@@ -6,12 +6,18 @@ readonly BIN_DIR="${HOME}/.local/bin"
 readonly CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_CONFIG="${CODEX_DIR}/config.toml"
 readonly CODEX_PROVIDER_SOURCE="${SCRIPT_DIR}/codex_provider.py"
+readonly CODEX_AUTH_SOURCE="${SCRIPT_DIR}/switch-codex-auth.sh"
 readonly SECRETS_DIR="${HOME}/.config/codex"
 readonly SECRETS_FILE="${SECRETS_DIR}/secrets.env"
 readonly BASHRC="${HOME}/.bashrc"
+readonly CLAUDE_DIR="${HOME}/.claude"
+readonly CLAUDE_SETTINGS_YOLO="${CLAUDE_DIR}/settings.yolo.json"
+readonly CLAUDE_SETTINGS_CLAUDEX_YOLO="${CLAUDE_DIR}/settings.claudex-yolo.json"
+readonly CODEX_CONFIG_YOLO="${CODEX_DIR}/yolo.config.toml"
 readonly DEFAULT_PROVIDER="${CLAUDEX_DEFAULT_PROVIDER:-crs_local}"
 readonly DEFAULT_ENABLED_SKILLS="agent-reach brainstorming grill-me grill-with-docs handoff tdd"
 readonly INTERNAL_SKILLS="domain-modeling grilling"
+readonly YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling grilling tdd"
 readonly AGENT_REACH_VERSION="1.5.0"
 readonly AGENT_REACH_SOURCE="https://github.com/Panniantong/Agent-Reach/archive/refs/tags/v${AGENT_REACH_VERSION}.zip"
 ENABLED_SKILLS="${DEFAULT_ENABLED_SKILLS}"
@@ -35,6 +41,112 @@ case "${DEFAULT_PROVIDER}" in
 esac
 
 [[ -f ${CODEX_PROVIDER_SOURCE} ]] || fail "missing provider manager: ${CODEX_PROVIDER_SOURCE}"
+[[ -f ${CODEX_AUTH_SOURCE} ]] || fail "missing Codex auth switcher: ${CODEX_AUTH_SOURCE}"
+
+create_claude_yolo_settings() {
+  mkdir -p "${CLAUDE_DIR}"
+  python3 - "${CLAUDE_DIR}/skills" "${CLAUDE_SETTINGS_YOLO}" \
+    "${CLAUDE_SETTINGS_CLAUDEX_YOLO}" "${YOLO_MINIMAL_SKILLS}" <<'PY'
+import json
+import re
+import sys
+from pathlib import Path
+
+skills_root = Path(sys.argv[1])
+yolo_path = Path(sys.argv[2])
+claudex_yolo_path = Path(sys.argv[3])
+minimal_skills = set(sys.argv[4].split())
+skill_names = set(minimal_skills)
+
+if skills_root.is_dir():
+    for skill_file in skills_root.rglob("SKILL.md"):
+        name = skill_file.parent.name
+        try:
+            content = skill_file.read_text(encoding="utf-8")
+        except OSError:
+            continue
+        frontmatter = re.search(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
+        if frontmatter:
+            match = re.search(r"^name:\s*([^#\n]+)", frontmatter.group(1), re.MULTILINE)
+            if match:
+                name = match.group(1).strip().strip("'\"")
+        skill_names.add(name)
+
+overrides = {
+    name: "on" if name in minimal_skills else "off"
+    for name in sorted(skill_names)
+}
+yolo_path.write_text(
+    json.dumps({"skillOverrides": overrides}, ensure_ascii=False, indent=2) + "\n",
+    encoding="utf-8",
+)
+
+claudex_overrides = dict(overrides)
+claudex_overrides["claude-api"] = "off"
+claudex_yolo_path.write_text(
+    json.dumps(
+        {
+            "availableModels": ["claudex-router[1m]"],
+            "skillOverrides": claudex_overrides,
+        },
+        ensure_ascii=False,
+        indent=2,
+    )
+    + "\n",
+    encoding="utf-8",
+)
+PY
+  chmod 600 "${CLAUDE_SETTINGS_YOLO}" "${CLAUDE_SETTINGS_CLAUDEX_YOLO}"
+  printf 'Created minimal skill settings for claude-yolo: %s\n' "${CLAUDE_SETTINGS_YOLO}" >&2
+  printf 'Created minimal skill settings for claudex-yolo: %s\n' \
+    "${CLAUDE_SETTINGS_CLAUDEX_YOLO}" >&2
+}
+
+create_codex_yolo_config() {
+  mkdir -p "${CODEX_DIR}"
+
+  local config_tmp
+  local enabled
+  local enabled_skill_names=" "
+  local escaped_path
+  local skill_name
+  local skill_path
+  config_tmp="$(mktemp "${CODEX_CONFIG_YOLO}.tmp.XXXXXX")"
+
+  awk '
+    /^\[\[skills\.config\]\]/ { in_skill = 1; next }
+    in_skill && /^$/ { in_skill = 0; next }
+    in_skill { next }
+    $0 == "# >>> scripts disabled Codex skills >>>" { managed = 1; next }
+    $0 == "# <<< scripts disabled Codex skills <<<" { managed = 0; next }
+    !managed && !in_skill { print }
+  ' "${CODEX_CONFIG}" >"${config_tmp}"
+
+  printf '\n# >>> scripts disabled Codex skills >>>\n' >>"${config_tmp}"
+
+  while IFS= read -r -d '' skill_path; do
+    escaped_path="${skill_path//\\/\\\\}"
+    escaped_path="${escaped_path//\"/\\\"}"
+    skill_name="$(basename "$(dirname "${skill_path}")")"
+    enabled=false
+    if [[ " ${YOLO_MINIMAL_SKILLS} " == *" ${skill_name} "* ]] \
+      && [[ ${enabled_skill_names} != *" ${skill_name} "* ]]; then
+      enabled=true
+      enabled_skill_names+="${skill_name} "
+    fi
+    printf '[[skills.config]]\npath = "%s"\nenabled = %s\n\n' \
+      "${escaped_path}" "${enabled}" >>"${config_tmp}"
+  done < <(
+    find "${CODEX_DIR}/skills" "${HOME}/.agents/skills" "${HOME}/.claude/skills" \
+      -type f -name SKILL.md -print0 2>/dev/null | sort -zu
+  )
+
+  printf '# <<< scripts disabled Codex skills <<<\n' >>"${config_tmp}"
+
+  chmod 600 "${config_tmp}"
+  mv "${config_tmp}" "${CODEX_CONFIG_YOLO}"
+  printf 'Created minimal skill config for codex-yolo: %s\n' "${CODEX_CONFIG_YOLO}" >&2
+}
 
 update_bashrc() {
   local mode=600
@@ -56,8 +168,8 @@ update_bashrc() {
 
 # >>> scripts AI yolo aliases >>>
 [ -f "$HOME/.config/codex/secrets.env" ] && source "$HOME/.config/codex/secrets.env"
-alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox'
-alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'
+alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox -p yolo'
+alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'
 alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 # <<< scripts AI yolo aliases <<<
 EOF
@@ -237,68 +349,20 @@ for plugin in json.load(sys.stdin):
 }
 
 configure_claude_skill_overrides() {
-  local settings_file="${HOME}/.claude/settings.json"
-  local settings_backup="${settings_file}.before-disabled-extensions"
-  local settings_tmp
-  local settings_mode=600
+  # 默认的 claude 命令不设置 skillOverrides，允许使用所有 skills
+  # 只有 claude-yolo 通过 settings.yolo.json 限制 skills
+  printf 'Skipping Claude skillOverrides - default command uses all available skills\n' >&2
 
+  # 确保目录存在
   mkdir -p "${HOME}/.claude"
   chmod 700 "${HOME}/.claude"
-  if [[ -f ${settings_file} ]]; then
-    settings_mode="$(stat -c '%a' "${settings_file}")"
-    [[ -f ${settings_backup} ]] || cp -p "${settings_file}" "${settings_backup}"
-    chmod 600 "${settings_backup}"
+
+  # 如果 settings.json 不存在，创建一个空的
+  local settings_file="${HOME}/.claude/settings.json"
+  if [[ ! -f ${settings_file} ]]; then
+    echo '{}' > "${settings_file}"
+    chmod 600 "${settings_file}"
   fi
-
-  settings_tmp="$(mktemp "${settings_file}.tmp.XXXXXX")"
-  python3 - "${settings_file}" "${settings_tmp}" \
-    "${ENABLED_SKILLS}" "${INTERNAL_SKILLS}" <<'PY'
-import json
-import re
-import sys
-from pathlib import Path
-
-settings_path = Path(sys.argv[1])
-output_path = Path(sys.argv[2])
-enabled_skills = set(sys.argv[3].split())
-internal_skills = set(sys.argv[4].split())
-settings = {}
-if settings_path.is_file():
-    with settings_path.open(encoding="utf-8") as stream:
-        settings = json.load(stream)
-
-skills_root = settings_path.parent / "skills"
-skill_names = set()
-if skills_root.is_dir():
-    for skill_file in skills_root.rglob("SKILL.md"):
-        name = skill_file.parent.name
-        try:
-            content = skill_file.read_text(encoding="utf-8")
-        except OSError:
-            continue
-        frontmatter = re.search(r"\A---\s*\n(.*?)\n---\s*\n", content, re.DOTALL)
-        if frontmatter:
-            match = re.search(r"^name:\s*([^\s#]+)", frontmatter.group(1), re.MULTILINE)
-            if match:
-                name = match.group(1)
-        skill_names.add(name)
-
-overrides = settings.get("skillOverrides")
-if not isinstance(overrides, dict):
-    overrides = {}
-for name in sorted(skill_names):
-    if name in enabled_skills:
-        overrides[name] = "on"
-    else:
-        overrides[name] = "name-only" if name in internal_skills else "off"
-settings["skillOverrides"] = overrides
-
-with output_path.open("w", encoding="utf-8") as stream:
-    json.dump(settings, stream, ensure_ascii=False, indent=2)
-    stream.write("\n")
-PY
-  chmod "${settings_mode}" "${settings_tmp}"
-  mv "${settings_tmp}" "${settings_file}"
 }
 
 provider_manager() {
@@ -309,6 +373,7 @@ printf '[1/3] Initializing Codex providers\n'
 mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}"
 chmod 700 "${CODEX_DIR}" "${SECRETS_DIR}"
 rm -f -- "${BIN_DIR}/codex-provider"
+install -m 0755 "${CODEX_AUTH_SOURCE}" "${BIN_DIR}/codex-auth"
 
 toml_top_value() {
   awk -v wanted="$1" '
@@ -460,10 +525,11 @@ disable_extension_tables() {
 
 configure_codex_skills() {
   local config_tmp
-  local skill_path
+  local enabled
+  local enabled_skill_names=" "
   local escaped_path
   local skill_name
-  local enabled
+  local skill_path
   config_tmp="$(mktemp "${CODEX_CONFIG}.skills.XXXXXX")"
   awk '
     $0 == "# >>> scripts disabled Codex skills >>>" { managed = 1; next }
@@ -476,9 +542,9 @@ configure_codex_skills() {
     escaped_path="${escaped_path//\"/\\\"}"
     skill_name="$(basename "$(dirname "${skill_path}")")"
     enabled=false
-    if [[ ${skill_path} == "${HOME}/.agents/skills/"* ]] \
-      && [[ " ${ENABLED_SKILLS} ${INTERNAL_SKILLS} " == *" ${skill_name} "* ]]; then
+    if [[ ${enabled_skill_names} != *" ${skill_name} "* ]]; then
       enabled=true
+      enabled_skill_names+="${skill_name} "
     fi
     printf '[[skills.config]]\npath = "%s"\nenabled = %s\n\n' \
       "${escaped_path}" "${enabled}" >>"${config_tmp}"
@@ -496,7 +562,8 @@ configure_codex_skills() {
 }
 
 active_provider="$(toml_top_value model_provider)"
-if [[ -z ${active_provider} ]] || ! grep -Fqx "[model_providers.${active_provider}]" "${CODEX_CONFIG}"; then
+if [[ ${active_provider} != openai ]] \
+  && { [[ -z ${active_provider} ]] || ! grep -Fqx "[model_providers.${active_provider}]" "${CODEX_CONFIG}"; }; then
   provider_manager switch "${DEFAULT_PROVIDER}" >/dev/null
   active_provider="${DEFAULT_PROVIDER}"
 fi
@@ -523,13 +590,17 @@ set -a
 source "${SECRETS_FILE}"
 set +a
 
-active_env_key="$(toml_provider_value "${active_provider}" env_key)"
-if [[ ! ${active_env_key} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
-  printf 'Provider %s has no valid env_key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
-    "${active_provider}"
-elif [[ -z $(printenv "${active_env_key}" || true) ]]; then
-  printf 'Provider %s has no Key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
-    "${active_provider}"
+if [[ ${active_provider} == openai ]]; then
+  printf 'Codex account mode is active; use codex-auth api to restore the saved API provider.\n'
+else
+  active_env_key="$(toml_provider_value "${active_provider}" env_key)"
+  if [[ ! ${active_env_key} =~ ^[A-Za-z_][A-Za-z0-9_]*$ ]]; then
+    printf 'Provider %s has no valid env_key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
+      "${active_provider}"
+  elif [[ -z $(printenv "${active_env_key}" || true) ]]; then
+    printf 'Provider %s has no Key yet; configure it at http://127.0.0.1:8320 after installation.\n' \
+      "${active_provider}"
+  fi
 fi
 
 printf 'Codex configured: provider=%s config=%s\n' "${active_provider}" "${CODEX_CONFIG}"
@@ -538,6 +609,7 @@ printf '[2/3] Updating aliases, skills, and extension policy\n'
 configure_agent_reach_choice
 update_bashrc
 install_selected_skills
+create_claude_yolo_settings
 disable_claude_plugins
 configure_claude_skill_overrides
 for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
@@ -548,5 +620,7 @@ for config_file in "${CODEX_CONFIG}" "${CODEX_DIR}"/*.config.toml; do
   disable_extension_tables "${config_file}"
 done
 configure_codex_skills
+create_codex_yolo_config
 
 printf 'Shell aliases installed in: %s\n' "${BASHRC}"
+printf 'Codex auth switch installed: %s (use: codex-auth status)\n' "${BIN_DIR}/codex-auth"

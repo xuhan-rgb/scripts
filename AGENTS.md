@@ -74,6 +74,7 @@ python convert_trt.py
 .
 |- claude/install-codex-bridge.sh     # 跟随本地 Codex provider 的 Claude Code 桥接服务
 |- claude/setup-codex.sh              # 新电脑 provider、Skills、私有密钥和 alias 初始化
+|- claude/switch-codex-auth.sh        # 在自定义 API provider 与 ChatGPT 账号间切换 Codex
 |- claude/codex_provider.py           # 安装器与 8320 网页共用的内部 provider/profile/key 后端
 |- claude/codex_bridge_manager.py     # 实时模型路由与逐请求 usage 可视化控制台
 |- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置

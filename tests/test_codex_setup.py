@@ -13,6 +13,7 @@ from unittest import mock
 REPOSITORY = Path(__file__).parents[1]
 SETUP_SCRIPT = REPOSITORY / "claude" / "setup-codex.sh"
 INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-bridge.sh"
+AUTH_SWITCH_SCRIPT = REPOSITORY / "claude" / "switch-codex-auth.sh"
 PROVIDER_SCRIPT = REPOSITORY / "claude" / "codex_provider.py"
 PROVIDER_SPEC = importlib.util.spec_from_file_location("codex_provider", PROVIDER_SCRIPT)
 provider = importlib.util.module_from_spec(PROVIDER_SPEC)
@@ -92,12 +93,11 @@ class CodexSetupTests(unittest.TestCase):
         self.assertNotIn("--safe-mode", installer)
         self.assertIn("CLAUDEX_EXTENSIONS", installer)
         self.assertIn('${CLAUDEX_YOLO:-0} == 1', installer)
-        self.assertIn(
-            '"skillOverrides":{"claude-api":"off"}',
-            installer,
-        )
+        self.assertIn("settings.claudex-yolo.json", installer)
+        self.assertIn("settings_args=(", installer)
+        self.assertIn("settings_args[@]", installer)
         self.assertIn('--settings "${session_settings}"', installer)
-        self.assertEqual(installer.count('skillOverrides\":{\"claude-api'), 1)
+        self.assertNotIn('skillOverrides\":{\"claude-api', installer)
         sync = 'if sync_output="$(CLAUDEX_SYNC_BACKUP=1 "${BIN_DIR}/claude-codex-sync"'
         self.assertIn(sync, installer)
         self.assertLess(
@@ -165,7 +165,20 @@ class CodexSetupTests(unittest.TestCase):
                     self.assertEqual("--autocompact" in arguments, supported)
                     self.assertEqual("250k" in arguments, supported)
 
-    def test_default_skill_allowlist_preserves_claude_memory_files(self):
+            yolo_settings = home / ".claude" / "settings.claudex-yolo.json"
+            yolo_settings.parent.mkdir()
+            yolo_settings.write_text("{}\n", encoding="utf-8")
+            environment["CLAUDEX_YOLO"] = "1"
+            completed = subprocess.run(
+                [str(wrapper_path)],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(completed.returncode, 0, completed.stderr)
+            self.assertIn(str(yolo_settings), completed.stdout.splitlines())
+
+    def test_default_modes_keep_all_skills_and_yolo_uses_dedicated_settings(self):
         setup = SETUP_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn(
@@ -188,10 +201,29 @@ class CodexSetupTests(unittest.TestCase):
             setup,
         )
         self.assertNotIn('uv tool install "agent-reach==', setup)
-        self.assertIn('alias claude-yolo=\'claude --dangerously-skip-permissions --strict-mcp-config\'', setup)
-        self.assertIn('settings["skillOverrides"] = overrides', setup)
-        self.assertIn('"name-only" if name in internal_skills', setup)
+        self.assertIn(
+            'YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling grilling tdd"',
+            setup,
+        )
+        self.assertIn("CLAUDE_SETTINGS_CLAUDEX_YOLO", setup)
+        self.assertIn(
+            "alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'",
+            setup,
+        )
         self.assertNotIn("--safe-mode", setup)
+
+    def test_codex_yolo_uses_a_named_config_profile(self):
+        setup = SETUP_SCRIPT.read_text(encoding="utf-8")
+
+        self.assertIn(
+            'readonly CODEX_CONFIG_YOLO="${CODEX_DIR}/yolo.config.toml"',
+            setup,
+        )
+        self.assertIn(
+            "alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox -p yolo'",
+            setup,
+        )
+        self.assertNotIn(" -c ~/.codex/config.yolo.toml", setup)
 
     def test_fresh_setup_is_idempotent_and_keeps_claude_login_separate(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -203,6 +235,9 @@ class CodexSetupTests(unittest.TestCase):
             skill = home / ".agents" / "skills" / "example" / "SKILL.md"
             skill.parent.mkdir(parents=True)
             skill.write_text("---\nname: example\n---\n", encoding="utf-8")
+            codex_skill = home / ".codex" / "skills" / "system-helper" / "SKILL.md"
+            codex_skill.parent.mkdir(parents=True)
+            codex_skill.write_text("---\nname: system-helper\n---\n", encoding="utf-8")
             for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
                 skill_file = home / ".agents" / "skills" / skill_name / "SKILL.md"
                 skill_file.parent.mkdir(parents=True, exist_ok=True)
@@ -269,8 +304,10 @@ class CodexSetupTests(unittest.TestCase):
                         config_file.write('\n[plugins."unused@example"]\nenabled = true\n')
 
             config = home / ".codex" / "config.toml"
+            yolo_config = home / ".codex" / "yolo.config.toml"
             secrets = home / ".config" / "codex" / "secrets.env"
             config_text = config.read_text(encoding="utf-8")
+            yolo_config_text = yolo_config.read_text(encoding="utf-8")
             bashrc_text = bashrc.read_text(encoding="utf-8")
 
             self.assertIn('model_provider = "crs_local"', config_text)
@@ -282,37 +319,75 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn("enabled = false", config_text)
             self.assertIn(str(skill), config_text)
             self.assertIn("[[skills.config]]", config_text)
-            for skill_name in self.enabled_skills + self.internal_skills:
-                expected = "false" if skill_name == "agent-reach" else "true"
+            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
                 self.assertIn(
                     'path = "'
                     + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
-                    + f'"\nenabled = {expected}',
+                    + '"\nenabled = true',
                     config_text,
                 )
-            for skill_name in self.disabled_skills:
                 self.assertIn(
                     'path = "'
-                    + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
+                    + str(home / ".claude" / "skills" / skill_name / "SKILL.md")
                     + '"\nenabled = false',
                     config_text,
                 )
+            self.assertIn(f'path = "{codex_skill}"\nenabled = true', config_text)
+            yolo_skill_names = {
+                "agent-reach",
+                "brainstorming",
+                "domain-modeling",
+                "grilling",
+                "tdd",
+            }
+            for skill_root in (home / ".agents" / "skills", home / ".claude" / "skills"):
+                for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
+                    expected = (
+                        "true"
+                        if skill_root == home / ".agents" / "skills"
+                        and skill_name in yolo_skill_names
+                        else "false"
+                    )
+                    self.assertIn(
+                        f'path = "{skill_root / skill_name / "SKILL.md"}"\nenabled = {expected}',
+                        yolo_config_text,
+                    )
+            self.assertIn(f'path = "{codex_skill}"\nenabled = false', yolo_config_text)
+            managed_yolo_skills = yolo_config_text.split(
+                "# >>> scripts disabled Codex skills >>>", 1
+            )[1]
+            self.assertEqual(managed_yolo_skills.count("enabled = true"), 5)
             self.assertNotIn(secret_value, config_text)
             self.assertIn(secret_value, secrets.read_text(encoding="utf-8"))
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
             self.assertEqual(secrets.stat().st_mode & 0o777, 0o600)
             settings = home / ".claude" / "settings.json"
             settings_data = json.loads(settings.read_text(encoding="utf-8"))
-            for skill_name in self.enabled_skills:
-                expected = "off" if skill_name == "agent-reach" else "on"
-                self.assertEqual(settings_data["skillOverrides"][skill_name], expected)
-            for skill_name in self.internal_skills:
-                self.assertEqual(
-                    settings_data["skillOverrides"][skill_name],
-                    "name-only",
-                )
+            self.assertNotIn("skillOverrides", settings_data)
+            yolo_settings = json.loads(
+                (home / ".claude" / "settings.yolo.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(
+                {name for name, state in yolo_settings["skillOverrides"].items() if state == "on"},
+                yolo_skill_names,
+            )
             for skill_name in self.disabled_skills:
-                self.assertEqual(settings_data["skillOverrides"][skill_name], "off")
+                self.assertEqual(yolo_settings["skillOverrides"][skill_name], "off")
+            claudex_yolo_settings = json.loads(
+                (home / ".claude" / "settings.claudex-yolo.json").read_text(
+                    encoding="utf-8"
+                )
+            )
+            self.assertEqual(
+                claudex_yolo_settings["availableModels"], ["claudex-router[1m]"]
+            )
+            self.assertEqual(
+                claudex_yolo_settings["skillOverrides"]["claude-api"], "off"
+            )
+            for skill_name in self.disabled_skills:
+                self.assertEqual(
+                    claudex_yolo_settings["skillOverrides"][skill_name], "off"
+                )
             self.assertEqual(bashrc_text.count("alias codex-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claude-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claudex-yolo="), 1)
@@ -326,8 +401,14 @@ class CodexSetupTests(unittest.TestCase):
                 ),
                 1,
             )
-            self.assertIn("alias claude-yolo='claude --dangerously-skip-permissions --strict-mcp-config'", bashrc_text)
-            self.assertIn("alias claudex-yolo='CLAUDEX_YOLO=1 claudex'", bashrc_text)
+            self.assertIn(
+                "alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'",
+                bashrc_text,
+            )
+            self.assertIn(
+                "alias claudex-yolo='CLAUDEX_YOLO=1 claudex'",
+                bashrc_text,
+            )
             self.assertNotIn("claude-api", bashrc_text)
             self.assertNotIn("--safe-mode", bashrc_text)
             self.assertLess(
@@ -446,6 +527,162 @@ class CodexSetupTests(unittest.TestCase):
             self.assertNotIn(secret, completed.stdout + completed.stderr)
             secrets = home / ".config" / "codex" / "secrets.env"
             self.assertIn(secret, secrets.read_text(encoding="utf-8"))
+
+
+class CodexAuthSwitchTests(unittest.TestCase):
+    def setUp(self):
+        self.temporary_directory = tempfile.TemporaryDirectory()
+        self.home = Path(self.temporary_directory.name)
+        self.codex_home = self.home / ".codex"
+        self.codex_home.mkdir()
+        self.config = self.codex_home / "config.toml"
+        self.config.write_text(
+            'model_provider = "test_route"\n'
+            'preferred_auth_method = "apikey"\n'
+            'model = "gpt-test"\n\n'
+            '[model_providers.test_route]\n'
+            'base_url = "https://example.invalid/openai"\n'
+            'wire_api = "responses"\n'
+            'env_key = "TEST_ROUTE_KEY"\n',
+            encoding="utf-8",
+        )
+        self.yolo_config = self.codex_home / "yolo.config.toml"
+        self.yolo_config.write_text(
+            'model_provider = "test_route"\n\n'
+            '[[skills.config]]\n'
+            'path = "/tmp/example/SKILL.md"\n'
+            'enabled = true\n',
+            encoding="utf-8",
+        )
+        self.fake_bin = self.home / "bin"
+        self.fake_bin.mkdir()
+        self.codex_log = self.home / "codex.log"
+        fake_codex = self.fake_bin / "codex"
+        fake_codex.write_text(
+            "#!/bin/sh\n"
+            "printf '%s\\n' \"$*\" >> \"$FAKE_CODEX_LOG\"\n"
+            "if [ \"$1 $2\" = 'login status' ]; then\n"
+            "  [ \"${FAKE_CHATGPT_LOGIN:-0}\" = 1 ] && printf '%s\\n' 'Logged in using ChatGPT' && exit 0\n"
+            "  printf '%s\\n' 'Not logged in'\n"
+            "  exit 1\n"
+            "fi\n"
+            "exit 0\n",
+            encoding="utf-8",
+        )
+        fake_codex.chmod(0o755)
+        self.environment = os.environ.copy()
+        self.environment.update(
+            {
+                "HOME": str(self.home),
+                "CODEX_HOME": str(self.codex_home),
+                "PATH": f"{self.fake_bin}:{self.environment['PATH']}",
+                "FAKE_CODEX_LOG": str(self.codex_log),
+            }
+        )
+
+    def tearDown(self):
+        self.temporary_directory.cleanup()
+
+    def run_switch(self, *arguments, **environment):
+        child_environment = self.environment.copy()
+        child_environment.update(environment)
+        return subprocess.run(
+            ["bash", str(AUTH_SWITCH_SCRIPT), *arguments],
+            capture_output=True,
+            text=True,
+            env=child_environment,
+        )
+
+    def test_account_mode_saves_api_provider_and_starts_chatgpt_login(self):
+        completed = self.run_switch("account")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        config_text = self.config.read_text(encoding="utf-8")
+        self.assertIn('model_provider = "openai"', config_text)
+        self.assertIn('preferred_auth_method = "chatgpt"', config_text)
+        self.assertIn('forced_login_method = "chatgpt"', config_text)
+        self.assertIn('[model_providers.test_route]', config_text)
+        self.assertIn('model_provider = "openai"', self.yolo_config.read_text(encoding="utf-8"))
+        saved_provider = self.home / ".config" / "codex" / "api-provider"
+        self.assertEqual(saved_provider.read_text(encoding="utf-8"), "test_route\n")
+        self.assertEqual(saved_provider.stat().st_mode & 0o777, 0o600)
+        self.assertEqual(self.codex_log.read_text(encoding="utf-8").splitlines(), ["login status", "login"])
+
+    def test_account_mode_reuses_an_existing_chatgpt_login(self):
+        completed = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(self.codex_log.read_text(encoding="utf-8").splitlines(), ["login status"])
+
+    def test_api_mode_restores_the_saved_provider(self):
+        account_result = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")
+        self.assertEqual(account_result.returncode, 0, account_result.stderr)
+
+        completed = self.run_switch("api")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        config_text = self.config.read_text(encoding="utf-8")
+        self.assertIn('model_provider = "test_route"', config_text)
+        self.assertIn('preferred_auth_method = "apikey"', config_text)
+        self.assertNotIn("forced_login_method", config_text)
+        self.assertIn('model_provider = "test_route"', self.yolo_config.read_text(encoding="utf-8"))
+
+    def test_status_reports_the_active_mode_without_showing_secrets(self):
+        completed = self.run_switch("status")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn("mode: api", completed.stdout)
+        self.assertIn("provider: test_route", completed.stdout)
+        self.assertNotIn("TEST_ROUTE_KEY", completed.stdout)
+
+    def test_setup_installs_the_auth_switch_command(self):
+        environment = self.environment.copy()
+        environment.update(
+            {
+                "CLAUDEX_NONINTERACTIVE": "1",
+                "CLAUDEX_AGENT_REACH": "0",
+                "CLAUDEX_SKIP_SKILL_INSTALL": "1",
+            }
+        )
+
+        completed = subprocess.run(
+            ["bash", str(SETUP_SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        installed = self.home / ".local" / "bin" / "codex-auth"
+        self.assertTrue(installed.is_file())
+        self.assertTrue(os.access(installed, os.X_OK))
+        self.assertEqual(
+            installed.read_text(encoding="utf-8"),
+            AUTH_SWITCH_SCRIPT.read_text(encoding="utf-8"),
+        )
+
+    def test_setup_preserves_account_mode(self):
+        account_result = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")
+        self.assertEqual(account_result.returncode, 0, account_result.stderr)
+        environment = self.environment.copy()
+        environment.update(
+            {
+                "CLAUDEX_NONINTERACTIVE": "1",
+                "CLAUDEX_AGENT_REACH": "0",
+                "CLAUDEX_SKIP_SKILL_INSTALL": "1",
+            }
+        )
+
+        completed = subprocess.run(
+            ["bash", str(SETUP_SCRIPT)],
+            capture_output=True,
+            text=True,
+            env=environment,
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn('model_provider = "openai"', self.config.read_text(encoding="utf-8"))
+        self.assertIn("Codex account mode is active", completed.stdout)
 
 
 if __name__ == "__main__":

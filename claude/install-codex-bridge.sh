@@ -303,9 +303,13 @@ set -euo pipefail
 
 extra_args=()
 session_settings='{"availableModels":["claudex-router[1m]"]}'
+settings_args=(--settings "${session_settings}")
 if [[ $(basename "$0") == "claudex-yolo" || ${CLAUDEX_YOLO:-0} == 1 ]]; then
   extra_args+=(--dangerously-skip-permissions)
-  session_settings='{"availableModels":["claudex-router[1m]"],"skillOverrides":{"claude-api":"off"}}'
+  yolo_settings="${HOME}/.claude/settings.claudex-yolo.json"
+  [[ -r ${yolo_settings} ]] \
+    || { printf 'Missing claudex-yolo settings: %s\n' "${yolo_settings}" >&2; exit 1; }
+  settings_args=(--settings "${yolo_settings}")
 fi
 extension_args=(--strict-mcp-config)
 if [[ ${CLAUDEX_EXTENSIONS:-0} == 1 ]]; then
@@ -334,7 +338,7 @@ exec env \
   CLAUDE_CODE_ALWAYS_ENABLE_EFFORT=1 \
   CLAUDE_CODE_ENABLE_GATEWAY_MODEL_DISCOVERY=0 \
   claude --model 'claudex-router[1m]' "${compact_args[@]}" --effort medium \
-    --settings "${session_settings}" \
+    "${settings_args[@]}" \
     --prompt-suggestions false "${extension_args[@]}" "${extra_args[@]}" "$@"
 EOF
 install -m 0755 "${tmp_dir}/claudex" "${BIN_DIR}/claudex"
