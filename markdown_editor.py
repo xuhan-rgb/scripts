@@ -1744,14 +1744,9 @@ def build_chatgpt_edit_prompt(
     syntax_kind = "LaTeX" if is_latex else "Markdown"
     output_suffix = suffix if suffix in AUTO_OPEN_DOCUMENT_SUFFIXES else ".md"
     source_label = source_path.name if source_path else "当前尚未保存的文档"
-    local_reference = (
-        f"\n\n本地参考路径（仅供核对文件名）：{source_path}"
-        if source_path
-        else ""
-    )
     return f"""请修改你在本次对话中刚才提供的{document_kind} 源文件：
 
-{source_label}{local_reference}
+{source_label}
 
 请以该会话附件为唯一源文件，不要重新构建文档，也不要使用其他历史版本。
 

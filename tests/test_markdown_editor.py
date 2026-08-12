@@ -1761,7 +1761,9 @@ title: 自动驾驶世界模型
 
             dialog.assert_not_called()
             copied = QApplication.clipboard().text()
-            self.assertIn(str(source_path), copied)
+            self.assertIn("report.tex", copied)
+            self.assertNotIn(str(source_path), copied)
+            self.assertNotIn("本地参考路径", copied)
             self.assertIn("原来的定义。", copied)
             self.assertIn("第 3 页", copied)
             self.assertTrue(copied.rstrip().endswith("修改要求（由我补充）："))
