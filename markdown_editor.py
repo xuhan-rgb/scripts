@@ -2976,7 +2976,7 @@ class MarkdownWindow(QMainWindow):
         self.latest_tex_pdf_path: Path | None = None
         self.border_color = DEFAULT_BORDER_COLOR
         self.background_color = DEFAULT_BACKGROUND_COLOR
-        self.setProperty("tocVisible", True)
+        self.setProperty("tocVisible", False)
         self.line_height = normalized_line_height(
             self.settings.value("lineHeight", DEFAULT_LINE_HEIGHT)
         )
@@ -3029,7 +3029,7 @@ class MarkdownWindow(QMainWindow):
         self.chatgpt_view = None
         self.chatgpt_dock = QDockWidget("ChatGPT", self)
         self.chatgpt_dock.setObjectName("chatgptDock")
-        self.chatgpt_dock.setProperty("tocVisible", True)
+        self.chatgpt_dock.setProperty("tocVisible", False)
         self.chatgpt_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.chatgpt_dock.setMinimumWidth(380)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.chatgpt_dock)
@@ -3051,12 +3051,13 @@ class MarkdownWindow(QMainWindow):
         self.open_action.setToolTip("打开 Markdown 或完整 LaTeX 文档")
         self.open_action.triggered.connect(self.open_file_dialog)
         toolbar.addAction(self.open_action)
-        self.toc_action = QAction("隐藏目录", self)
+        self.toc_action = QAction("显示目录", self)
         self.toc_action.setCheckable(True)
-        self.toc_action.setChecked(True)
+        self.toc_action.setChecked(False)
         self.toc_action.triggered.connect(self.set_toc_visible)
         toolbar.addAction(self.toc_action)
         self.toc_dock.visibilityChanged.connect(self.sync_toc_action)
+        self.toc_dock.hide()
         self.chatgpt_action = QAction("ChatGPT", self)
         self.chatgpt_action.setCheckable(True)
         self.chatgpt_action.setToolTip("在目录左侧嵌入或隐藏远程 Chrome ChatGPT")

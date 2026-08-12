@@ -1330,16 +1330,20 @@ title: 自动驾驶世界模型
             )
             build.assert_called_once_with(output_path, include_toc=True)
 
-    def test_window_shows_a_live_left_toc_and_navigates_on_click(self):
+    def test_window_hides_the_live_left_toc_by_default_and_navigates_when_shown(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
             window = MarkdownWindow(settings=settings)
             window.editor.setPlainText("# 第一章\n\n## 1.1 方法\n\n### 1.1.1 数据")
             window.refresh_preview()
 
+            self.assertTrue(window.toc_dock.isHidden())
+            self.assertFalse(window.toc_action.isChecked())
+            self.assertEqual(window.toc_action.text(), "显示目录")
+            self.assertEqual(window.toc_tree.topLevelItemCount(), 1)
+            window.toc_action.trigger()
             self.assertFalse(window.toc_dock.isHidden())
             self.assertEqual(window.toc_action.text(), "隐藏目录")
-            self.assertEqual(window.toc_tree.topLevelItemCount(), 1)
             chapter = window.toc_tree.topLevelItem(0)
             self.assertEqual(chapter.text(0), "第一章")
             self.assertEqual(chapter.child(0).text(0), "1.1 方法")
@@ -1413,6 +1417,11 @@ title: 自动驾驶世界模型
             )
             self.assertIn("background-color: #7c3aed", stylesheet)
             self.assertIn("width: 4px", stylesheet)
+            self.assertFalse(window.chatgpt_dock.property("tocVisible"))
+            self.assertFalse(window.property("tocVisible"))
+
+            window.set_toc_visible(True)
+
             self.assertTrue(window.chatgpt_dock.property("tocVisible"))
             self.assertTrue(window.property("tocVisible"))
 
