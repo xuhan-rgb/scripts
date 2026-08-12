@@ -12,6 +12,7 @@ import logging
 import math
 import os
 import re
+import shlex
 import shutil
 import signal
 import subprocess
@@ -20,13 +21,13 @@ import tempfile
 import warnings
 import weakref
 import xml.etree.ElementTree as ElementTree
+from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
 from pathlib import Path
 
 import markdown
 from PyQt5.QtCore import (
-    QCoreApplication,
     QPointF,
     QRectF,
     QSettings,
@@ -70,19 +71,8 @@ from PyQt5.QtWidgets import (
     QTreeWidgetItem,
     QVBoxLayout,
     QHBoxLayout,
+    QWidget,
 )
-
-QCoreApplication.setAttribute(Qt.AA_ShareOpenGLContexts)
-try:
-    from PyQt5.QtWebEngineWidgets import (
-        QWebEnginePage,
-        QWebEngineProfile,
-        QWebEngineView,
-    )
-except ImportError:
-    QWebEnginePage = None
-    QWebEngineProfile = None
-    QWebEngineView = None
 
 
 APP_NAME = "Markdown Renderer"
@@ -1735,126 +1725,376 @@ def save_preview_image(
     return output_path
 
 
-def chatgpt_profile_directory() -> Path:
-    """Return mdview's persistent, user-scoped Chromium profile directory."""
-    data_home = Path(
-        os.environ.get("XDG_DATA_HOME", str(Path.home() / ".local" / "share"))
-    )
-    return data_home / "mdview" / "chatgpt-profile"
+@dataclass(frozen=True)
+class RemoteChromeSession:
+    executable: str
+    user_data_dir: str | None
+    profile_directory: str | None
+    debug_port: int
+    pid: int
 
 
-def _configure_chatgpt_page(page, parent=None) -> None:
-    """Enable normal website interactions and relay protected permissions."""
-    settings_getter = getattr(page, "settings", None)
-    if settings_getter is not None:
-        settings = settings_getter()
-        for attribute_name in (
-            "JavascriptEnabled",
-            "JavascriptCanOpenWindows",
-            "JavascriptCanAccessClipboard",
-            "FullScreenSupportEnabled",
-            "LocalStorageEnabled",
-            "WebGLEnabled",
-        ):
-            attribute = getattr(settings, attribute_name, None)
-            if attribute is not None:
-                settings.setAttribute(attribute, True)
+@dataclass(frozen=True)
+class X11WindowInfo:
+    window_id: int
+    wm_class: str
+    pid: int | None
+    width: int
+    height: int
+    is_viewable: bool
 
-    permission_signal = getattr(page, "featurePermissionRequested", None)
-    if permission_signal is None:
-        return
 
-    def request_permission(origin, feature) -> None:
-        origin_name = origin.host() or origin.toString()
-        answer = QMessageBox.question(
-            parent,
-            "ChatGPT 网页权限",
-            f"{origin_name} 请求使用麦克风、摄像头或其他受保护设备。是否允许？",
-            QMessageBox.Yes | QMessageBox.No,
-            QMessageBox.No,
+def find_remote_chrome(
+    debug_port: int = 9223,
+    proc_root: Path = Path("/proc"),
+) -> RemoteChromeSession | None:
+    """Find the top-level Chrome process serving the requested debug port."""
+    port_argument = f"--remote-debugging-port={debug_port}"
+    for commandline_path in sorted(proc_root.glob("[0-9]*/cmdline")):
+        try:
+            commandline_values = [
+                value.decode("utf-8", errors="replace")
+                for value in commandline_path.read_bytes().split(b"\0")
+                if value
+            ]
+        except (OSError, PermissionError):
+            continue
+        if len(commandline_values) == 1 and " --" in commandline_values[0]:
+            arguments = shlex.split(commandline_values[0])
+        else:
+            arguments = commandline_values
+        if not arguments or port_argument not in arguments:
+            continue
+        if any(argument.startswith("--type=") for argument in arguments):
+            continue
+        executable_name = Path(arguments[0]).name.casefold()
+        if "chrome" not in executable_name and "chromium" not in executable_name:
+            continue
+        user_data_dir = next(
+            (
+                argument.partition("=")[2]
+                for argument in arguments
+                if argument.startswith("--user-data-dir=")
+            ),
+            None,
         )
-        policy = (
-            page.PermissionGrantedByUser
-            if answer == QMessageBox.Yes
-            else page.PermissionDeniedByUser
+        profile_directory = next(
+            (
+                argument.partition("=")[2]
+                for argument in arguments
+                if argument.startswith("--profile-directory=")
+            ),
+            None,
         )
-        page.setFeaturePermission(origin, feature, policy)
+        return RemoteChromeSession(
+            executable=arguments[0],
+            user_data_dir=user_data_dir,
+            profile_directory=profile_directory,
+            debug_port=debug_port,
+            pid=int(commandline_path.parent.name),
+        )
+    return None
 
-    permission_signal.connect(request_permission)
-    page._mdview_permission_handler = request_permission
 
-
-def _handle_chatgpt_download(download, parent=None) -> None:
-    """Ask where to save a website download, then let Chromium handle it."""
-    current_path = download.path() if hasattr(download, "path") else ""
-    filename = Path(current_path).name or "chatgpt-download"
-    downloads_directory = Path.home() / "Downloads"
-    if not downloads_directory.is_dir():
-        downloads_directory = Path.home()
-    output_path, _ = QFileDialog.getSaveFileName(
-        parent,
-        "保存 ChatGPT 下载文件",
-        str(downloads_directory / filename),
+def remote_chrome_app_command(session: RemoteChromeSession) -> list[str]:
+    """Build the command that asks the existing Chrome process for an app window."""
+    command = [session.executable]
+    if session.user_data_dir:
+        command.append(f"--user-data-dir={session.user_data_dir}")
+    if session.profile_directory:
+        command.append(f"--profile-directory={session.profile_directory}")
+    command.extend(
+        [
+            f"--remote-debugging-port={session.debug_port}",
+            "--new-window",
+            f"--app={CHATGPT_URL.toString()}",
+        ]
     )
-    if not output_path:
-        if hasattr(download, "cancel"):
-            download.cancel()
-        return
-    download.setPath(output_path)
-    download.accept()
+    return command
 
 
-def create_chatgpt_browser(parent=None):
-    """Create a persistent, full website ChatGPT browser when WebEngine exists."""
-    if QWebEngineView is None or QWebEngineProfile is None or QWebEnginePage is None:
+def parse_x11_client_ids(output: str) -> set[int]:
+    """Parse _NET_CLIENT_LIST output into X11 window IDs."""
+    return {int(value, 16) for value in re.findall(r"0x[0-9a-fA-F]+", output)}
+
+
+def x11_client_window_ids() -> set[int]:
+    completed = subprocess.run(
+        ["xprop", "-root", "_NET_CLIENT_LIST"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    if completed.returncode != 0:
+        raise OSError(completed.stderr.strip() or "无法读取 X11 窗口列表。")
+    return parse_x11_client_ids(completed.stdout)
+
+
+def read_x11_window_info(window_id: int) -> X11WindowInfo | None:
+    properties = subprocess.run(
+        [
+            "xprop",
+            "-id",
+            hex(window_id),
+            "WM_CLASS",
+            "_NET_WM_PID",
+            "_NET_WM_WINDOW_TYPE",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    geometry = subprocess.run(
+        ["xwininfo", "-id", hex(window_id)],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    if properties.returncode != 0 or geometry.returncode != 0:
         return None
+    class_match = re.search(r"^WM_CLASS.*?=\s*(.+)$", properties.stdout, re.M)
+    pid_match = re.search(r"^_NET_WM_PID.*?=\s*(\d+)$", properties.stdout, re.M)
+    width_match = re.search(r"^\s*Width:\s*(\d+)$", geometry.stdout, re.M)
+    height_match = re.search(r"^\s*Height:\s*(\d+)$", geometry.stdout, re.M)
+    if width_match is None or height_match is None:
+        return None
+    return X11WindowInfo(
+        window_id=window_id,
+        wm_class=class_match.group(1) if class_match else "",
+        pid=int(pid_match.group(1)) if pid_match else None,
+        width=int(width_match.group(1)),
+        height=int(height_match.group(1)),
+        is_viewable="Map State: IsViewable" in geometry.stdout,
+    )
 
-    view_class = QWebEngineView
-    page_class = QWebEnginePage
 
-    class EmbeddedChatGPTView(view_class):
-        def __init__(self, profile, widget_parent=None):
-            super().__init__(widget_parent)
-            self._mdview_profile = profile
-            self._mdview_popup_windows = []
-            page = page_class(profile, self)
-            self.setPage(page)
-            _configure_chatgpt_page(page, self)
+def x11_window_matches_session(
+    window: X11WindowInfo,
+    session: RemoteChromeSession,
+) -> bool:
+    window_class = window.wm_class.casefold()
+    return (
+        ("chrome" in window_class or "chromium" in window_class)
+        and window.pid == session.pid
+        and window.is_viewable
+        and window.width >= 320
+        and window.height >= 320
+    )
 
-        def createWindow(self, window_type):
-            del window_type
-            popup = EmbeddedChatGPTView(self._mdview_profile)
-            popup.setAttribute(Qt.WA_DeleteOnClose)
-            popup.setWindowTitle("ChatGPT")
-            popup.resize(1000, 760)
-            self._mdview_popup_windows.append(popup)
 
-            def forget_popup(*_args) -> None:
-                if popup in self._mdview_popup_windows:
-                    self._mdview_popup_windows.remove(popup)
+def x11_parent_window_id(window_id: int) -> int | None:
+    completed = subprocess.run(
+        ["xwininfo", "-id", hex(window_id), "-tree"],
+        check=False,
+        capture_output=True,
+        text=True,
+        timeout=3,
+    )
+    if completed.returncode != 0:
+        return None
+    match = re.search(r"Parent window id:\s*(0x[0-9a-fA-F]+)", completed.stdout)
+    return int(match.group(1), 16) if match else None
 
-            popup.destroyed.connect(forget_popup)
-            popup.show()
-            return popup
 
-    profile_root = chatgpt_profile_directory()
-    cache_directory = profile_root / "cache"
-    storage_directory = profile_root / "storage"
-    cache_directory.mkdir(parents=True, exist_ok=True)
-    storage_directory.mkdir(parents=True, exist_ok=True)
-    profile = QWebEngineProfile("mdview-chatgpt", parent)
-    profile.setCachePath(str(cache_directory))
-    profile.setPersistentStoragePath(str(storage_directory))
-    profile.setHttpCacheType(QWebEngineProfile.DiskHttpCache)
-    profile.setPersistentCookiesPolicy(QWebEngineProfile.ForcePersistentCookies)
-    browser = EmbeddedChatGPTView(profile, parent)
-    download_handler = lambda download: _handle_chatgpt_download(download, browser)
-    download_signal = getattr(profile, "downloadRequested", None)
-    if download_signal is not None:
-        download_signal.connect(download_handler)
-        profile._mdview_download_handler = download_handler
-    browser.setUrl(CHATGPT_URL)
-    return browser
+class X11WindowController:
+    """Reparent and size one external X11 window via xdotool."""
+
+    def _run(self, arguments: list[str]) -> None:
+        completed = subprocess.run(
+            ["xdotool", *arguments],
+            check=False,
+            capture_output=True,
+            text=True,
+            timeout=5,
+        )
+        if completed.returncode != 0:
+            raise OSError(completed.stderr.strip() or "X11 窗口操作失败。")
+
+    def reparent(
+        self,
+        child_id: int,
+        parent_id: int,
+        width: int,
+        height: int,
+    ) -> None:
+        child = str(child_id)
+        self._run(
+            [
+                "windowunmap",
+                child,
+                "windowreparent",
+                child,
+                str(parent_id),
+                "windowmove",
+                child,
+                "0",
+                "0",
+                "windowsize",
+                child,
+                str(max(width, 1)),
+                str(max(height, 1)),
+                "windowmap",
+                child,
+            ]
+        )
+        actual_parent = x11_parent_window_id(child_id)
+        if actual_parent != parent_id:
+            actual = hex(actual_parent) if actual_parent is not None else "unknown"
+            raise OSError(
+                f"Chrome 窗口父节点校验失败：期望 {hex(parent_id)}，实际 {actual}。"
+            )
+
+    def resize(self, window_id: int, width: int, height: int) -> None:
+        window = str(window_id)
+        self._run(
+            [
+                "windowmove",
+                window,
+                "0",
+                "0",
+                "windowsize",
+                window,
+                str(max(width, 1)),
+                str(max(height, 1)),
+            ]
+        )
+
+    def destroy(self, window_id: int) -> None:
+        try:
+            self._run(["windowclose", str(window_id)])
+        except OSError:
+            pass
+
+    def close(self) -> None:
+        return
+
+
+class EmbeddedChromeWidget(QWidget):
+    """Host a real Chrome app window inside Qt through an X11 foreign window."""
+
+    attach_failed = pyqtSignal(str)
+
+    def __init__(
+        self,
+        session: RemoteChromeSession,
+        parent=None,
+        *,
+        x11_connection=None,
+    ) -> None:
+        super().__init__(parent)
+        self.setAttribute(Qt.WA_NativeWindow, True)
+        self.session = session
+        self.x11_connection = x11_connection or X11WindowController()
+        self.window_id: int | None = None
+        self.poll_attempts = 0
+        self.known_window_ids = x11_client_window_ids()
+
+        self.layout = QVBoxLayout(self)
+        self.layout.setContentsMargins(0, 0, 0, 0)
+        self.status_label = QLabel("正在连接远程 Chrome…", self)
+        self.status_label.setAlignment(Qt.AlignCenter)
+        self.status_label.setWordWrap(True)
+        self.layout.addWidget(self.status_label)
+
+        try:
+            self.chrome_process = subprocess.Popen(
+                remote_chrome_app_command(session),
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                start_new_session=True,
+            )
+        except OSError as error:
+            raise OSError(f"无法启动 Chrome：{error}") from error
+
+        self.poll_timer = QTimer(self)
+        self.poll_timer.setInterval(100)
+        self.poll_timer.timeout.connect(self.attach_new_chrome_window)
+        self.poll_timer.start()
+
+    def attach_new_chrome_window(self) -> None:
+        self.poll_attempts += 1
+        try:
+            current_window_ids = x11_client_window_ids()
+        except OSError as error:
+            self.fail_attachment(str(error))
+            return
+        new_window_ids = current_window_ids - self.known_window_ids
+        for window_id in sorted(new_window_ids):
+            window = read_x11_window_info(window_id)
+            if window is not None and x11_window_matches_session(window, self.session):
+                self.attach_window(window_id)
+                return
+        if self.poll_attempts >= 100:
+            self.fail_attachment(
+                "Chrome 已启动，但 10 秒内没有找到新的 ChatGPT 窗口。"
+            )
+
+    def attach_window(self, window_id: int) -> None:
+        try:
+            self.x11_connection.reparent(
+                window_id,
+                int(self.winId()),
+                self.width(),
+                self.height(),
+            )
+        except OSError as error:
+            self.fail_attachment(f"无法嵌入 Chrome 窗口：{error}")
+            return
+        self.poll_timer.stop()
+        self.window_id = window_id
+        self.status_label.deleteLater()
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        if self.window_id is None:
+            return
+        try:
+            self.x11_connection.resize(
+                self.window_id,
+                event.size().width(),
+                event.size().height(),
+            )
+        except OSError as error:
+            self.fail_attachment(f"无法调整 Chrome 窗口大小：{error}")
+
+    def fail_attachment(self, message: str) -> None:
+        self.poll_timer.stop()
+        self.status_label.setText(message)
+        self.attach_failed.emit(message)
+
+    def shutdown(self) -> None:
+        self.poll_timer.stop()
+        if self.window_id is not None:
+            self.x11_connection.destroy(self.window_id)
+            self.window_id = None
+        self.x11_connection.close()
+
+
+def create_chatgpt_browser(parent=None) -> EmbeddedChromeWidget:
+    """Embed the real remotely-debuggable Chrome window in the current X11 app."""
+    if os.environ.get("XDG_SESSION_TYPE", "").casefold() == "wayland":
+        raise OSError("Chrome 窗口嵌入只支持 X11，当前桌面正在使用 Wayland。")
+    if not os.environ.get("DISPLAY"):
+        raise OSError("没有检测到 X11 DISPLAY，无法嵌入 Chrome 窗口。")
+    missing_tools = [tool for tool in ("xprop", "xwininfo", "xdotool") if shutil.which(tool) is None]
+    if missing_tools:
+        raise OSError(
+            f"缺少 X11 工具：{', '.join(missing_tools)}。请运行 mdview 安装脚本。"
+        )
+    try:
+        debug_port = int(os.environ.get("MDVIEW_CHROME_DEBUG_PORT", "9223"))
+    except ValueError as error:
+        raise OSError("MDVIEW_CHROME_DEBUG_PORT 必须是整数端口。") from error
+    session = find_remote_chrome(debug_port)
+    if session is None:
+        raise OSError(
+            f"没有找到使用 --remote-debugging-port={debug_port} 的 Chrome。\n\n"
+            "请先启动远程调试 Chrome，再打开 ChatGPT 面板。"
+        )
+    return EmbeddedChromeWidget(session, parent)
 
 
 class MarkdownPreview(QTextBrowser):
@@ -2347,7 +2587,7 @@ class MarkdownWindow(QMainWindow):
         self.toc_dock.visibilityChanged.connect(self.sync_toc_action)
         self.chatgpt_action = QAction("ChatGPT", self)
         self.chatgpt_action.setCheckable(True)
-        self.chatgpt_action.setToolTip("在目录左侧显示或隐藏 ChatGPT 网页")
+        self.chatgpt_action.setToolTip("在目录左侧嵌入或隐藏远程 Chrome ChatGPT")
         self.chatgpt_action.triggered.connect(self.set_chatgpt_visible)
         toolbar.addAction(self.chatgpt_action)
         self.chatgpt_dock.visibilityChanged.connect(self.sync_chatgpt_action)
@@ -2437,18 +2677,6 @@ class MarkdownWindow(QMainWindow):
                 self.chatgpt_action.blockSignals(False)
                 QMessageBox.warning(self, "无法打开 ChatGPT", str(error))
                 return
-            if self.chatgpt_view is None:
-                self.chatgpt_action.blockSignals(True)
-                self.chatgpt_action.setChecked(False)
-                self.chatgpt_action.blockSignals(False)
-                QMessageBox.warning(
-                    self,
-                    "缺少内嵌浏览器",
-                    "ChatGPT 模式需要 Qt WebEngine。\n\n"
-                    "请运行：\n"
-                    "bash ~/scripts/desktop/install-markdown-renderer.sh",
-                )
-                return
             self.chatgpt_dock.setWidget(self.chatgpt_view)
         self.chatgpt_dock.setVisible(visible)
         self.sync_chatgpt_action(visible)
@@ -2462,6 +2690,13 @@ class MarkdownWindow(QMainWindow):
     def sync_chatgpt_action(self, visible: bool) -> None:
         self.chatgpt_action.setChecked(visible)
         self.chatgpt_action.setText("隐藏 ChatGPT" if visible else "ChatGPT")
+
+    def closeEvent(self, event) -> None:
+        if self.chatgpt_view is not None:
+            shutdown = getattr(self.chatgpt_view, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+        super().closeEvent(event)
 
     def navigate_to_toc_item(self, item: QTreeWidgetItem, _column: int) -> None:
         anchor = item.data(0, Qt.UserRole)

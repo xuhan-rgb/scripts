@@ -2,7 +2,7 @@
 # Install the complete Markdown/LaTeX mdview desktop workflow on Ubuntu/Debian.
 #
 # This single installer covers:
-#   1. PyQt/Qt WebEngine/Markdown/Matplotlib preview dependencies.
+#   1. PyQt/Markdown/Matplotlib preview dependencies and X11 Chrome embedding.
 #   2. Pandoc -> XeLaTeX PDF dependencies, Chinese fonts, and TikZ.
 #   3. Mermaid's pinned Node package and a local Chrome/Chromium check.
 #   4. The ~/.local/bin/mdview command, desktop entry, and Markdown MIME defaults.
@@ -66,12 +66,13 @@ packages=(
     python3-markdown
     python3-matplotlib
     python3-pyqt5
-    python3-pyqt5.qtwebengine
     texlive-lang-chinese
     texlive-latex-extra
     texlive-pictures
     texlive-xetex
+    x11-utils
     xdg-utils
+    xdotool
 )
 
 if ! command -v node >/dev/null || ! command -v npm >/dev/null; then
@@ -102,16 +103,15 @@ else
     sudo apt-get install -y "${missing_packages[@]}"
 fi
 
-printf '%s\n' '[2/5] Verifying preview and PDF engines...'
+printf '%s\n' '[2/5] Verifying preview, PDF, and X11 engines...'
 python3 - <<'PY' \
     || die "Python preview dependencies could not be imported."
 import markdown
 import matplotlib
 import PyQt5
-from PyQt5 import QtWebEngineWidgets
 PY
 
-for command in pandoc xelatex kpsewhich dot pdftocairo pdftotext pdfinfo; do
+for command in pandoc xelatex kpsewhich dot pdftocairo pdftotext pdfinfo xdotool xprop xwininfo; do
     command -v "$command" >/dev/null \
         || die "$command was not installed successfully."
 done
@@ -180,7 +180,7 @@ printf '  Command:       %s [document.md|document.tex]\n' "$command_path"
 printf '  PDF pipeline:  Pandoc -> XeLaTeX (ctexart)\n'
 printf '  PDF preview:   Real pages + coordinate-accurate Poppler selection\n'
 printf '  Image copies:  Clipboard + /tmp/mdview-selection-*.png\n'
-printf '  ChatGPT:       Embedded Qt WebEngine panel with persistent login\n'
+printf '  ChatGPT:       Real Chrome window embedded through X11 reparenting\n'
 printf '  TikZ preview:  XeLaTeX -> pdftocairo (PDF export stays vector)\n'
 printf '  Mermaid:       %s + %s\n' "$(command -v npm)" "$browser"
 printf '  Desktop entry: %s\n' "$desktop_path"

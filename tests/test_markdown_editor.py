@@ -22,6 +22,9 @@ from markdown_editor import (
     MarkdownPreview,
     MarkdownWindow,
     PdfExportDialog,
+    RemoteChromeSession,
+    X11WindowInfo,
+    X11WindowController,
     ascii_flow_to_mermaid,
     compile_latex_document,
     configure_latex_toc,
@@ -33,8 +36,12 @@ from markdown_editor import (
     normalize_math_markup,
     open_local_file,
     pandoc_pdf_command,
+    find_remote_chrome,
+    parse_x11_client_ids,
     pdf_destination_targets,
     prepare_markdown_for_pdf,
+    remote_chrome_app_command,
+    x11_window_matches_session,
     render_mermaid_data_url,
     render_math_data_url,
     render_markdown,
@@ -783,13 +790,13 @@ title: 自动驾驶世界模型
             create_browser.assert_called_once_with(window.chatgpt_dock)
             self.assertIs(window.chatgpt_dock.widget(), browser)
 
-    def test_chatgpt_panel_reports_missing_webengine(self):
+    def test_chatgpt_panel_reports_missing_remote_chrome(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
             window = MarkdownWindow(settings=settings)
             with mock.patch(
                 "markdown_editor.create_chatgpt_browser",
-                return_value=None,
+                side_effect=OSError("没有远程 Chrome"),
             ):
                 with mock.patch.object(QMessageBox, "warning") as warning:
                     window.chatgpt_action.trigger()
@@ -798,201 +805,182 @@ title: 自动驾驶世界模型
             self.assertFalse(window.chatgpt_action.isChecked())
             warning.assert_called_once()
 
-    def test_chatgpt_browser_uses_persistent_user_profile(self):
-        class FakeProfile:
-            DiskHttpCache = 1
-            ForcePersistentCookies = 2
-
-            def __init__(self, name, parent):
-                self.name = name
-                self.parent = parent
-
-            def setCachePath(self, path):
-                self.cache_path = path
-
-            def setPersistentStoragePath(self, path):
-                self.storage_path = path
-
-            def setHttpCacheType(self, value):
-                self.cache_type = value
-
-            def setPersistentCookiesPolicy(self, value):
-                self.cookies_policy = value
-
-        class FakePage:
-            def __init__(self, profile, parent):
-                self.profile = profile
-                self.parent = parent
-
-        class FakeBrowser(QLabel):
-            def setPage(self, page):
-                self.page = page
-
-            def setUrl(self, url):
-                self.url = url
-
+    def test_remote_chrome_discovery_reuses_the_browser_profile(self):
         with tempfile.TemporaryDirectory() as directory:
-            data_home = Path(directory) / "data"
-            with mock.patch.dict(os.environ, {"XDG_DATA_HOME": str(data_home)}):
-                with mock.patch("markdown_editor.QWebEngineProfile", FakeProfile):
-                    with mock.patch("markdown_editor.QWebEnginePage", FakePage):
-                        with mock.patch("markdown_editor.QWebEngineView", FakeBrowser):
-                            browser = create_chatgpt_browser()
+            proc_root = Path(directory)
+            browser_proc = proc_root / "100"
+            renderer_proc = proc_root / "101"
+            browser_proc.mkdir()
+            renderer_proc.mkdir()
+            browser_proc.joinpath("cmdline").write_bytes(
+                b"/opt/google/chrome/chrome "
+                b"--user-data-dir=/home/qwer/.config/google-chrome-shared "
+                b"--profile-directory=Default "
+                b"--remote-debugging-address=127.0.0.1 "
+                b"--remote-debugging-port=9223\0"
+            )
+            renderer_proc.joinpath("cmdline").write_bytes(
+                b"/opt/google/chrome/chrome\0"
+                b"--type=renderer\0"
+                b"--remote-debugging-port=9223\0"
+            )
 
-        profile = browser._mdview_profile
-        self.assertEqual(profile.name, "mdview-chatgpt")
-        self.assertEqual(Path(profile.cache_path), data_home / "mdview/chatgpt-profile/cache")
+            session = find_remote_chrome(9223, proc_root)
+
+        self.assertIsNotNone(session)
+        self.assertEqual(session.executable, "/opt/google/chrome/chrome")
         self.assertEqual(
-            Path(profile.storage_path),
-            data_home / "mdview/chatgpt-profile/storage",
+            session.user_data_dir,
+            "/home/qwer/.config/google-chrome-shared",
         )
-        self.assertEqual(profile.cache_type, FakeProfile.DiskHttpCache)
-        self.assertEqual(profile.cookies_policy, FakeProfile.ForcePersistentCookies)
-        self.assertEqual(browser.url.toString(), "https://chatgpt.com/")
+        self.assertEqual(session.profile_directory, "Default")
+        self.assertEqual(session.debug_port, 9223)
+        self.assertEqual(session.pid, 100)
+        self.assertEqual(
+            remote_chrome_app_command(session),
+            [
+                "/opt/google/chrome/chrome",
+                "--user-data-dir=/home/qwer/.config/google-chrome-shared",
+                "--profile-directory=Default",
+                "--remote-debugging-port=9223",
+                "--new-window",
+                "--app=https://chatgpt.com/",
+            ],
+        )
 
-    def test_chatgpt_browser_preserves_full_website_interactions(self):
-        class FakeSignal:
-            def __init__(self):
-                self.callbacks = []
-
-            def connect(self, callback):
-                self.callbacks.append(callback)
-
-            def emit(self, *args):
-                for callback in self.callbacks:
-                    callback(*args)
-
-        class FakeSettings:
-            JavascriptEnabled = 1
-            JavascriptCanOpenWindows = 2
-            JavascriptCanAccessClipboard = 3
-            FullScreenSupportEnabled = 4
-
-            def __init__(self):
-                self.attributes = {}
-
-            def setAttribute(self, attribute, enabled):
-                self.attributes[attribute] = enabled
-
-        class FakeProfile:
-            DiskHttpCache = 1
-            ForcePersistentCookies = 2
-
-            def __init__(self, name, parent):
-                self.name = name
-                self.parent = parent
-                self.downloadRequested = FakeSignal()
-
-            def setCachePath(self, path):
-                self.cache_path = path
-
-            def setPersistentStoragePath(self, path):
-                self.storage_path = path
-
-            def setHttpCacheType(self, value):
-                self.cache_type = value
-
-            def setPersistentCookiesPolicy(self, value):
-                self.cookies_policy = value
-
-        class FakePage:
-            MediaAudioCapture = 10
-            PermissionGrantedByUser = 11
-            PermissionDeniedByUser = 12
-
-            def __init__(self, profile, parent):
-                self.profile = profile
-                self.parent = parent
-                self.featurePermissionRequested = FakeSignal()
-                self._settings = FakeSettings()
-                self.permissions = []
-
-            def settings(self):
-                return self._settings
-
-            def setFeaturePermission(self, origin, feature, policy):
-                self.permissions.append((origin, feature, policy))
-
-        class FakeBrowser(QLabel):
-            def setPage(self, page):
-                self.page = page
-
-            def setUrl(self, url):
-                self.url = url
-
-        class FakeDownload:
-            def __init__(self):
-                self.saved_path = None
-                self.accepted = False
-
-            def path(self):
-                return "/tmp/report.pdf"
-
-            def setPath(self, path):
-                self.saved_path = path
-
-            def accept(self):
-                self.accepted = True
-
-        with tempfile.TemporaryDirectory() as directory:
-            output_path = str(Path(directory) / "report.pdf")
-            with mock.patch("markdown_editor.QWebEngineProfile", FakeProfile):
-                with mock.patch("markdown_editor.QWebEnginePage", FakePage):
-                    with mock.patch("markdown_editor.QWebEngineView", FakeBrowser):
-                        browser = create_chatgpt_browser()
-
-            settings = browser.page.settings()
-            self.assertEqual(
-                settings.attributes,
-                {
-                    FakeSettings.JavascriptEnabled: True,
-                    FakeSettings.JavascriptCanOpenWindows: True,
-                    FakeSettings.JavascriptCanAccessClipboard: True,
-                    FakeSettings.FullScreenSupportEnabled: True,
-                },
+    def test_remote_chrome_window_match_rejects_auxiliary_windows(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        valid = X11WindowInfo(
+            window_id=0x200,
+            wm_class='"google-chrome", "Google-chrome"',
+            pid=100,
+            width=800,
+            height=900,
+            is_viewable=True,
+        )
+        self.assertTrue(x11_window_matches_session(valid, session))
+        self.assertFalse(
+            x11_window_matches_session(
+                X11WindowInfo(0x201, valid.wm_class, 100, 200, 200, False),
+                session,
             )
+        )
+        self.assertFalse(
+            x11_window_matches_session(
+                X11WindowInfo(0x202, '"chatgpt", "Chatgpt"', 200, 800, 900, True),
+                session,
+            )
+        )
 
-            origin = browser.url
-            with mock.patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.Yes,
-            ):
-                browser.page.featurePermissionRequested.emit(
-                    origin,
-                    FakePage.MediaAudioCapture,
+    def test_parses_x11_client_window_ids(self):
+        output = (
+            "_NET_CLIENT_LIST(WINDOW): window id # "
+            "0x3600007, 0x4000012, 0x4000012\n"
+        )
+        self.assertEqual(
+            parse_x11_client_ids(output),
+            {0x3600007, 0x4000012},
+        )
+
+    def test_embedded_chrome_detects_the_new_remote_window(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        x11_connection = mock.Mock()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=x11_connection,
                 )
-            self.assertEqual(
-                browser.page.permissions,
-                [(origin, FakePage.MediaAudioCapture, FakePage.PermissionGrantedByUser)],
-            )
-            with mock.patch.object(
-                QMessageBox,
-                "question",
-                return_value=QMessageBox.No,
-            ):
-                browser.page.featurePermissionRequested.emit(
-                    origin,
-                    FakePage.MediaAudioCapture,
-                )
-            self.assertEqual(
-                browser.page.permissions[-1],
-                (origin, FakePage.MediaAudioCapture, FakePage.PermissionDeniedByUser),
-            )
-
-            download = FakeDownload()
+        browser.poll_timer.stop()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100, 0x200},
+        ):
             with mock.patch(
-                "markdown_editor.QFileDialog.getSaveFileName",
-                return_value=(output_path, ""),
+                "markdown_editor.read_x11_window_info",
+                return_value=X11WindowInfo(
+                    0x200,
+                    '"google-chrome", "Google-chrome"',
+                    100,
+                    800,
+                    900,
+                    True,
+                ),
             ):
-                browser._mdview_profile.downloadRequested.emit(download)
-            self.assertTrue(download.accepted)
-            self.assertEqual(download.saved_path, output_path)
+                with mock.patch.object(browser, "attach_window") as attach:
+                    browser.attach_new_chrome_window()
 
-            popup = browser.createWindow(0)
-            self.assertIs(popup.page.profile, browser._mdview_profile)
-            popup.close()
-            browser.close()
+        attach.assert_called_once_with(0x200)
+        browser.close()
+
+    def test_embedded_chrome_reparents_into_the_native_qt_widget(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        x11_connection = mock.Mock()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=x11_connection,
+                )
+        browser.resize(640, 720)
+        browser.attach_window(0x200)
+
+        x11_connection.reparent.assert_called_once_with(
+            0x200,
+            int(browser.winId()),
+            640,
+            720,
+        )
+        self.assertEqual(browser.window_id, 0x200)
+        browser.shutdown()
+        x11_connection.destroy.assert_called_once_with(0x200)
+        x11_connection.close.assert_called_once()
+
+    def test_x11_reparent_requires_the_expected_parent(self):
+        controller = X11WindowController()
+        with mock.patch.object(controller, "_run") as xdotool:
+            with mock.patch(
+                "markdown_editor.x11_parent_window_id",
+                return_value=0x300,
+            ):
+                controller.reparent(0x200, 0x300, 640, 720)
+        xdotool.assert_called_once()
+
+        with mock.patch.object(controller, "_run"):
+            with mock.patch(
+                "markdown_editor.x11_parent_window_id",
+                return_value=0x400,
+            ):
+                with self.assertRaisesRegex(OSError, "父节点校验失败"):
+                    controller.reparent(0x200, 0x300, 640, 720)
 
     def test_preview_pdf_builds_a_cache_file_and_opens_it(self):
         with tempfile.TemporaryDirectory() as directory:

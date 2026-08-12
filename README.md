@@ -117,7 +117,7 @@ claudex-yolo --prompt-suggestions true
 bash ~/scripts/desktop/install-markdown-renderer.sh
 ```
 
-安装脚本只在发现缺失的 APT 包时调用 `sudo`，并在终端中由 sudo 正常读取密码；不会保存密码。它会检查项目模板和锁文件，安装实时预览、Qt WebEngine、Pandoc/XeLaTeX、Poppler、TikZ、Mermaid 与浏览器依赖，并配置当前用户的 `mdview` 命令、桌面入口及 Markdown/TeX MIME 默认应用。脚本可重复运行；已满足的 APT 和 npm 依赖会跳过。
+安装脚本只在发现缺失的 APT 包时调用 `sudo`，并在终端中由 sudo 正常读取密码；不会保存密码。它会检查项目模板和锁文件，安装实时预览、X11 Chrome 窗口嵌入、Pandoc/XeLaTeX、Poppler、TikZ、Mermaid 与浏览器依赖，并配置当前用户的 `mdview` 命令、桌面入口及 Markdown/TeX MIME 默认应用。脚本可重复运行；已满足的 APT 和 npm 依赖会跳过。
 
 直接启动原生 PyQt5 软件窗口。默认只显示渲染结果；点击工具栏的“显示原文”后，左侧显示 Markdown 原文、右侧保持实时渲染：
 
@@ -130,7 +130,7 @@ mdview /path/to/document.tex
 `mdview` 是指向 `~/scripts/markdown_editor.py` 的命令入口。窗口内也可点击“打开文件”选择 Markdown 或完整 LaTeX 文档。主工具栏只保留“打开文件 / 目录 / ChatGPT / 原文 / 预览 PDF / 导出 PDF / 设置”，并提供以下功能：
 
 - “显示原文 / 隐藏原文”：切换双栏与纯预览模式。
-- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧直接加载 `chatgpt.com` 官网，形成“ChatGPT / 目录 / 正文”三栏布局，并保留官网自身的登录、会话列表、模型选择、附件上传、复制与下载等功能。登录窗口或网页新窗口会使用同一会话打开；下载会询问保存位置，麦克风等受保护设备会先询问是否授权。浏览器按需创建，关闭面板不会销毁网页；Cookie 和站点数据持久化到 `~/.local/share/mdview/chatgpt-profile/`。该 Qt WebEngine 登录环境与系统 Chrome 隔离，需要首次单独登录。
+- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧嵌入真实的系统 Chrome 窗口，形成“Chrome ChatGPT / 目录 / 正文”三栏布局。`mdview` 查找通过 `--remote-debugging-port=9223` 运行的 Chrome，复用其 `user-data-dir` 与登录状态，再让 Chrome 原生打开 `--app=https://chatgpt.com/`；官网样式、登录、会话、模型选择、上传、语音、复制和下载均由 Chrome 本身处理，不再使用 Qt WebEngine。该窗口嵌入依赖 X11，不支持 Wayland。
 - 预览右键复制：选中右侧渲染内容后，可选择“复制为文字”或“复制为图片”；图片会保留标题、表格和公式的排版，同时写入剪贴板和唯一文件 `/tmp/mdview-selection-*.png`，完整路径显示在状态栏。
 - 左侧目录：默认显示 Markdown 的一级至三级标题；点击目录项跳转到右侧对应章节，编辑时实时更新，可用“隐藏目录 / 显示目录”切换。
 - “设置”：收纳背景颜色、整体边框颜色和 Markdown 行间距；不再将低频选项平铺在主工具栏。
@@ -144,6 +144,18 @@ mdview /path/to/document.tex
 - “导出 PDF”：Markdown 使用 Pandoc → 论文风格 LaTeX 模板 → XeLaTeX；完整 `.tex` 文档直接使用 XeLaTeX。
 - 底部文件路径：点击后复制当前 Markdown 所在目录。实时预览不再画虚拟分页线或页码；PDF 仍使用 LaTeX 的真实分页和页码。
 
+如果远程调试 Chrome 尚未运行，可先启动一次；端口只监听本机：
+
+```bash
+google-chrome \
+  --user-data-dir="$HOME/.config/google-chrome-shared" \
+  --profile-directory=Default \
+  --remote-debugging-address=127.0.0.1 \
+  --remote-debugging-port=9223
+```
+
+以后点击“ChatGPT”会从这个 Chrome 进程创建并嵌入官网窗口。若使用其他端口，可在启动 `mdview` 前设置 `MDVIEW_CHROME_DEBUG_PORT`。
+
 Python 依赖：
 
 ```bash
@@ -153,7 +165,7 @@ python3 -m pip install -r requirements-markdown.txt
 PDF 导出必须具备 Pandoc + XeLaTeX。在 Ubuntu/Debian 安装：
 
 ```bash
-sudo apt install python3-pyqt5 python3-pyqt5.qtwebengine pandoc texlive-xetex texlive-lang-chinese texlive-latex-extra texlive-pictures fonts-noto-cjk graphviz poppler-utils
+sudo apt install python3-pyqt5 pandoc texlive-xetex texlive-lang-chinese texlive-latex-extra texlive-pictures fonts-noto-cjk graphviz poppler-utils x11-utils xdotool
 ```
 
 导出使用 `markdown_pdf/template.tex`，生成封面、可选三级目录、页眉页脚、论文式表格和中文数学排版。封面与页眉可通过 Markdown 开头的 YAML 设置：
