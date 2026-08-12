@@ -1731,6 +1731,38 @@ def save_preview_image(
     return output_path
 
 
+def build_chatgpt_edit_prompt(
+    source_path: Path | None,
+    selected_text: str,
+    rendered_location: str,
+) -> str:
+    source_path = source_path.expanduser().resolve() if source_path else None
+    suffix = source_path.suffix.casefold() if source_path else ".md"
+    is_latex = suffix in {".tex", ".latex", ".ltx"}
+    document_kind = "完整 LaTeX" if is_latex else "Markdown"
+    output_suffix = suffix if suffix in AUTO_OPEN_DOCUMENT_SUFFIXES else ".md"
+    source_label = str(source_path) if source_path else "当前打开但尚未保存的文档"
+    return f"""请修改你在本次对话中提供、且我已下载的{document_kind}源文件。
+
+本地文件：{source_label}
+渲染位置：{rendered_location}
+
+请在源文件中定位下面的选中原文。PDF 中的公式、空格或换行可能与源代码不完全一致；遇到这种情况，请结合物理页码、相邻文字和语义定位，不要修改其他相似段落。
+
+<<<MDVIEW_SELECTED_TEXT
+{selected_text.strip()}
+MDVIEW_SELECTED_TEXT
+
+执行约束：
+1. 只修改上述原文对应的位置，不要顺带重写其他章节。
+2. 保留原有文档结构、公式、引用、标签、目录和排版风格，除非修改要求明确涉及它们。
+3. 修改后自行检查上下文是否连贯、语法是否有效。
+4. 返回可下载的完整 `{output_suffix}` 文件，不要只返回修改片段或 diff。
+
+修改要求（由我补充）：
+"""
+
+
 @dataclass(frozen=True)
 class RemoteChromeSession:
     executable: str
@@ -2506,6 +2538,7 @@ class MarkdownPreview(QTextBrowser):
 
     image_saved = pyqtSignal(str)
     image_save_failed = pyqtSignal(str)
+    chatgpt_edit_requested = pyqtSignal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -2724,6 +2757,30 @@ class MarkdownPreview(QTextBrowser):
         selected = cursor.selectedText().replace("\u2029", "\n").replace("\u2028", "\n")
         QApplication.clipboard().setText(selected)
 
+    def selected_text_and_location(self) -> tuple[str, str]:
+        if self._pdf_pages:
+            ordinals = list(self._pdf_selected_ordinals())
+            if not ordinals:
+                return "", ""
+            pages = sorted({self._pdf_words[ordinal][0] + 1 for ordinal in ordinals})
+            if len(pages) == 1:
+                location = f"PDF 物理页码：第 {pages[0]} 页"
+            else:
+                location = f"PDF 物理页码：第 {pages[0]}–{pages[-1]} 页"
+            return self._pdf_selection_text(), location
+        cursor = self.textCursor()
+        if not cursor.hasSelection():
+            return "", ""
+        selected = cursor.selectedText().replace("\u2029", "\n").replace(
+            "\u2028", "\n"
+        )
+        return selected, "实时渲染预览（请按选中原文精确搜索）"
+
+    def request_chatgpt_edit(self) -> None:
+        selected_text, location = self.selected_text_and_location()
+        if selected_text:
+            self.chatgpt_edit_requested.emit(selected_text, location)
+
     def copy_selection_as_image(self) -> None:
         if self._pdf_pages:
             self._copy_pdf_selection_as_image()
@@ -2803,6 +2860,9 @@ class MarkdownPreview(QTextBrowser):
             copy_image = menu.addAction("复制为图片")
             copy_image.setEnabled(has_selection)
             copy_image.triggered.connect(self.copy_selection_as_image)
+            chatgpt_edit = menu.addAction("复制为 ChatGPT 对话…")
+            chatgpt_edit.setEnabled(has_selection)
+            chatgpt_edit.triggered.connect(self.request_chatgpt_edit)
             return menu
         menu = self.createStandardContextMenu()
         menu.addSeparator()
@@ -2813,6 +2873,9 @@ class MarkdownPreview(QTextBrowser):
         copy_image = menu.addAction("复制为图片")
         copy_image.setEnabled(cursor_has_selection)
         copy_image.triggered.connect(self.copy_selection_as_image)
+        chatgpt_edit = menu.addAction("复制为 ChatGPT 对话…")
+        chatgpt_edit.setEnabled(cursor_has_selection)
+        chatgpt_edit.triggered.connect(self.request_chatgpt_edit)
         return menu
 
     def contextMenuEvent(self, event) -> None:
@@ -2938,6 +3001,9 @@ class MarkdownWindow(QMainWindow):
             lambda error: self.statusBar().showMessage(
                 f"图片已复制，但保存到 /tmp 失败：{error}", 10_000
             )
+        )
+        self.preview.chatgpt_edit_requested.connect(
+            self.copy_chatgpt_edit_request
         )
 
         splitter = QSplitter(Qt.Horizontal)
@@ -3131,6 +3197,22 @@ class MarkdownWindow(QMainWindow):
         self.statusBar().showMessage(
             f"已在当前窗口打开 ChatGPT 下载：{document_path}",
             5000,
+        )
+
+    def copy_chatgpt_edit_request(
+        self,
+        selected_text: str,
+        rendered_location: str,
+    ) -> None:
+        prompt = build_chatgpt_edit_prompt(
+            self.current_path,
+            selected_text,
+            rendered_location,
+        )
+        QApplication.clipboard().setText(prompt)
+        self.statusBar().showMessage(
+            "已复制 ChatGPT 定位对话；粘贴后在末尾填写修改要求。",
+            8000,
         )
 
     def closeEvent(self, event) -> None:

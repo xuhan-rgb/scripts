@@ -13,6 +13,7 @@ from PyQt5.QtGui import QImage, QPainter, QTextDocument
 from PyQt5.QtWidgets import (
     QApplication,
     QDialog,
+    QInputDialog,
     QLabel,
     QMessageBox,
     QSplitter,
@@ -29,6 +30,7 @@ from markdown_editor import (
     X11WindowInfo,
     X11WindowController,
     ascii_flow_to_mermaid,
+    build_chatgpt_edit_prompt,
     compile_latex_document,
     configure_latex_toc,
     chrome_download_directory,
@@ -1480,6 +1482,61 @@ title: 自动驾驶世界模型
             action_texts = [action.text() for action in menu.actions()]
             self.assertIn("复制为文字", action_texts)
             self.assertIn("复制为图片", action_texts)
+            self.assertIn("复制为 ChatGPT 对话…", action_texts)
+
+    def test_chatgpt_edit_prompt_identifies_source_page_text_and_request(self):
+        prompt = build_chatgpt_edit_prompt(
+            Path("/home/qwer/Downloads/report.tex"),
+            "W_t 给出具体沿哪些点走。",
+            "PDF 物理页码：第 7 页",
+        )
+
+        self.assertIn("report.tex", prompt)
+        self.assertIn("完整 LaTeX", prompt)
+        self.assertIn("PDF 物理页码：第 7 页", prompt)
+        self.assertIn("W_t 给出具体沿哪些点走。", prompt)
+        self.assertIn("修改要求（由我补充）：", prompt)
+        self.assertIn("只修改上述原文对应的位置", prompt)
+        self.assertIn("返回可下载的完整 `.tex` 文件", prompt)
+
+    def test_pdf_selection_generates_its_physical_page_location(self):
+        preview = MarkdownPreview()
+        preview._pdf_pages = [
+            (100.0, 100.0, [(1, 1, 20, 10, "第一页", 1)]),
+            (100.0, 100.0, [(1, 1, 20, 10, "第二页", 1)]),
+        ]
+        preview._pdf_words = [(0, 0), (1, 0)]
+        preview._pdf_selection_start = 0
+        preview._pdf_selection_end = 1
+
+        selected, location = preview.selected_text_and_location()
+
+        self.assertEqual(selected, "第一页\n第二页")
+        self.assertEqual(location, "PDF 物理页码：第 1–2 页")
+
+    def test_chatgpt_location_conversation_is_copied_without_an_extra_dialog(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path
+
+            with mock.patch.object(QInputDialog, "getMultiLineText") as dialog:
+                window.copy_chatgpt_edit_request(
+                    "原来的定义。",
+                    "PDF 物理页码：第 3 页",
+                )
+
+            dialog.assert_not_called()
+            copied = QApplication.clipboard().text()
+            self.assertIn(str(source_path), copied)
+            self.assertIn("原来的定义。", copied)
+            self.assertIn("第 3 页", copied)
+            self.assertTrue(copied.rstrip().endswith("修改要求（由我补充）："))
 
     def test_clicking_file_path_copies_the_complete_file_path(self):
         with tempfile.TemporaryDirectory() as directory:
