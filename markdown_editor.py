@@ -20,6 +20,8 @@ import signal
 import subprocess
 import sys
 import tempfile
+import urllib.parse
+import urllib.request
 import warnings
 import weakref
 import xml.etree.ElementTree as ElementTree
@@ -29,6 +31,7 @@ from functools import lru_cache
 from pathlib import Path
 
 import markdown
+import websocket
 from PyQt5.QtCore import (
     QPointF,
     QRectF,
@@ -79,7 +82,7 @@ from PyQt5.QtWidgets import (
 
 APP_NAME = "Markdown Renderer"
 CHATGPT_URL = QUrl("https://chatgpt.com/")
-TEX_DOCUMENT_SUFFIXES = {".tex", ".latex", ".ltx"}
+AUTO_OPEN_DOCUMENT_SUFFIXES = {".tex", ".latex", ".ltx", ".md", ".markdown"}
 MARKDOWN_EXTENSIONS = ("extra", "sane_lists")
 DEFAULT_BORDER_COLOR = "#2563eb"
 DEFAULT_BACKGROUND_COLOR = "#ffffff"
@@ -1737,6 +1740,13 @@ class RemoteChromeSession:
     pid: int
 
 
+@dataclass(frozen=True)
+class ChromeDebugTarget:
+    target_id: str
+    url: str
+    websocket_url: str
+
+
 def chrome_download_directory(
     session: RemoteChromeSession,
     fallback_home: Path | None = None,
@@ -1758,6 +1768,180 @@ def chrome_download_directory(
     if not isinstance(configured, str) or not configured.strip():
         return fallback.resolve()
     return Path(os.path.expandvars(configured)).expanduser().resolve()
+
+
+def chrome_debug_json(debug_port: int, endpoint: str):
+    url = f"http://127.0.0.1:{debug_port}{endpoint}"
+    try:
+        with urllib.request.urlopen(url, timeout=1) as response:
+            return json.load(response)
+    except (OSError, ValueError, json.JSONDecodeError) as error:
+        raise OSError(f"无法读取 Chrome 调试端点 {endpoint}：{error}") from error
+
+
+def chrome_debug_targets(debug_port: int) -> list[ChromeDebugTarget]:
+    targets = []
+    for item in chrome_debug_json(debug_port, "/json/list"):
+        target_id = item.get("id")
+        websocket_url = item.get("webSocketDebuggerUrl")
+        if item.get("type") != "page" or not target_id or not websocket_url:
+            continue
+        targets.append(
+            ChromeDebugTarget(
+                target_id=str(target_id),
+                url=str(item.get("url", "")),
+                websocket_url=str(websocket_url),
+            )
+        )
+    return targets
+
+
+def chrome_browser_websocket_url(debug_port: int) -> str:
+    websocket_url = chrome_debug_json(debug_port, "/json/version").get(
+        "webSocketDebuggerUrl"
+    )
+    if not websocket_url:
+        raise OSError("Chrome 调试端点没有提供浏览器 WebSocket 地址。")
+    return str(websocket_url)
+
+
+def new_chatgpt_target(
+    known_target_ids: set[str],
+    targets: list[ChromeDebugTarget],
+) -> ChromeDebugTarget | None:
+    for target in targets:
+        hostname = (urllib.parse.urlparse(target.url).hostname or "").casefold()
+        if target.target_id in known_target_ids:
+            continue
+        if hostname == "chatgpt.com" or hostname.endswith(".chatgpt.com"):
+            return target
+    return None
+
+
+class ChromeTargetDownloadCapture:
+    """Capture completed downloads initiated by one Chrome page target."""
+
+    def __init__(
+        self,
+        target: ChromeDebugTarget,
+        browser_websocket_url: str,
+        download_directory: Path,
+        *,
+        socket_factory=None,
+    ) -> None:
+        self.download_directory = Path(download_directory).expanduser().resolve()
+        self.socket_factory = socket_factory or websocket.create_connection
+        self.request_id = 0
+        target_socket = self.socket_factory(
+            target.websocket_url,
+            timeout=2,
+            suppress_origin=True,
+        )
+        try:
+            frame_tree = self.request(target_socket, "Page.getFrameTree").get(
+                "frameTree", {}
+            )
+            self.frame_ids = self.collect_frame_ids(frame_tree)
+        finally:
+            target_socket.close()
+        self.browser_socket = self.socket_factory(
+            browser_websocket_url,
+            timeout=2,
+            suppress_origin=True,
+        )
+        self.request(
+            self.browser_socket,
+            "Browser.setDownloadBehavior",
+            {"behavior": "default", "eventsEnabled": True},
+        )
+        self.browser_socket.settimeout(0)
+        self.downloads: dict[str, str] = {}
+        self.pending_completed: set[Path] = set()
+
+    def request(self, connection, method: str, params=None):
+        self.request_id += 1
+        request_id = self.request_id
+        message = {"id": request_id, "method": method}
+        if params is not None:
+            message["params"] = params
+        connection.send(json.dumps(message))
+        while True:
+            response = json.loads(connection.recv())
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise OSError(response["error"].get("message", "Chrome 调试命令失败。"))
+            return response.get("result", {})
+
+    @classmethod
+    def collect_frame_ids(cls, frame_tree) -> set[str]:
+        frame_ids = set()
+        frame_id = frame_tree.get("frame", {}).get("id")
+        if frame_id:
+            frame_ids.add(str(frame_id))
+        for child in frame_tree.get("childFrames", []):
+            frame_ids.update(cls.collect_frame_ids(child))
+        return frame_ids
+
+    def poll_completed_downloads(self) -> list[Path]:
+        completed = self.take_existing_completed_paths()
+        while True:
+            try:
+                raw_message = self.browser_socket.recv()
+            except (
+                BlockingIOError,
+                TimeoutError,
+                websocket.WebSocketTimeoutException,
+            ):
+                break
+            except websocket.WebSocketConnectionClosedException:
+                break
+            message = json.loads(raw_message)
+            method = message.get("method")
+            params = message.get("params", {})
+            if method == "Browser.downloadWillBegin":
+                filename = str(params.get("suggestedFilename", ""))
+                if (
+                    params.get("frameId") in self.frame_ids
+                    and Path(filename).suffix.casefold()
+                    in AUTO_OPEN_DOCUMENT_SUFFIXES
+                ):
+                    self.downloads[str(params.get("guid", ""))] = filename
+                continue
+            if method != "Browser.downloadProgress":
+                continue
+            guid = str(params.get("guid", ""))
+            filename = self.downloads.get(guid)
+            state = params.get("state")
+            if filename is None:
+                continue
+            if state == "canceled":
+                self.downloads.pop(guid, None)
+                continue
+            if state != "completed":
+                continue
+            self.downloads.pop(guid, None)
+            file_path = params.get("filePath")
+            completed_path = (
+                Path(str(file_path))
+                if file_path
+                else self.download_directory / filename
+            )
+            self.pending_completed.add(completed_path.expanduser().resolve())
+        completed.extend(self.take_existing_completed_paths())
+        return completed
+
+    def take_existing_completed_paths(self) -> list[Path]:
+        completed = []
+        for path in list(self.pending_completed):
+            if not path.is_file():
+                continue
+            self.pending_completed.remove(path)
+            completed.append(path)
+        return completed
+
+    def close(self) -> None:
+        self.browser_socket.close()
 
 
 @dataclass(frozen=True)
@@ -2082,7 +2266,7 @@ class EmbeddedChromeWidget(QWidget):
     """Host a real Chrome app window inside Qt through an X11 foreign window."""
 
     attach_failed = pyqtSignal(str)
-    tex_downloaded = pyqtSignal(str)
+    document_downloaded = pyqtSignal(str)
     ATTACH_STABILITY_POLLS = 8
 
     def __init__(
@@ -2092,6 +2276,7 @@ class EmbeddedChromeWidget(QWidget):
         *,
         x11_connection=None,
         download_directory: Path | None = None,
+        known_debug_targets: list[ChromeDebugTarget] | None = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_NativeWindow, True)
@@ -2107,8 +2292,21 @@ class EmbeddedChromeWidget(QWidget):
             if download_directory is not None
             else chrome_download_directory(session)
         )
-        self.known_tex_files = self.tex_file_versions()
-        self.pending_tex_files: dict[Path, tuple[int, int]] = {}
+        self.download_capture: ChromeTargetDownloadCapture | None = None
+        self.target_poll_attempts = 0
+        try:
+            debug_targets = (
+                chrome_debug_targets(session.debug_port)
+                if known_debug_targets is None
+                else known_debug_targets
+            )
+        except OSError as error:
+            logging.warning("ChatGPT 下载捕获不可用：%s", error)
+            self.known_debug_target_ids: set[str] | None = None
+        else:
+            self.known_debug_target_ids = {
+                target.target_id for target in debug_targets
+            }
 
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -2134,52 +2332,50 @@ class EmbeddedChromeWidget(QWidget):
         self.guard_timer = QTimer(self)
         self.guard_timer.setInterval(250)
         self.guard_timer.timeout.connect(self.verify_embedded_window)
+        self.target_timer = QTimer(self)
+        self.target_timer.setInterval(100)
+        self.target_timer.timeout.connect(self.attach_download_capture)
         self.download_timer = QTimer(self)
-        self.download_timer.setInterval(500)
-        self.download_timer.timeout.connect(self.check_tex_downloads)
+        self.download_timer.setInterval(100)
+        self.download_timer.timeout.connect(self.poll_download_capture)
+        if self.known_debug_target_ids is not None:
+            self.target_timer.start()
+
+    def attach_download_capture(self) -> None:
+        self.target_poll_attempts += 1
+        try:
+            targets = chrome_debug_targets(self.session.debug_port)
+            target = new_chatgpt_target(self.known_debug_target_ids or set(), targets)
+            if target is None:
+                if self.target_poll_attempts >= 100:
+                    self.target_timer.stop()
+                return
+            browser_websocket_url = chrome_browser_websocket_url(
+                self.session.debug_port
+            )
+            self.download_capture = ChromeTargetDownloadCapture(
+                target,
+                browser_websocket_url,
+                self.download_directory,
+            )
+        except (OSError, websocket.WebSocketException) as error:
+            self.target_timer.stop()
+            logging.warning("无法连接内嵌 ChatGPT 下载事件：%s", error)
+            return
+        self.target_timer.stop()
         self.download_timer.start()
 
-    def tex_file_versions(self) -> dict[Path, tuple[int, int]]:
-        if not self.download_directory.is_dir():
-            return {}
-        versions = {}
+    def poll_download_capture(self) -> None:
+        if self.download_capture is None:
+            return
         try:
-            paths = list(self.download_directory.iterdir())
-        except OSError:
-            return {}
-        for path in paths:
-            if (
-                not path.is_file()
-                or path.suffix.casefold() not in TEX_DOCUMENT_SUFFIXES
-            ):
-                continue
-            try:
-                stat = path.stat()
-            except OSError:
-                continue
-            versions[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
-        return versions
-
-    def check_tex_downloads(self) -> None:
-        current_files = self.tex_file_versions()
-        current_paths = set(current_files)
-        for path in list(self.pending_tex_files):
-            if path not in current_paths:
-                self.pending_tex_files.pop(path, None)
-        for path, version in current_files.items():
-            if self.known_tex_files.get(path) == version:
-                self.pending_tex_files.pop(path, None)
-                continue
-            partial_path = path.with_name(path.name + ".crdownload")
-            if partial_path.exists() or version[1] <= 0:
-                self.pending_tex_files.pop(path, None)
-                continue
-            if self.pending_tex_files.get(path) != version:
-                self.pending_tex_files[path] = version
-                continue
-            self.pending_tex_files.pop(path, None)
-            self.known_tex_files[path] = version
-            self.tex_downloaded.emit(str(path))
+            completed_paths = self.download_capture.poll_completed_downloads()
+        except (OSError, ValueError, json.JSONDecodeError) as error:
+            self.download_timer.stop()
+            logging.warning("读取内嵌 ChatGPT 下载事件失败：%s", error)
+            return
+        for path in completed_paths:
+            self.document_downloaded.emit(str(path))
 
     def attach_new_chrome_window(self) -> None:
         self.poll_attempts += 1
@@ -2270,7 +2466,11 @@ class EmbeddedChromeWidget(QWidget):
     def shutdown(self) -> None:
         self.poll_timer.stop()
         self.guard_timer.stop()
+        self.target_timer.stop()
         self.download_timer.stop()
+        if self.download_capture is not None:
+            self.download_capture.close()
+            self.download_capture = None
         if self.window_id is not None:
             self.x11_connection.destroy(self.window_id)
             self.window_id = None
@@ -2898,9 +3098,13 @@ class MarkdownWindow(QMainWindow):
                 self.chatgpt_action.blockSignals(False)
                 QMessageBox.warning(self, "无法打开 ChatGPT", str(error))
                 return
-            tex_downloaded = getattr(self.chatgpt_view, "tex_downloaded", None)
-            if tex_downloaded is not None:
-                tex_downloaded.connect(self.open_downloaded_tex)
+            document_downloaded = getattr(
+                self.chatgpt_view,
+                "document_downloaded",
+                None,
+            )
+            if document_downloaded is not None:
+                document_downloaded.connect(self.open_downloaded_document)
             self.chatgpt_dock.setWidget(self.chatgpt_view)
         self.chatgpt_dock.setVisible(visible)
         self.sync_chatgpt_action(visible)
@@ -2915,10 +3119,10 @@ class MarkdownWindow(QMainWindow):
         self.chatgpt_action.setChecked(visible)
         self.chatgpt_action.setText("隐藏 ChatGPT" if visible else "ChatGPT")
 
-    def open_downloaded_tex(self, filename: str) -> None:
+    def open_downloaded_document(self, filename: str) -> None:
         document_path = Path(filename).expanduser().resolve()
         if (
-            document_path.suffix.casefold() not in TEX_DOCUMENT_SUFFIXES
+            document_path.suffix.casefold() not in AUTO_OPEN_DOCUMENT_SUFFIXES
             or not document_path.is_file()
         ):
             return
@@ -2928,7 +3132,7 @@ class MarkdownWindow(QMainWindow):
                 start_new_session=True,
             )
         except OSError as error:
-            QMessageBox.warning(self, "无法打开 TeX", str(error))
+            QMessageBox.warning(self, "无法打开下载文档", str(error))
             return
         self.statusBar().showMessage(
             f"已捕获 ChatGPT 下载并打开：{document_path}",

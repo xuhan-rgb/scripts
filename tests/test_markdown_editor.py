@@ -1,5 +1,6 @@
 import os
 import base64
+import json
 import tempfile
 import unittest
 from pathlib import Path
@@ -19,6 +20,8 @@ from PyQt5.QtWidgets import (
 )
 
 from markdown_editor import (
+    ChromeDebugTarget,
+    ChromeTargetDownloadCapture,
     MarkdownPreview,
     MarkdownWindow,
     PdfExportDialog,
@@ -35,6 +38,7 @@ from markdown_editor import (
     extract_latex_toc_entries,
     export_pdf,
     normalize_math_markup,
+    new_chatgpt_target,
     open_local_file,
     pandoc_pdf_command,
     find_remote_chrome,
@@ -935,6 +939,7 @@ title: 自动驾驶世界模型
                 browser = EmbeddedChromeWidget(
                     session,
                     x11_connection=x11_connection,
+                    known_debug_targets=[],
                 )
         browser.poll_timer.stop()
         with mock.patch(
@@ -974,7 +979,11 @@ title: 自动驾驶世界模型
             with mock.patch("markdown_editor.subprocess.Popen"):
                 from markdown_editor import EmbeddedChromeWidget
 
-                browser = EmbeddedChromeWidget(session, x11_connection=mock.Mock())
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=mock.Mock(),
+                    known_debug_targets=[],
+                )
         browser.poll_timer.stop()
         with mock.patch(
             "markdown_editor.x11_client_window_ids",
@@ -1017,6 +1026,7 @@ title: 自动驾驶世界模型
                 browser = EmbeddedChromeWidget(
                     session,
                     x11_connection=x11_connection,
+                    known_debug_targets=[],
                 )
         browser.resize(640, 720)
         browser.attach_window(0x200)
@@ -1048,7 +1058,11 @@ title: 自动驾驶世界模型
             with mock.patch("markdown_editor.subprocess.Popen"):
                 from markdown_editor import EmbeddedChromeWidget
 
-                browser = EmbeddedChromeWidget(session, x11_connection=x11_connection)
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=x11_connection,
+                    known_debug_targets=[],
+                )
         browser.poll_timer.stop()
         browser.window_id = 0x200
         x11_connection.parent_window_id.return_value = 0x204
@@ -1064,65 +1078,142 @@ title: 自动驾驶世界模型
         browser.window_id = None
         browser.close()
 
-    def test_embedded_chrome_emits_a_completed_tex_download_once(self):
-        session = RemoteChromeSession(
-            executable="/opt/google/chrome/chrome",
-            user_data_dir="/tmp/chrome-profile",
-            profile_directory="Default",
-            debug_port=9223,
-            pid=100,
+    def test_new_chatgpt_target_excludes_existing_and_regular_browser_pages(self):
+        existing = ChromeDebugTarget(
+            target_id="existing-chatgpt",
+            url="https://chatgpt.com/",
+            websocket_url="ws://existing",
         )
-        x11_connection = mock.Mock()
+        regular = ChromeDebugTarget(
+            target_id="regular-download",
+            url="https://example.com/report.tex",
+            websocket_url="ws://regular",
+        )
+        embedded = ChromeDebugTarget(
+            target_id="embedded-chatgpt",
+            url="https://chatgpt.com/c/new",
+            websocket_url="ws://embedded",
+        )
+
+        self.assertEqual(
+            new_chatgpt_target(
+                {existing.target_id},
+                [regular, existing, embedded],
+            ),
+            embedded,
+        )
+
+    def test_download_capture_only_returns_the_embedded_target_download(self):
+        class FakeSocket:
+            def __init__(self, frame_id=None, events=None):
+                self.frame_id = frame_id
+                self.events = list(events or [])
+                self.responses = []
+
+            def send(self, raw_message):
+                message = json.loads(raw_message)
+                if message["method"] == "Page.getFrameTree":
+                    result = {
+                        "frameTree": {
+                            "frame": {"id": self.frame_id},
+                        }
+                    }
+                else:
+                    result = {}
+                self.responses.append(
+                    json.dumps({"id": message["id"], "result": result})
+                )
+
+            def recv(self):
+                if self.responses:
+                    return self.responses.pop(0)
+                if self.events:
+                    return json.dumps(self.events.pop(0))
+                raise BlockingIOError
+
+            def settimeout(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
         with tempfile.TemporaryDirectory() as directory:
             download_directory = Path(directory)
-            with mock.patch(
-                "markdown_editor.x11_client_window_ids",
-                return_value={0x100},
-            ):
-                with mock.patch("markdown_editor.subprocess.Popen"):
-                    from markdown_editor import EmbeddedChromeWidget
+            ordinary_path = download_directory / "ordinary.md"
+            embedded_path = download_directory / "embedded.tex"
+            ordinary_path.write_text("ordinary", encoding="utf-8")
+            embedded_path.write_text("embedded", encoding="utf-8")
+            target_socket = FakeSocket(frame_id="embedded-frame")
+            browser_socket = FakeSocket(
+                events=[
+                    {
+                        "method": "Browser.downloadWillBegin",
+                        "params": {
+                            "frameId": "ordinary-frame",
+                            "guid": "ordinary-guid",
+                            "suggestedFilename": ordinary_path.name,
+                        },
+                    },
+                    {
+                        "method": "Browser.downloadProgress",
+                        "params": {
+                            "guid": "ordinary-guid",
+                            "state": "completed",
+                            "filePath": str(ordinary_path),
+                        },
+                    },
+                    {
+                        "method": "Browser.downloadWillBegin",
+                        "params": {
+                            "frameId": "embedded-frame",
+                            "guid": "embedded-guid",
+                            "suggestedFilename": embedded_path.name,
+                        },
+                    },
+                    {
+                        "method": "Browser.downloadProgress",
+                        "params": {
+                            "guid": "embedded-guid",
+                            "state": "completed",
+                            "filePath": str(embedded_path),
+                        },
+                    },
+                ]
+            )
+            sockets = iter([target_socket, browser_socket])
+            capture = ChromeTargetDownloadCapture(
+                ChromeDebugTarget(
+                    target_id="embedded-target",
+                    url="https://chatgpt.com/",
+                    websocket_url="ws://embedded-target",
+                ),
+                "ws://browser",
+                download_directory,
+                socket_factory=lambda *_args, **_kwargs: next(sockets),
+            )
 
-                    browser = EmbeddedChromeWidget(
-                        session,
-                        x11_connection=x11_connection,
-                        download_directory=download_directory,
-                    )
-            browser.poll_timer.stop()
-            browser.download_timer.stop()
-            downloaded = []
-            browser.tex_downloaded.connect(downloaded.append)
-            partial_path = download_directory / "report.tex.crdownload"
-            final_path = download_directory / "report.tex"
-            partial_path.write_text("partial", encoding="utf-8")
+            self.assertEqual(
+                capture.poll_completed_downloads(),
+                [embedded_path.resolve()],
+            )
+            capture.close()
 
-            browser.check_tex_downloads()
-            self.assertEqual(downloaded, [])
-
-            partial_path.unlink()
-            final_path.write_text("\\documentclass{article}", encoding="utf-8")
-            browser.check_tex_downloads()
-            browser.check_tex_downloads()
-            browser.check_tex_downloads()
-
-            self.assertEqual(downloaded, [str(final_path.resolve())])
-            browser.close()
-
-    def test_downloaded_tex_opens_in_a_new_mdview_window(self):
+    def test_downloaded_markdown_opens_in_a_new_mdview_window(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
             window = MarkdownWindow(settings=settings)
-            tex_path = root / "report.tex"
-            tex_path.write_text("\\documentclass{article}", encoding="utf-8")
+            markdown_path = root / "report.md"
+            markdown_path.write_text("# Downloaded", encoding="utf-8")
 
             with mock.patch("markdown_editor.subprocess.Popen") as launch:
-                window.open_downloaded_tex(str(tex_path))
+                window.open_downloaded_document(str(markdown_path))
 
             launch.assert_called_once_with(
                 [
                     os.sys.executable,
                     str(Path("markdown_editor.py").resolve()),
-                    str(tex_path.resolve()),
+                    str(markdown_path.resolve()),
                 ],
                 start_new_session=True,
             )

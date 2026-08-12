@@ -67,6 +67,7 @@ packages=(
     python3-markdown
     python3-matplotlib
     python3-pyqt5
+    python3-websocket
     texlive-lang-chinese
     texlive-latex-extra
     texlive-pictures
@@ -109,6 +110,7 @@ python3 - <<'PY' \
 import markdown
 import matplotlib
 import PyQt5
+import websocket
 PY
 
 for command in pandoc xelatex kpsewhich dot pdftocairo pdftotext pdfinfo xprop xwininfo; do
@@ -180,7 +182,7 @@ printf '  Command:       %s [document.md|document.tex]\n' "$command_path"
 printf '  PDF pipeline:  Pandoc -> XeLaTeX (ctexart)\n'
 printf '  PDF preview:   Real pages + coordinate-accurate Poppler selection\n'
 printf '  Image copies:  Clipboard + /tmp/mdview-selection-*.png\n'
-printf '  ChatGPT:       Embedded Chrome + automatic downloaded TeX rendering\n'
+printf '  ChatGPT:       Embedded-page Markdown/TeX download capture\n'
 printf '  TikZ preview:  XeLaTeX -> pdftocairo (PDF export stays vector)\n'
 printf '  Mermaid:       %s + %s\n' "$(command -v npm)" "$browser"
 printf '  Desktop entry: %s\n' "$desktop_path"
