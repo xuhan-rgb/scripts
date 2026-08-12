@@ -4,3 +4,4 @@ __pycache__/
 /model/
 /images/
 *.engine
+/markdown_renderer_node/node_modules/
