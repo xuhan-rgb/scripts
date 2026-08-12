@@ -1879,7 +1879,8 @@ def x11_window_matches_session(
 ) -> bool:
     window_class = window.wm_class.casefold()
     return (
-        ("chrome" in window_class or "chromium" in window_class)
+        "chatgpt.com" in window_class
+        and ("chrome" in window_class or "chromium" in window_class)
         and window.pid == session.pid
         and window.is_viewable
         and window.width >= 320
@@ -2057,6 +2058,7 @@ class EmbeddedChromeWidget(QWidget):
     """Host a real Chrome app window inside Qt through an X11 foreign window."""
 
     attach_failed = pyqtSignal(str)
+    ATTACH_STABILITY_POLLS = 8
 
     def __init__(
         self,
@@ -2071,6 +2073,8 @@ class EmbeddedChromeWidget(QWidget):
         self.x11_connection = x11_connection or X11WindowController()
         self.window_id: int | None = None
         self.poll_attempts = 0
+        self.candidate_window_id: int | None = None
+        self.candidate_seen_count = 0
         self.known_window_ids = x11_client_window_ids()
 
         self.layout = QVBoxLayout(self)
@@ -2094,6 +2098,9 @@ class EmbeddedChromeWidget(QWidget):
         self.poll_timer.setInterval(100)
         self.poll_timer.timeout.connect(self.attach_new_chrome_window)
         self.poll_timer.start()
+        self.guard_timer = QTimer(self)
+        self.guard_timer.setInterval(250)
+        self.guard_timer.timeout.connect(self.verify_embedded_window)
 
     def attach_new_chrome_window(self) -> None:
         self.poll_attempts += 1
@@ -2103,11 +2110,27 @@ class EmbeddedChromeWidget(QWidget):
             self.fail_attachment(str(error))
             return
         new_window_ids = current_window_ids - self.known_window_ids
-        for window_id in sorted(new_window_ids):
+        candidates = list(sorted(new_window_ids)) + list(
+            sorted(current_window_ids & self.known_window_ids)
+        )
+        matched_window_id = None
+        for window_id in candidates:
             window = read_x11_window_info(window_id)
             if window is not None and x11_window_matches_session(window, self.session):
-                self.attach_window(window_id)
+                matched_window_id = window_id
+                break
+        if matched_window_id is not None:
+            if matched_window_id == self.candidate_window_id:
+                self.candidate_seen_count += 1
+            else:
+                self.candidate_window_id = matched_window_id
+                self.candidate_seen_count = 1
+            if self.candidate_seen_count >= self.ATTACH_STABILITY_POLLS:
+                self.attach_window(matched_window_id)
                 return
+        else:
+            self.candidate_window_id = None
+            self.candidate_seen_count = 0
         if self.poll_attempts >= 100:
             self.fail_attachment(
                 "Chrome 已启动，但 10 秒内没有找到新的 ChatGPT 窗口。"
@@ -2126,7 +2149,24 @@ class EmbeddedChromeWidget(QWidget):
             return
         self.poll_timer.stop()
         self.window_id = window_id
-        self.status_label.deleteLater()
+        self.status_label.hide()
+        self.guard_timer.start()
+
+    def verify_embedded_window(self) -> None:
+        if self.window_id is None:
+            return
+        parent_id = int(self.winId())
+        if self.x11_connection.parent_window_id(self.window_id) == parent_id:
+            return
+        try:
+            self.x11_connection.reparent(
+                self.window_id,
+                parent_id,
+                self.width(),
+                self.height(),
+            )
+        except OSError as error:
+            self.fail_attachment(f"Chrome 窗口脱离面板且无法重新接管：{error}")
 
     def resizeEvent(self, event) -> None:
         super().resizeEvent(event)
@@ -2143,11 +2183,14 @@ class EmbeddedChromeWidget(QWidget):
 
     def fail_attachment(self, message: str) -> None:
         self.poll_timer.stop()
+        self.guard_timer.stop()
+        self.status_label.show()
         self.status_label.setText(message)
         self.attach_failed.emit(message)
 
     def shutdown(self) -> None:
         self.poll_timer.stop()
+        self.guard_timer.stop()
         if self.window_id is not None:
             self.x11_connection.destroy(self.window_id)
             self.window_id = None
@@ -2748,6 +2791,13 @@ class MarkdownWindow(QMainWindow):
         self.toc_action.setText("隐藏目录" if visible else "显示目录")
 
     def set_chatgpt_visible(self, visible: bool) -> None:
+        if not visible and self.chatgpt_view is not None:
+            shutdown = getattr(self.chatgpt_view, "shutdown", None)
+            if shutdown is not None:
+                shutdown()
+            self.chatgpt_dock.setWidget(None)
+            self.chatgpt_view.deleteLater()
+            self.chatgpt_view = None
         if visible and self.chatgpt_view is None:
             try:
                 self.chatgpt_view = create_chatgpt_browser(self.chatgpt_dock)

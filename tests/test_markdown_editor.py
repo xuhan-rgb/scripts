@@ -760,6 +760,7 @@ title: 自动驾驶世界模型
             settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
             window = MarkdownWindow(settings=settings)
             browser = QLabel("ChatGPT browser")
+            browser.shutdown = mock.Mock()
 
             self.assertTrue(window.chatgpt_dock.isHidden())
             with mock.patch(
@@ -784,10 +785,11 @@ title: 自动驾驶世界模型
                 window.chatgpt_action.trigger()
                 self.assertTrue(window.chatgpt_dock.isHidden())
                 self.assertEqual(window.chatgpt_action.text(), "ChatGPT")
+                browser.shutdown.assert_called_once()
 
                 window.chatgpt_action.trigger()
 
-            create_browser.assert_called_once_with(window.chatgpt_dock)
+            self.assertEqual(create_browser.call_count, 2)
             self.assertIs(window.chatgpt_dock.widget(), browser)
 
     def test_chatgpt_panel_reports_missing_remote_chrome(self):
@@ -858,7 +860,7 @@ title: 自动驾驶世界模型
         )
         valid = X11WindowInfo(
             window_id=0x200,
-            wm_class='"google-chrome", "Google-chrome"',
+            wm_class='"chatgpt.com", "Google-chrome"',
             pid=100,
             width=800,
             height=900,
@@ -917,7 +919,7 @@ title: 自动驾驶世界模型
                 "markdown_editor.read_x11_window_info",
                 return_value=X11WindowInfo(
                     0x200,
-                    '"google-chrome", "Google-chrome"',
+                    '"chatgpt.com", "Google-chrome"',
                     100,
                     800,
                     900,
@@ -925,7 +927,47 @@ title: 自动驾驶世界模型
                 ),
             ):
                 with mock.patch.object(browser, "attach_window") as attach:
-                    browser.attach_new_chrome_window()
+                    for _ in range(browser.ATTACH_STABILITY_POLLS):
+                        browser.attach_new_chrome_window()
+
+        attach.assert_called_once_with(0x200)
+        browser.close()
+
+    def test_embedded_chrome_can_adopt_an_existing_chatgpt_app_window(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x200},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(session, x11_connection=mock.Mock())
+        browser.poll_timer.stop()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x200},
+        ):
+            with mock.patch(
+                "markdown_editor.read_x11_window_info",
+                return_value=X11WindowInfo(
+                    0x200,
+                    '"chatgpt.com", "Google-chrome"',
+                    100,
+                    460,
+                    688,
+                    True,
+                ),
+            ):
+                with mock.patch.object(browser, "attach_window") as attach:
+                    for _ in range(browser.ATTACH_STABILITY_POLLS):
+                        browser.attach_new_chrome_window()
 
         attach.assert_called_once_with(0x200)
         browser.close()
@@ -963,6 +1005,38 @@ title: 自动驾驶世界模型
         browser.shutdown()
         x11_connection.destroy.assert_called_once_with(0x200)
         x11_connection.close.assert_called_once()
+
+    def test_embedded_chrome_recaptures_a_window_that_escaped_to_root(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        x11_connection = mock.Mock()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(session, x11_connection=x11_connection)
+        browser.poll_timer.stop()
+        browser.window_id = 0x200
+        x11_connection.parent_window_id.return_value = 0x204
+
+        browser.verify_embedded_window()
+
+        x11_connection.reparent.assert_called_once_with(
+            0x200,
+            int(browser.winId()),
+            browser.width(),
+            browser.height(),
+        )
+        browser.window_id = None
+        browser.close()
 
     def test_x11_reparent_requires_the_expected_parent(self):
         x11 = mock.Mock()
