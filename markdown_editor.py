@@ -1878,6 +1878,50 @@ PDF 中的公式、空格、换行、上下标可能与 {document_kind} 源码�
 """
 
 
+def build_codex_edit_prompt(
+    source_path: Path,
+    selected_text: str,
+    rendered_location: str,
+) -> str:
+    source_path = source_path.expanduser().resolve()
+    is_latex = source_path.suffix.casefold() in {".tex", ".latex", ".ltx"}
+    document_kind = "LaTeX" if is_latex else "Markdown"
+    return f"""请直接修改以下本地 {document_kind} 源文件。
+
+【源文件】
+{source_path}
+
+请以上述本地文件为唯一源文件：
+- 直接修改并保存上述原文件；
+- 不要创建副本，不要使用其他历史版本；
+- 不要根据 PDF 重新构建整个文档；
+- 如果无法读取该文件，请停止并说明，不要猜测修改其他文件。
+
+需要修改的位置：
+
+【章节/页码】
+{rendered_location}
+
+【原文】
+<<<
+{selected_text.strip()}
+>>>
+
+PDF 中的公式、空格、换行、上下标可能与 {document_kind} 源码不完全一致，请结合上下文语义定位对应位置。
+
+执行要求：
+
+1. 只修改对应位置，不修改其他无关章节；
+2. 保留原有公式编号、label、引用、目录和排版风格；
+3. 不改变已有结构，除非修改内容明确需要；
+4. 修改后检查上下文逻辑是否连贯；
+5. 检查 {document_kind} 语法是否有效；
+6. 修改完成后直接保存到上述原文件，不要只返回修改片段或 diff。
+
+【修改要求】
+"""
+
+
 @dataclass(frozen=True)
 class RemoteChromeSession:
     executable: str
@@ -2843,6 +2887,7 @@ class MarkdownPreview(QTextBrowser):
     image_saved = pyqtSignal(str)
     image_save_failed = pyqtSignal(str)
     chatgpt_edit_requested = pyqtSignal(str, str)
+    codex_edit_requested = pyqtSignal(str, str)
 
     def __init__(self, parent=None) -> None:
         super().__init__(parent)
@@ -3160,6 +3205,11 @@ class MarkdownPreview(QTextBrowser):
         if selected_text:
             self.chatgpt_edit_requested.emit(selected_text, location)
 
+    def request_codex_edit(self) -> None:
+        selected_text, location = self.selected_text_and_location()
+        if selected_text:
+            self.codex_edit_requested.emit(selected_text, location)
+
     def copy_selection_as_image(self) -> None:
         if self._pdf_pages:
             self._copy_pdf_selection_as_image()
@@ -3242,6 +3292,9 @@ class MarkdownPreview(QTextBrowser):
             chatgpt_edit = menu.addAction("复制为 ChatGPT 对话…")
             chatgpt_edit.setEnabled(has_selection)
             chatgpt_edit.triggered.connect(self.request_chatgpt_edit)
+            codex_edit = menu.addAction("复制为 Codex 对话…")
+            codex_edit.setEnabled(has_selection)
+            codex_edit.triggered.connect(self.request_codex_edit)
             return menu
         menu = self.createStandardContextMenu()
         menu.addSeparator()
@@ -3255,6 +3308,9 @@ class MarkdownPreview(QTextBrowser):
         chatgpt_edit = menu.addAction("复制为 ChatGPT 对话…")
         chatgpt_edit.setEnabled(cursor_has_selection)
         chatgpt_edit.triggered.connect(self.request_chatgpt_edit)
+        codex_edit = menu.addAction("复制为 Codex 对话…")
+        codex_edit.setEnabled(cursor_has_selection)
+        codex_edit.triggered.connect(self.request_codex_edit)
         return menu
 
     def contextMenuEvent(self, event) -> None:
@@ -3386,6 +3442,7 @@ class MarkdownWindow(QMainWindow):
         self.preview.chatgpt_edit_requested.connect(
             self.copy_chatgpt_edit_request
         )
+        self.preview.codex_edit_requested.connect(self.copy_codex_edit_request)
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setObjectName("sourcePreviewSplitter")
@@ -3635,6 +3692,28 @@ class MarkdownWindow(QMainWindow):
         QApplication.clipboard().setText(prompt)
         self.statusBar().showMessage(
             "已复制 ChatGPT 定位对话；粘贴后在末尾填写修改要求。",
+            8000,
+        )
+
+    def copy_codex_edit_request(
+        self,
+        selected_text: str,
+        rendered_location: str,
+    ) -> None:
+        if self.current_path is None:
+            self.statusBar().showMessage(
+                "无法生成 Codex 对话：请先打开本地源文件。",
+                8000,
+            )
+            return
+        prompt = build_codex_edit_prompt(
+            self.current_path,
+            selected_text,
+            rendered_location,
+        )
+        QApplication.clipboard().setText(prompt)
+        self.statusBar().showMessage(
+            "已复制 Codex 定位对话；粘贴后在末尾填写修改要求。",
             8000,
         )
 

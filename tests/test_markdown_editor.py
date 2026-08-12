@@ -31,6 +31,7 @@ from markdown_editor import (
     X11WindowInfo,
     X11WindowController,
     ascii_flow_to_mermaid,
+    build_codex_edit_prompt,
     build_chatgpt_edit_prompt,
     chatgpt_performance_script,
     compile_latex_document,
@@ -1915,6 +1916,24 @@ title: 自动驾驶世界模型
             self.assertIn("复制为文字", action_texts)
             self.assertIn("复制为图片", action_texts)
             self.assertIn("复制为 ChatGPT 对话…", action_texts)
+            self.assertIn("复制为 Codex 对话…", action_texts)
+
+    def test_codex_edit_prompt_modifies_the_local_source_file_directly(self):
+        source_path = Path("/home/qwer/Downloads/report.tex")
+        prompt = build_codex_edit_prompt(
+            source_path,
+            "W_t 给出具体沿哪些点走。",
+            "PDF 物理页码：第 7 页",
+        )
+
+        self.assertIn("【源文件】\n/home/qwer/Downloads/report.tex", prompt)
+        self.assertIn("直接修改并保存上述原文件", prompt)
+        self.assertIn("【章节/页码】\nPDF 物理页码：第 7 页", prompt)
+        self.assertIn("【原文】\n<<<\nW_t 给出具体沿哪些点走。\n>>>", prompt)
+        self.assertIn("检查 LaTeX 语法是否有效", prompt)
+        self.assertNotIn("返回完整 `.tex` 文件", prompt)
+        self.assertNotIn("会话附件", prompt)
+        self.assertTrue(prompt.endswith("【修改要求】\n"))
 
     def test_chatgpt_edit_prompt_identifies_source_page_text_and_request(self):
         prompt = build_chatgpt_edit_prompt(
@@ -2030,6 +2049,29 @@ title: 自动驾驶世界模型
             self.assertNotIn("请在该位置进行以下修改：", copied)
             self.assertNotIn("额外定制要求：", copied)
             self.assertTrue(copied.endswith("【修改要求】\n"))
+
+    def test_codex_location_conversation_uses_the_current_local_source(self):
+        with tempfile.TemporaryDirectory() as directory:
+            source_path = Path(directory) / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(source_path, settings=settings)
+
+            window.copy_codex_edit_request(
+                "原来的定义。",
+                "PDF 物理页码：第 3 页",
+            )
+
+            copied = QApplication.clipboard().text()
+            self.assertIn(f"【源文件】\n{source_path}", copied)
+            self.assertIn("直接修改并保存上述原文件", copied)
+            self.assertIn("原来的定义。", copied)
+            self.assertIn("第 3 页", copied)
+            self.assertNotIn("会话附件", copied)
+            self.assertIn("Codex 定位对话", window.statusBar().currentMessage())
 
     def test_clicking_file_path_copies_the_complete_file_path(self):
         with tempfile.TemporaryDirectory() as directory:
