@@ -3126,16 +3126,10 @@ class MarkdownWindow(QMainWindow):
             or not document_path.is_file()
         ):
             return
-        try:
-            subprocess.Popen(
-                [sys.executable, str(Path(__file__).resolve()), str(document_path)],
-                start_new_session=True,
-            )
-        except OSError as error:
-            QMessageBox.warning(self, "无法打开下载文档", str(error))
+        if not self.load_file(document_path):
             return
         self.statusBar().showMessage(
-            f"已捕获 ChatGPT 下载并打开：{document_path}",
+            f"已在当前窗口打开 ChatGPT 下载：{document_path}",
             5000,
         )
 

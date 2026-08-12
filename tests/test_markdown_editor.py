@@ -1198,7 +1198,7 @@ title: 自动驾驶世界模型
             )
             capture.close()
 
-    def test_downloaded_markdown_opens_in_a_new_mdview_window(self):
+    def test_downloaded_markdown_replaces_the_current_document(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
@@ -1209,14 +1209,9 @@ title: 自动驾驶世界模型
             with mock.patch("markdown_editor.subprocess.Popen") as launch:
                 window.open_downloaded_document(str(markdown_path))
 
-            launch.assert_called_once_with(
-                [
-                    os.sys.executable,
-                    str(Path("markdown_editor.py").resolve()),
-                    str(markdown_path.resolve()),
-                ],
-                start_new_session=True,
-            )
+            launch.assert_not_called()
+            self.assertEqual(window.current_path, markdown_path.resolve())
+            self.assertEqual(window.editor.toPlainText(), "# Downloaded")
 
     def test_x11_reparent_requires_the_expected_parent(self):
         x11 = mock.Mock()
