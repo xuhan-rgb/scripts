@@ -83,6 +83,7 @@ from PyQt5.QtWidgets import (
 APP_NAME = "Markdown Renderer"
 CHATGPT_URL = QUrl("https://chatgpt.com/")
 AUTO_OPEN_DOCUMENT_SUFFIXES = {".tex", ".latex", ".ltx", ".md", ".markdown"}
+CHATGPT_PERFORMANCE_STYLE_ID = "mdview-chatgpt-performance-style"
 MARKDOWN_EXTENSIONS = ("extra", "sane_lists")
 DEFAULT_BORDER_COLOR = "#2563eb"
 DEFAULT_BACKGROUND_COLOR = "#ffffff"
@@ -1739,24 +1740,35 @@ def build_chatgpt_edit_prompt(
     source_path = source_path.expanduser().resolve() if source_path else None
     suffix = source_path.suffix.casefold() if source_path else ".md"
     is_latex = suffix in {".tex", ".latex", ".ltx"}
-    document_kind = "完整 LaTeX" if is_latex else "Markdown"
+    document_kind = "完整 LaTeX" if is_latex else "完整 Markdown"
+    syntax_kind = "LaTeX" if is_latex else "Markdown"
     output_suffix = suffix if suffix in AUTO_OPEN_DOCUMENT_SUFFIXES else ".md"
-    source_label = str(source_path) if source_path else "当前打开但尚未保存的文档"
-    return f"""请修改你在本次对话中提供、且我已下载的{document_kind}源文件。
+    source_label = source_path.name if source_path else "当前尚未保存的文档"
+    local_reference = (
+        f"\n\n本地参考路径（仅供核对文件名）：{source_path}"
+        if source_path
+        else ""
+    )
+    return f"""请修改你在本次对话中刚才提供的{document_kind} 源文件：
 
-本地文件：{source_label}
-渲染位置：{rendered_location}
+{source_label}{local_reference}
 
-请在源文件中定位下面的选中原文。PDF 中的公式、空格或换行可能与源代码不完全一致；遇到这种情况，请结合物理页码、相邻文字和语义定位，不要修改其他相似段落。
+请以该会话附件为唯一源文件，不要重新构建文档，也不要使用其他历史版本。
+
+需要修改的位置：
+- {rendered_location}
+- 选中原文：
 
 <<<MDVIEW_SELECTED_TEXT
 {selected_text.strip()}
 MDVIEW_SELECTED_TEXT
 
+请在附件源文件中定位这一处。PDF 中的公式、空格或换行可能与源代码不完全一致；遇到这种情况，请结合物理页码、相邻文字和语义定位。
+
 执行约束：
-1. 只修改上述原文对应的位置，不要顺带重写其他章节。
-2. 保留原有文档结构、公式、引用、标签、目录和排版风格，除非修改要求明确涉及它们。
-3. 修改后自行检查上下文是否连贯、语法是否有效。
+1. 只修改这一个位置，不要修改其他相同或相似的内容，也不要顺带重写其他章节。
+2. 保留原有结构、公式编号、label、引用、目录和排版，除非修改要求明确涉及它们。
+3. 修改后自行检查上下文是否连贯，并完成后检查 {syntax_kind} 语法是否有效。
 4. 返回可下载的完整 `{output_suffix}` 文件，不要只返回修改片段或 diff。
 
 修改要求（由我补充）：
@@ -1850,6 +1862,46 @@ def new_chatgpt_target(
     return None
 
 
+def chatgpt_performance_script() -> str:
+    css = r"""
+html { scroll-behavior: auto !important; }
+[data-testid^="conversation-turn-"]:not(:has([data-writing-block])) {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 600px;
+}
+[data-testid^="conversation-turn-"]:not(:has([data-writing-block])) .markdown.prose > * {
+  content-visibility: auto;
+  contain-intrinsic-block-size: auto 96px;
+}
+* {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+@media (prefers-reduced-motion: reduce) {
+  *, *::before, *::after {
+    animation-duration: 0.001ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.001ms !important;
+    scroll-behavior: auto !important;
+  }
+}
+""".strip()
+    return f"""(() => {{
+  const install = () => {{
+    if (document.getElementById({json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)})) return;
+    const style = document.createElement('style');
+    style.id = {json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)};
+    style.textContent = {json.dumps(css)};
+    (document.head || document.documentElement).appendChild(style);
+  }};
+  if (document.readyState === 'loading') {{
+    document.addEventListener('DOMContentLoaded', install, {{ once: true }});
+  }} else {{
+    install();
+  }}
+}})();"""
+
+
 class ChromeTargetDownloadCapture:
     """Capture completed downloads initiated by one Chrome page target."""
 
@@ -1875,6 +1927,7 @@ class ChromeTargetDownloadCapture:
                 "frameTree", {}
             )
             self.frame_ids = self.collect_frame_ids(frame_tree)
+            self.configure_chatgpt_target(target_socket)
         finally:
             target_socket.close()
         self.browser_socket = self.socket_factory(
@@ -1890,6 +1943,33 @@ class ChromeTargetDownloadCapture:
         self.browser_socket.settimeout(0)
         self.downloads: dict[str, str] = {}
         self.pending_completed: set[Path] = set()
+
+    def configure_chatgpt_target(self, connection) -> None:
+        script = chatgpt_performance_script()
+        commands = [
+            (
+                "Emulation.setEmulatedMedia",
+                {
+                    "media": "screen",
+                    "features": [
+                        {"name": "prefers-reduced-motion", "value": "reduce"},
+                    ],
+                },
+            ),
+            ("Page.addScriptToEvaluateOnNewDocument", {"source": script}),
+            (
+                "Runtime.evaluate",
+                {
+                    "expression": script,
+                    "returnByValue": True,
+                },
+            ),
+        ]
+        for method, params in commands:
+            try:
+                self.request(connection, method, params)
+            except (OSError, ValueError, websocket.WebSocketException) as error:
+                logging.warning("内嵌 ChatGPT 性能配置 %s 失败：%s", method, error)
 
     def request(self, connection, method: str, params=None):
         self.request_id += 1

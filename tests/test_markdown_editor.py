@@ -31,6 +31,7 @@ from markdown_editor import (
     X11WindowController,
     ascii_flow_to_mermaid,
     build_chatgpt_edit_prompt,
+    chatgpt_performance_script,
     compile_latex_document,
     configure_latex_toc,
     chrome_download_directory,
@@ -1270,6 +1271,66 @@ title: 自动驾驶世界模型
             ]
             self.assertIn("Target.closeTarget", sent_methods)
 
+    def test_embedded_target_enables_low_cost_chatgpt_rendering(self):
+        class FakeSocket:
+            def __init__(self, frame_id=None):
+                self.frame_id = frame_id
+                self.responses = []
+                self.sent_messages = []
+
+            def send(self, raw_message):
+                self.sent_messages.append(raw_message)
+                message = json.loads(raw_message)
+                result = (
+                    {"frameTree": {"frame": {"id": self.frame_id}}}
+                    if message["method"] == "Page.getFrameTree"
+                    else {}
+                )
+                self.responses.append(
+                    json.dumps({"id": message["id"], "result": result})
+                )
+
+            def recv(self):
+                if self.responses:
+                    return self.responses.pop(0)
+                raise BlockingIOError
+
+            def settimeout(self, _timeout):
+                pass
+
+            def close(self):
+                pass
+
+        target_socket = FakeSocket(frame_id="embedded-frame")
+        browser_socket = FakeSocket()
+        sockets = iter([target_socket, browser_socket])
+        capture = ChromeTargetDownloadCapture(
+            ChromeDebugTarget(
+                target_id="embedded-target",
+                url="https://chatgpt.com/",
+                websocket_url="ws://embedded-target",
+            ),
+            "ws://browser",
+            Path("/tmp"),
+            socket_factory=lambda *_args, **_kwargs: next(sockets),
+        )
+
+        target_messages = [json.loads(raw) for raw in target_socket.sent_messages]
+        methods = [message["method"] for message in target_messages]
+        self.assertIn("Emulation.setEmulatedMedia", methods)
+        self.assertIn("Page.addScriptToEvaluateOnNewDocument", methods)
+        self.assertIn("Runtime.evaluate", methods)
+        script = chatgpt_performance_script()
+        self.assertIn(r'data-testid^=\"conversation-turn-\"', script)
+        self.assertIn("content-visibility", script)
+        self.assertIn("data-writing-block", script)
+        self.assertIn("backdrop-filter", script)
+        browser_methods = [
+            json.loads(raw)["method"] for raw in browser_socket.sent_messages
+        ]
+        self.assertEqual(browser_methods, ["Browser.setDownloadBehavior"])
+        capture.close()
+
     def test_downloaded_markdown_replaces_the_current_document(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
@@ -1644,12 +1705,26 @@ title: 自动驾驶世界模型
             "PDF 物理页码：第 7 页",
         )
 
-        self.assertIn("report.tex", prompt)
-        self.assertIn("完整 LaTeX", prompt)
-        self.assertIn("PDF 物理页码：第 7 页", prompt)
+        self.assertTrue(
+            prompt.startswith(
+                "请修改你在本次对话中刚才提供的完整 LaTeX 源文件："
+            )
+        )
+        self.assertIn("\n\nreport.tex\n\n", prompt)
+        self.assertIn(
+            "请以该会话附件为唯一源文件，不要重新构建文档，"
+            "也不要使用其他历史版本。",
+            prompt,
+        )
+        self.assertIn("需要修改的位置：", prompt)
+        self.assertIn("- PDF 物理页码：第 7 页", prompt)
+        self.assertIn("- 选中原文：", prompt)
         self.assertIn("W_t 给出具体沿哪些点走。", prompt)
         self.assertIn("修改要求（由我补充）：", prompt)
-        self.assertIn("只修改上述原文对应的位置", prompt)
+        self.assertIn("只修改这一个位置", prompt)
+        self.assertIn("不要修改其他相同或相似的内容", prompt)
+        self.assertIn("保留原有结构、公式编号、label、引用、目录和排版", prompt)
+        self.assertIn("完成后检查 LaTeX 语法", prompt)
         self.assertIn("返回可下载的完整 `.tex` 文件", prompt)
 
     def test_pdf_selection_generates_its_physical_page_location(self):
