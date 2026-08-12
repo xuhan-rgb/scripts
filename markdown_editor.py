@@ -2633,6 +2633,7 @@ class MarkdownWindow(QMainWindow):
         self.latest_tex_pdf_path: Path | None = None
         self.border_color = DEFAULT_BORDER_COLOR
         self.background_color = DEFAULT_BACKGROUND_COLOR
+        self.setProperty("tocVisible", True)
         self.line_height = normalized_line_height(
             self.settings.value("lineHeight", DEFAULT_LINE_HEIGHT)
         )
@@ -2790,7 +2791,11 @@ class MarkdownWindow(QMainWindow):
     def sync_toc_action(self, visible: bool) -> None:
         self.toc_action.setChecked(visible)
         self.toc_action.setText("隐藏目录" if visible else "显示目录")
+        self.setProperty("tocVisible", visible)
         self.chatgpt_dock.setProperty("tocVisible", visible)
+        self.style().unpolish(self)
+        self.style().polish(self)
+        self.update()
         self.chatgpt_dock.style().unpolish(self.chatgpt_dock)
         self.chatgpt_dock.style().polish(self.chatgpt_dock)
         self.chatgpt_dock.update()
@@ -2975,6 +2980,10 @@ class MarkdownWindow(QMainWindow):
             "QMainWindow {"
             f" border: 4px solid {self.border_color};"
             " }"
+            "QMainWindow::separator { background-color: transparent; width: 4px; }"
+            'QMainWindow[tocVisible="true"]::separator {'
+            f" background-color: {self.border_color}; width: 4px;"
+            " }"
             "QToolBar {"
             f" border: 0; border-bottom: 2px solid {self.border_color};"
             " spacing: 5px; padding: 6px 8px;"
@@ -3007,9 +3016,6 @@ class MarkdownWindow(QMainWindow):
             f" border: 3px solid {self.border_color};"
             " }"
             "QDockWidget#chatgptDock { border-right: 0; }"
-            'QDockWidget#chatgptDock[tocVisible="true"] {'
-            f" border-right: 3px solid {self.border_color};"
-            " }"
             "QDockWidget#chatgptDock::title {"
             f" background-color: {self.background_color}; color: {text_color};"
             " padding: 6px; text-align: left; font-weight: 600;"

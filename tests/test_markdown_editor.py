@@ -1231,15 +1231,18 @@ title: 自动驾驶世界模型
 
             stylesheet = window.styleSheet()
             self.assertIn(
-                'QDockWidget#chatgptDock[tocVisible="true"]',
+                'QMainWindow[tocVisible="true"]::separator',
                 stylesheet,
             )
-            self.assertIn("border-right: 3px solid #7c3aed", stylesheet)
+            self.assertIn("background-color: #7c3aed", stylesheet)
+            self.assertIn("width: 4px", stylesheet)
             self.assertTrue(window.chatgpt_dock.property("tocVisible"))
+            self.assertTrue(window.property("tocVisible"))
 
             window.set_toc_visible(False)
 
             self.assertFalse(window.chatgpt_dock.property("tocVisible"))
+            self.assertFalse(window.property("tocVisible"))
 
     def test_background_color_covers_app_and_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
