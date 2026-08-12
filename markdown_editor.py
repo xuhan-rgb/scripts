@@ -20,6 +20,7 @@ import signal
 import subprocess
 import sys
 import tempfile
+import unicodedata
 import urllib.parse
 import urllib.request
 import warnings
@@ -67,6 +68,7 @@ from PyQt5.QtWidgets import (
     QMenu,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSplitter,
     QStyle,
     QTextBrowser,
@@ -1565,6 +1567,74 @@ def compile_latex_document(
     return "XeLaTeX"
 
 
+def _order_pdf_words_by_visual_lines(
+    words: list[tuple[float, float, float, float, str, int]],
+) -> list[tuple[float, float, float, float, str, int]]:
+    line_groups: dict[
+        int,
+        list[tuple[float, float, float, float, str, int]],
+    ] = {}
+    for word in words:
+        line_groups.setdefault(word[5], []).append(word)
+
+    def bounds(group):
+        return (
+            min(word[0] for word in group),
+            min(word[1] for word in group),
+            max(word[2] for word in group),
+            max(word[3] for word in group),
+        )
+
+    groups = sorted(
+        line_groups.values(),
+        key=lambda group: (bounds(group)[1], bounds(group)[0]),
+    )
+    visual_rows: list[
+        list[list[tuple[float, float, float, float, str, int]]]
+    ] = []
+    for group in groups:
+        left, top, right, bottom = bounds(group)
+        matching_row = None
+        best_overlap = 0.0
+        for row_index, row in enumerate(visual_rows):
+            for existing in row:
+                other_left, other_top, other_right, other_bottom = bounds(existing)
+                vertical_overlap = min(bottom, other_bottom) - max(top, other_top)
+                horizontal_gap = max(
+                    other_left - right,
+                    left - other_right,
+                    0.0,
+                )
+                if vertical_overlap > 0 and horizontal_gap <= 2.0:
+                    if vertical_overlap > best_overlap:
+                        best_overlap = vertical_overlap
+                        matching_row = row_index
+        if matching_row is None:
+            visual_rows.append([group])
+        else:
+            visual_rows[matching_row].append(group)
+
+    visual_rows.sort(
+        key=lambda row: (
+            min(bounds(group)[1] for group in row),
+            min(bounds(group)[0] for group in row),
+        )
+    )
+    ordered = []
+    for visual_line, row in enumerate(visual_rows):
+        row_words = [word for group in row for word in group]
+
+        def horizontal_key(word):
+            x_min, y_min, _x_max, y_max, text, _line_number = word
+            if text and all(unicodedata.combining(character) for character in text):
+                x_min -= (y_max - y_min) * 0.5
+            return x_min, y_min
+
+        for word in sorted(row_words, key=horizontal_key):
+            ordered.append((*word[:5], visual_line))
+    return ordered
+
+
 def extract_pdf_text_layout(
     pdf_path: Path,
 ) -> list[tuple[float, float, list[tuple[float, float, float, float, str, int]]]]:
@@ -1619,8 +1689,9 @@ def extract_pdf_text_layout(
                 except (KeyError, ValueError):
                     continue
                 words.append((x_min, y_min, x_max, y_max, text, line_number))
-        words.sort(key=lambda value: (value[5], value[0]))
-        pages.append((page_width, page_height, words))
+        pages.append(
+            (page_width, page_height, _order_pdf_words_by_visual_lines(words))
+        )
     return pages
 
 
@@ -1732,41 +1803,78 @@ def save_preview_image(
     return output_path
 
 
+class FilePathEdit(QLineEdit):
+    """Read-only path display that becomes editable on double-click."""
+
+    clicked = pyqtSignal()
+    doubleClicked = pyqtSignal()
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setReadOnly(True)
+        self.setCursor(Qt.PointingHandCursor)
+
+    def mouseReleaseEvent(self, event) -> None:
+        super().mouseReleaseEvent(event)
+        if self.isReadOnly() and event.button() == Qt.LeftButton:
+            self.clicked.emit()
+
+    def mouseDoubleClickEvent(self, event) -> None:
+        if event.button() == Qt.LeftButton:
+            self.setReadOnly(False)
+            self.setCursor(Qt.IBeamCursor)
+            self.setFocus(Qt.MouseFocusReason)
+            self.selectAll()
+            self.doubleClicked.emit()
+            event.accept()
+            return
+        super().mouseDoubleClickEvent(event)
+
+    def finish_editing(self) -> None:
+        self.setReadOnly(True)
+        self.deselect()
+        self.setCursor(Qt.PointingHandCursor)
+
+
 def build_chatgpt_edit_prompt(
     source_path: Path | None,
     selected_text: str,
     rendered_location: str,
 ) -> str:
-    source_path = source_path.expanduser().resolve() if source_path else None
     suffix = source_path.suffix.casefold() if source_path else ".md"
     is_latex = suffix in {".tex", ".latex", ".ltx"}
-    document_kind = "完整 LaTeX" if is_latex else "完整 Markdown"
-    syntax_kind = "LaTeX" if is_latex else "Markdown"
+    document_kind = "LaTeX" if is_latex else "Markdown"
     output_suffix = suffix if suffix in AUTO_OPEN_DOCUMENT_SUFFIXES else ".md"
-    source_label = source_path.name if source_path else "当前尚未保存的文档"
-    return f"""请修改你在本次对话中刚才提供的{document_kind} 源文件：
+    return f"""请修改你在本次对话中提供的 {document_kind} 源文件。
 
-{source_label}
-
-请以该会话附件为唯一源文件，不要重新构建文档，也不要使用其他历史版本。
+请以该会话附件作为唯一源文件：
+- 不要使用其他历史版本；
+- 不要根据 PDF 重新构建整个文档；
+- 不要使用我本地路径中的文件；
+- 如果无法读取该附件，请先说明，不要猜测修改其他版本。
 
 需要修改的位置：
-- {rendered_location}
-- 选中原文：
 
-<<<MDVIEW_SELECTED_TEXT
+【章节/页码】
+{rendered_location}
+
+【原文】
+<<<
 {selected_text.strip()}
-MDVIEW_SELECTED_TEXT
+>>>
 
-请在附件源文件中定位这一处。PDF 中的公式、空格或换行可能与源代码不完全一致；遇到这种情况，请结合物理页码、相邻文字和语义定位。
+PDF 中的公式、空格、换行、上下标可能与 {document_kind} 源码不完全一致，请结合上下文语义定位对应位置。
 
-执行约束：
-1. 只修改这一个位置，不要修改其他相同或相似的内容，也不要顺带重写其他章节。
-2. 保留原有结构、公式编号、label、引用、目录和排版，除非修改要求明确涉及它们。
-3. 修改后自行检查上下文是否连贯，并完成后检查 {syntax_kind} 语法是否有效。
-4. 返回可下载的完整 `{output_suffix}` 文件，不要只返回修改片段或 diff。
+执行要求：
 
-修改要求（由我补充）：
+1. 只修改对应位置，不修改其他无关章节；
+2. 保留原有公式编号、label、引用、目录和排版风格；
+3. 不改变已有结构，除非修改内容明确需要；
+4. 修改后检查上下文逻辑是否连贯；
+5. 检查 {document_kind} 语法是否有效；
+6. 返回完整 `{output_suffix}` 文件，不要只返回修改片段或 diff。
+
+【修改要求】
 """
 
 
@@ -1860,17 +1968,13 @@ def new_chatgpt_target(
 def chatgpt_performance_script() -> str:
     css = r"""
 html { scroll-behavior: auto !important; }
-[data-testid^="conversation-turn-"]:not(:has([data-writing-block])) {
+[data-testid^="conversation-turn-"] {
   content-visibility: auto;
   contain-intrinsic-block-size: auto 600px;
 }
-[data-testid^="conversation-turn-"]:not(:has([data-writing-block])) .markdown.prose > * {
+[data-testid^="conversation-turn-"] .markdown.prose > * {
   content-visibility: auto;
   contain-intrinsic-block-size: auto 96px;
-}
-* {
-  backdrop-filter: none !important;
-  -webkit-backdrop-filter: none !important;
 }
 @media (prefers-reduced-motion: reduce) {
   *, *::before, *::after {
@@ -1883,22 +1987,29 @@ html { scroll-behavior: auto !important; }
 """.strip()
     return f"""(() => {{
   const install = () => {{
-    if (document.getElementById({json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)})) return;
-    const style = document.createElement('style');
-    style.id = {json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)};
-    style.textContent = {json.dumps(css)};
-    (document.head || document.documentElement).appendChild(style);
+    if (!document.documentElement) return false;
+    document.documentElement.dataset.mdviewEmbeddedChatgpt = 'true';
+    if (!document.getElementById({json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)})) {{
+      const style = document.createElement('style');
+      style.id = {json.dumps(CHATGPT_PERFORMANCE_STYLE_ID)};
+      style.textContent = {json.dumps(css)};
+      (document.head || document.documentElement).appendChild(style);
+    }}
+    return true;
   }};
   if (document.readyState === 'loading') {{
     document.addEventListener('DOMContentLoaded', install, {{ once: true }});
+    return false;
   }} else {{
-    install();
+    return install();
   }}
 }})();"""
 
 
 class ChromeTargetDownloadCapture:
     """Capture completed downloads initiated by one Chrome page target."""
+
+    ACTIVITY_TIMEOUT_SECONDS = 0.05
 
     def __init__(
         self,
@@ -1912,59 +2023,101 @@ class ChromeTargetDownloadCapture:
         self.download_directory = Path(download_directory).expanduser().resolve()
         self.socket_factory = socket_factory or websocket.create_connection
         self.request_id = 0
-        target_socket = self.socket_factory(
+        self.performance_script_registered = False
+        self.performance_configured = False
+        self.page_active = True
+        self.target_socket = self.socket_factory(
             target.websocket_url,
             timeout=2,
             suppress_origin=True,
         )
         try:
-            frame_tree = self.request(target_socket, "Page.getFrameTree").get(
+            frame_tree = self.request(self.target_socket, "Page.getFrameTree").get(
                 "frameTree", {}
             )
             self.frame_ids = self.collect_frame_ids(frame_tree)
-            self.configure_chatgpt_target(target_socket)
-        finally:
-            target_socket.close()
-        self.browser_socket = self.socket_factory(
-            browser_websocket_url,
-            timeout=2,
-            suppress_origin=True,
-        )
-        self.request(
-            self.browser_socket,
-            "Browser.setDownloadBehavior",
-            {"behavior": "default", "eventsEnabled": True},
-        )
+            self.configure_chatgpt_target()
+            self.browser_socket = self.socket_factory(
+                browser_websocket_url,
+                timeout=2,
+                suppress_origin=True,
+            )
+            self.request(
+                self.browser_socket,
+                "Browser.setDownloadBehavior",
+                {"behavior": "default", "eventsEnabled": True},
+            )
+        except Exception:
+            self.target_socket.close()
+            browser_socket = getattr(self, "browser_socket", None)
+            if browser_socket is not None:
+                browser_socket.close()
+            raise
         self.browser_socket.settimeout(0)
+        self.target_socket.settimeout(self.ACTIVITY_TIMEOUT_SECONDS)
         self.downloads: dict[str, str] = {}
         self.pending_completed: set[Path] = set()
 
-    def configure_chatgpt_target(self, connection) -> None:
+    def configure_chatgpt_target(self) -> bool:
         script = chatgpt_performance_script()
-        commands = [
-            (
-                "Emulation.setEmulatedMedia",
-                {
-                    "media": "screen",
-                    "features": [
-                        {"name": "prefers-reduced-motion", "value": "reduce"},
-                    ],
-                },
-            ),
-            ("Page.addScriptToEvaluateOnNewDocument", {"source": script}),
-            (
+        if not self.performance_script_registered:
+            commands = [
+                (
+                    "Emulation.setEmulatedMedia",
+                    {
+                        "media": "screen",
+                        "features": [
+                            {"name": "prefers-reduced-motion", "value": "reduce"},
+                        ],
+                    },
+                ),
+                ("Page.addScriptToEvaluateOnNewDocument", {"source": script}),
+            ]
+            for method, params in commands:
+                try:
+                    self.request(self.target_socket, method, params)
+                except (OSError, ValueError, websocket.WebSocketException) as error:
+                    logging.warning("内嵌 ChatGPT 性能配置 %s 失败：%s", method, error)
+                else:
+                    if method == "Page.addScriptToEvaluateOnNewDocument":
+                        self.performance_script_registered = True
+        try:
+            result = self.request(
+                self.target_socket,
                 "Runtime.evaluate",
-                {
-                    "expression": script,
-                    "returnByValue": True,
-                },
-            ),
-        ]
-        for method, params in commands:
-            try:
-                self.request(connection, method, params)
-            except (OSError, ValueError, websocket.WebSocketException) as error:
-                logging.warning("内嵌 ChatGPT 性能配置 %s 失败：%s", method, error)
+                {"expression": script, "returnByValue": True},
+            )
+        except (OSError, ValueError, websocket.WebSocketException) as error:
+            logging.warning("内嵌 ChatGPT 性能配置 Runtime.evaluate 失败：%s", error)
+            self.performance_configured = False
+        else:
+            self.performance_configured = bool(
+                result.get("result", {}).get("value")
+            )
+        return self.performance_configured
+
+    def page_activity(self) -> tuple[bool, bool]:
+        expression = """(() => ({
+  focused: document.hasFocus(),
+  generating: Boolean(document.querySelector('[data-testid="stop-button"], [data-testid*="stop-generating"]'))
+}))()"""
+        result = self.request(
+            self.target_socket,
+            "Runtime.evaluate",
+            {"expression": expression, "returnByValue": True},
+        )
+        value = result.get("result", {}).get("value", {})
+        return bool(value.get("focused")), bool(value.get("generating"))
+
+    def set_page_active(self, active: bool) -> None:
+        if self.page_active == active:
+            return
+        self.request(
+            self.target_socket,
+            "Page.setWebLifecycleState",
+            {"state": "active" if active else "frozen"},
+        )
+        self.page_active = active
 
     def request(self, connection, method: str, params=None):
         self.request_id += 1
@@ -2067,6 +2220,7 @@ class ChromeTargetDownloadCapture:
             ) as error:
                 logging.warning("无法关闭内嵌 ChatGPT 页面 target：%s", error)
         self.browser_socket.close()
+        self.target_socket.close()
         return target_closed
 
 
@@ -2397,6 +2551,8 @@ class EmbeddedChromeWidget(QWidget):
     document_downloaded = pyqtSignal(str)
     ATTACH_STABILITY_POLLS = 8
     WINDOW_SCAN_BATCH_SIZE = 4
+    LIFECYCLE_POLL_INTERVAL_MS = 1000
+    INACTIVE_FOCUS_POLLS = 5
 
     def __init__(
         self,
@@ -2425,6 +2581,7 @@ class EmbeddedChromeWidget(QWidget):
         )
         self.download_capture: ChromeTargetDownloadCapture | None = None
         self.target_poll_attempts = 0
+        self.inactive_focus_polls = 0
         try:
             debug_targets = (
                 chrome_debug_targets(session.debug_port)
@@ -2469,11 +2626,20 @@ class EmbeddedChromeWidget(QWidget):
         self.download_timer = QTimer(self)
         self.download_timer.setInterval(250)
         self.download_timer.timeout.connect(self.poll_download_capture)
+        self.lifecycle_timer = QTimer(self)
+        self.lifecycle_timer.setInterval(self.LIFECYCLE_POLL_INTERVAL_MS)
+        self.lifecycle_timer.timeout.connect(self.update_target_lifecycle)
         if self.known_debug_target_ids is not None:
             self.target_timer.start()
 
     def attach_download_capture(self) -> None:
         self.target_poll_attempts += 1
+        if self.download_capture is not None:
+            if self.download_capture.configure_chatgpt_target():
+                self.target_timer.stop()
+            elif self.target_poll_attempts >= 100:
+                self.target_timer.stop()
+            return
         try:
             targets = chrome_debug_targets(self.session.debug_port)
             target = new_chatgpt_target(self.known_debug_target_ids or set(), targets)
@@ -2490,11 +2656,35 @@ class EmbeddedChromeWidget(QWidget):
                 self.download_directory,
             )
         except (OSError, websocket.WebSocketException) as error:
-            self.target_timer.stop()
             logging.warning("无法连接内嵌 ChatGPT 下载事件：%s", error)
+            if self.target_poll_attempts >= 100:
+                self.target_timer.stop()
             return
-        self.target_timer.stop()
+        if self.download_capture.performance_configured:
+            self.target_timer.stop()
         self.download_timer.start()
+        self.lifecycle_timer.start()
+
+    def update_target_lifecycle(self) -> None:
+        if self.download_capture is None:
+            return
+        try:
+            if self.window().isActiveWindow():
+                self.inactive_focus_polls = 0
+                self.download_capture.set_page_active(True)
+                return
+            if not self.download_capture.page_active:
+                return
+            focused, generating = self.download_capture.page_activity()
+            if focused or generating:
+                self.inactive_focus_polls = 0
+                self.download_capture.set_page_active(True)
+                return
+            self.inactive_focus_polls += 1
+            if self.inactive_focus_polls >= self.INACTIVE_FOCUS_POLLS:
+                self.download_capture.set_page_active(False)
+        except (OSError, ValueError, websocket.WebSocketException) as error:
+            logging.warning("无法更新内嵌 ChatGPT 后台状态：%s", error)
 
     def poll_download_capture(self) -> None:
         if self.download_capture is None:
@@ -2610,6 +2800,7 @@ class EmbeddedChromeWidget(QWidget):
         self.guard_timer.stop()
         self.target_timer.stop()
         self.download_timer.stop()
+        self.lifecycle_timer.stop()
         target_closed = False
         if self.download_capture is not None:
             target_closed = self.download_capture.close(close_target=True)
@@ -2663,7 +2854,8 @@ class MarkdownPreview(QTextBrowser):
             ]
         ] = []
         self._pdf_images: list[Path] = []
-        self._pdf_words: list[tuple[int, int]] = []
+        self._pdf_characters: list[tuple[int, int, int]] = []
+        self._pdf_character_ordinals: dict[tuple[int, int, int], int] = {}
         self._pdf_selection_start: int | None = None
         self._pdf_selection_end: int | None = None
         self._pdf_selecting = False
@@ -2688,22 +2880,32 @@ class MarkdownPreview(QTextBrowser):
         """Display PDF pages and select text using the PDF's own word boxes."""
         self._pdf_pages = text_pages
         self._pdf_images = page_images
-        self._pdf_words = [
-            (page_index, word_index)
+        self._pdf_characters = [
+            (page_index, word_index, character_index)
             for page_index, page in enumerate(text_pages)
-            for word_index in range(len(page[2]))
+            for word_index, word in enumerate(page[2])
+            for character_index in range(len(word[4]))
         ]
+        self._pdf_character_ordinals = {
+            position: ordinal
+            for ordinal, position in enumerate(self._pdf_characters)
+        }
         self._pdf_selection_start = None
         self._pdf_selection_end = None
         self._pdf_selecting = False
         self.setTextInteractionFlags(Qt.NoTextInteraction)
         super().setHtml(page_html)
-        self.viewport().setCursor(Qt.IBeamCursor)
+        self._keep_pdf_text_cursor()
+
+    def _keep_pdf_text_cursor(self) -> None:
+        if self._pdf_pages:
+            self.viewport().setCursor(Qt.IBeamCursor)
 
     def _clear_pdf_mode(self) -> None:
         self._pdf_pages = []
         self._pdf_images = []
-        self._pdf_words = []
+        self._pdf_characters = []
+        self._pdf_character_ordinals = {}
         self._pdf_selection_start = None
         self._pdf_selection_end = None
         self._pdf_selecting = False
@@ -2719,24 +2921,27 @@ class MarkdownPreview(QTextBrowser):
             for frame in self.document().rootFrame().childFrames()
         ][: len(self._pdf_pages)]
 
-    def _pdf_word_document_rect(self, ordinal: int) -> QRectF:
-        if ordinal < 0 or ordinal >= len(self._pdf_words):
+    def _pdf_character_document_rect(self, ordinal: int) -> QRectF:
+        if ordinal < 0 or ordinal >= len(self._pdf_characters):
             return QRectF()
-        page_index, word_index = self._pdf_words[ordinal]
+        page_index, word_index, character_index = self._pdf_characters[ordinal]
         frames = self._pdf_page_frames()
         if page_index >= len(frames):
             return QRectF()
         page_width, page_height, words = self._pdf_pages[page_index]
-        x_min, y_min, x_max, y_max, _text, _line = words[word_index]
+        x_min, y_min, x_max, y_max, text, _line = words[word_index]
+        character_count = max(len(text), 1)
+        character_left = x_min + (x_max - x_min) * character_index / character_count
+        character_right = x_min + (x_max - x_min) * (character_index + 1) / character_count
         frame = frames[page_index]
         return QRectF(
-            frame.x() + x_min * frame.width() / page_width,
+            frame.x() + character_left * frame.width() / page_width,
             frame.y() + y_min * frame.height() / page_height,
-            (x_max - x_min) * frame.width() / page_width,
+            (character_right - character_left) * frame.width() / page_width,
             (y_max - y_min) * frame.height() / page_height,
         )
 
-    def _pdf_word_at(self, viewport_position) -> int | None:
+    def _pdf_character_at(self, viewport_position) -> int | None:
         document_point = QPointF(
             viewport_position.x() + self.horizontalScrollBar().value(),
             viewport_position.y() + self.verticalScrollBar().value(),
@@ -2772,11 +2977,21 @@ class MarkdownPreview(QTextBrowser):
             dy = max(y_min - page_point.y(), 0, page_point.y() - y_max)
             return dx * dx + dy * dy
 
-        word_index, _word = min(candidates, key=distance)
-        try:
-            return self._pdf_words.index((page_index, word_index))
-        except ValueError:
+        word_index, word = min(candidates, key=distance)
+        x_min, _y_min, x_max, _y_max, text, _line = word
+        if not text:
             return None
+        if x_max <= x_min:
+            character_index = 0
+        else:
+            relative = (page_point.x() - x_min) / (x_max - x_min)
+            character_index = min(
+                len(text) - 1,
+                max(0, math.floor(relative * len(text))),
+            )
+        return self._pdf_character_ordinals.get(
+            (page_index, word_index, character_index)
+        )
 
     def _pdf_selected_ordinals(self) -> range:
         if self._pdf_selection_start is None or self._pdf_selection_end is None:
@@ -2787,29 +3002,70 @@ class MarkdownPreview(QTextBrowser):
     def _pdf_selection_text(self) -> str:
         output: list[str] = []
         previous_page_line: tuple[int, int] | None = None
+        previous_word: tuple[int, int] | None = None
         previous_x_max: float | None = None
         for ordinal in self._pdf_selected_ordinals():
-            page_index, word_index = self._pdf_words[ordinal]
+            page_index, word_index, character_index = self._pdf_characters[ordinal]
             x_min, _y_min, x_max, _y_max, text, line_number = self._pdf_pages[
                 page_index
             ][2][word_index]
             page_line = (page_index, line_number)
             if previous_page_line is not None and page_line != previous_page_line:
                 output.append("\n")
-            elif previous_x_max is not None and x_min - previous_x_max > 0.8:
+            elif (
+                previous_word != (page_index, word_index)
+                and previous_x_max is not None
+                and x_min - previous_x_max > 0.8
+            ):
                 output.append(" ")
-            output.append(text)
+            output.append(text[character_index])
             previous_page_line = page_line
-            previous_x_max = x_max
+            previous_word = (page_index, word_index)
+            previous_x_max = x_min + (x_max - x_min) * (
+                character_index + 1
+            ) / max(len(text), 1)
         return "".join(output)
 
     def _pdf_selection_rects(self) -> list[QRectF]:
         horizontal = self.horizontalScrollBar().value()
         vertical = self.verticalScrollBar().value()
+        merged: list[tuple[tuple[int, int], QRectF]] = []
+        for ordinal in self._pdf_selected_ordinals():
+            page_index, word_index, _character_index = self._pdf_characters[ordinal]
+            line_number = self._pdf_pages[page_index][2][word_index][5]
+            page_line = (page_index, line_number)
+            rectangle = self._pdf_character_document_rect(ordinal)
+            if (
+                merged
+                and merged[-1][0] == page_line
+                and rectangle.left()
+                <= merged[-1][1].right() + max(4.0, rectangle.height() * 2)
+            ):
+                merged[-1] = (page_line, merged[-1][1].united(rectangle))
+            else:
+                merged.append((page_line, rectangle))
         return [
-            self._pdf_word_document_rect(ordinal).translated(-horizontal, -vertical)
-            for ordinal in self._pdf_selected_ordinals()
+            rectangle.translated(-horizontal, -vertical)
+            for _page_line, rectangle in merged
         ]
+
+    def _pdf_selection_caret_rect(self) -> QRectF:
+        if self._pdf_selection_start is None or self._pdf_selection_end is None:
+            return QRectF()
+        rectangle = self._pdf_character_document_rect(self._pdf_selection_end)
+        if rectangle.isNull():
+            return QRectF()
+        caret_x = (
+            rectangle.right()
+            if self._pdf_selection_end >= self._pdf_selection_start
+            else rectangle.left()
+        )
+        return QRectF(
+            caret_x - self.horizontalScrollBar().value() - 1,
+            rectangle.top() - self.verticalScrollBar().value(),
+            2,
+            rectangle.height(),
+        )
 
     def paintEvent(self, event) -> None:
         super().paintEvent(event)
@@ -2820,13 +3076,18 @@ class MarkdownPreview(QTextBrowser):
         painter.setBrush(QColor(14, 165, 233, 150))
         for selection_rect in self._pdf_selection_rects():
             painter.drawRect(selection_rect.adjusted(-1, -1, 1, 1))
+        caret = self._pdf_selection_caret_rect()
+        if not caret.isNull():
+            painter.setBrush(QColor(3, 105, 161))
+            painter.drawRect(caret)
         painter.end()
 
     def mousePressEvent(self, event) -> None:
         if not self._pdf_pages or event.button() != Qt.LeftButton:
             super().mousePressEvent(event)
             return
-        ordinal = self._pdf_word_at(event.pos())
+        self._keep_pdf_text_cursor()
+        ordinal = self._pdf_character_at(event.pos())
         if ordinal is None:
             self._pdf_selection_start = None
             self._pdf_selection_end = None
@@ -2840,8 +3101,10 @@ class MarkdownPreview(QTextBrowser):
     def mouseMoveEvent(self, event) -> None:
         if not self._pdf_pages or not self._pdf_selecting:
             super().mouseMoveEvent(event)
+            self._keep_pdf_text_cursor()
             return
-        ordinal = self._pdf_word_at(event.pos())
+        self._keep_pdf_text_cursor()
+        ordinal = self._pdf_character_at(event.pos())
         if ordinal is not None:
             self._pdf_selection_end = ordinal
             self.viewport().update()
@@ -2849,6 +3112,7 @@ class MarkdownPreview(QTextBrowser):
     def mouseReleaseEvent(self, event) -> None:
         if self._pdf_pages and event.button() == Qt.LeftButton:
             self._pdf_selecting = False
+            self._keep_pdf_text_cursor()
             return
         super().mouseReleaseEvent(event)
 
@@ -2875,7 +3139,9 @@ class MarkdownPreview(QTextBrowser):
             ordinals = list(self._pdf_selected_ordinals())
             if not ordinals:
                 return "", ""
-            pages = sorted({self._pdf_words[ordinal][0] + 1 for ordinal in ordinals})
+            pages = sorted(
+                {self._pdf_characters[ordinal][0] + 1 for ordinal in ordinals}
+            )
             if len(pages) == 1:
                 location = f"PDF 物理页码：第 {pages[0]} 页"
             else:
@@ -2931,10 +3197,10 @@ class MarkdownPreview(QTextBrowser):
         selected = list(self._pdf_selected_ordinals())
         if not selected:
             return
-        page_groups: dict[int, list[int]] = {}
+        page_groups: dict[int, set[int]] = {}
         for ordinal in selected:
-            page_index, word_index = self._pdf_words[ordinal]
-            page_groups.setdefault(page_index, []).append(word_index)
+            page_index, word_index, _character_index = self._pdf_characters[ordinal]
+            page_groups.setdefault(page_index, set()).add(word_index)
         crops: list[QImage] = []
         for page_index, word_indices in page_groups.items():
             if page_index >= len(self._pdf_images):
@@ -3068,6 +3334,8 @@ class PdfExportDialog(QDialog):
 
 
 class MarkdownWindow(QMainWindow):
+    RECENT_FILES_LIMIT = 10
+
     def __init__(
         self,
         initial_path: Path | None = None,
@@ -3223,12 +3491,28 @@ class MarkdownWindow(QMainWindow):
         self.settings_button.setToolTip("外观和 Markdown 行间距")
         toolbar.addWidget(self.settings_button)
 
-        self.path_button = QPushButton("")
+        self.path_toolbar = QToolBar("当前文件", self)
+        self.path_toolbar.setObjectName("filePathToolBar")
+        self.path_toolbar.setMovable(False)
+        self.addToolBarBreak(Qt.TopToolBarArea)
+        self.addToolBar(Qt.TopToolBarArea, self.path_toolbar)
+
+        self.path_button = FilePathEdit()
         self.path_button.setObjectName("documentPathButton")
-        self.path_button.setFlat(True)
-        self.path_button.setCursor(Qt.PointingHandCursor)
+        self.path_button.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Preferred)
         self.path_button.clicked.connect(self.copy_current_file_path)
-        self.statusBar().addPermanentWidget(self.path_button, 1)
+        self.path_button.returnPressed.connect(self.open_edited_file_path)
+        self.path_widget_action = self.path_toolbar.addWidget(self.path_button)
+
+        self.history_menu = QMenu(self)
+        self.history_button = QToolButton(self)
+        self.history_button.setObjectName("recentFilesButton")
+        self.history_button.setText("历史")
+        self.history_button.setPopupMode(QToolButton.InstantPopup)
+        self.history_button.setMenu(self.history_menu)
+        self.history_button.setToolTip("最近打开的文档")
+        self.path_toolbar.addWidget(self.history_button)
+        self.refresh_recent_files_menu()
 
         self.set_border_color(str(self.settings.value("borderColor", DEFAULT_BORDER_COLOR)))
         self.set_background_color(
@@ -3266,6 +3550,18 @@ class MarkdownWindow(QMainWindow):
         if not visible:
             self.release_chatgpt_view()
         if visible and self.chatgpt_view is None:
+            answer = QMessageBox.question(
+                self,
+                "内嵌 ChatGPT 提示",
+                "内嵌 ChatGPT 暂时不推荐使用，长对话可能出现响应卡顿。\n\n"
+                "建议使用 ChatGPT 网页版或桌面版。\n\n"
+                "是否仍要打开 mdview 内嵌 ChatGPT？",
+                QMessageBox.Yes | QMessageBox.Cancel,
+                QMessageBox.Cancel,
+            )
+            if answer != QMessageBox.Yes:
+                self.sync_chatgpt_action(False)
+                return
             try:
                 self.chatgpt_view = create_chatgpt_browser(self.chatgpt_dock)
             except OSError as error:
@@ -3495,6 +3791,7 @@ class MarkdownWindow(QMainWindow):
             f" border: 0; border-bottom: 2px solid {self.border_color};"
             " spacing: 5px; padding: 6px 8px;"
             " }"
+            "QToolBar#filePathToolBar { padding: 2px 8px; }"
             "QToolButton {"
             f" background-color: {self.background_color}; color: {text_color};"
             " border: 0; border-radius: 6px; padding: 6px 10px;"
@@ -3545,7 +3842,7 @@ class MarkdownWindow(QMainWindow):
             "QPlainTextEdit#markdownSource {"
             f" background-color: {input_background}; color: {text_color};"
             " }"
-            "QPushButton#documentPathButton {"
+            "QLineEdit#documentPathButton {"
             f" color: {muted_color}; text-align: left; border: 0; padding: 1px 4px;"
             " }"
         )
@@ -3556,6 +3853,47 @@ class MarkdownWindow(QMainWindow):
         file_path = str(self.current_path)
         QApplication.clipboard().setText(file_path)
         self.statusBar().showMessage(f"文件路径已复制：{file_path}", 3000)
+
+    def open_edited_file_path(self) -> None:
+        selected = Path(self.path_button.text().strip()).expanduser()
+        if self.load_file(selected):
+            self.path_button.finish_editing()
+            self.statusBar().showMessage(f"已在当前窗口打开：{self.current_path}", 5000)
+            return
+        if self.current_path is not None:
+            self.path_button.setText(str(self.current_path))
+        self.path_button.finish_editing()
+
+    def recent_file_paths(self) -> list[Path]:
+        stored = self.settings.value("recentFiles", [])
+        if isinstance(stored, str):
+            stored = [stored]
+        return [Path(value).expanduser().resolve() for value in stored or []]
+
+    def refresh_recent_files_menu(self) -> None:
+        self.history_menu.clear()
+        existing = [path for path in self.recent_file_paths() if path.is_file()]
+        self.settings.setValue("recentFiles", [str(path) for path in existing])
+        if not existing:
+            empty_action = self.history_menu.addAction("暂无历史")
+            empty_action.setEnabled(False)
+            return
+        for path in existing:
+            action = self.history_menu.addAction(path.name)
+            action.setData(str(path))
+            action.setToolTip(str(path))
+            action.triggered.connect(
+                lambda _checked=False, selected=path: self.load_file(selected)
+            )
+
+    def remember_recent_file(self, path: Path) -> None:
+        resolved = path.expanduser().resolve()
+        paths = [
+            resolved,
+            *(item for item in self.recent_file_paths() if item != resolved),
+        ][: self.RECENT_FILES_LIMIT]
+        self.settings.setValue("recentFiles", [str(item) for item in paths])
+        self.refresh_recent_files_menu()
 
     def default_include_toc(self) -> bool:
         if self.document_mode == "latex":
@@ -3679,7 +4017,10 @@ class MarkdownWindow(QMainWindow):
             self.toc_dock.show()
         self.setWindowTitle(f"{self.current_path.name} — {APP_NAME}")
         self.path_button.setText(str(self.current_path))
-        self.path_button.setToolTip("点击复制当前文件的完整路径")
+        self.path_button.setToolTip(
+            "单击复制完整路径；双击编辑，按 Enter 在当前窗口打开"
+        )
+        self.remember_recent_file(self.current_path)
         self.refresh_preview()
         return True
 

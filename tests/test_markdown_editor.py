@@ -17,6 +17,7 @@ from PyQt5.QtWidgets import (
     QLabel,
     QMessageBox,
     QSplitter,
+    QToolBar,
     QTreeWidgetItem,
 )
 
@@ -480,9 +481,14 @@ title: 测试报告
 
     def test_compiles_full_latex_document_and_renders_real_pdf_pages(self):
         source = r"""\documentclass[UTF8,a4paper]{ctexart}
+\usepackage{unicode-math}
+\IfFontExistsTF{STIX Two Math}{\setmathfont{STIX Two Math}}{}
 \begin{document}
 \section{完整 TeX 预览}
-公式：$V_t \rightarrow W_t$。
+说明：
+\[
+(V_t,W_t) \rightarrow \hat V_{t+\Delta}.
+\]
 \end{document}
 """
         with tempfile.TemporaryDirectory() as directory:
@@ -516,29 +522,42 @@ title: 测试报告
             preview = MarkdownPreview()
             preview.image_output_directory = root
             text_pages = extract_pdf_text_layout(output)
+            formula_words = text_pages[0][2]
+            formula_body = next(word for word in formula_words if word[4] in {"(V", "(𝑉"})
+            formula_accent = next(
+                word for word in formula_words if word[4] == "̂"
+            )
+            self.assertEqual(formula_accent[5], formula_body[5])
             preview.set_pdf_document(html, page_images, text_pages)
             preview.resize(1100, 800)
             preview.show()
             QApplication.processEvents()
+            self.assertEqual(preview.viewport().cursor().shape(), Qt.IBeamCursor)
             title_ordinals = [
                 ordinal
-                for ordinal, (page_index, word_index) in enumerate(preview._pdf_words)
+                for ordinal, (page_index, word_index, _character_index) in enumerate(
+                    preview._pdf_characters
+                )
                 if "完整" in text_pages[page_index][2][word_index][4]
             ]
             self.assertTrue(title_ordinals)
-            title_page, title_word = preview._pdf_words[title_ordinals[0]]
+            title_page, title_word, _character_index = preview._pdf_characters[
+                title_ordinals[0]
+            ]
             title_line = text_pages[title_page][2][title_word][5]
             title_line_ordinals = [
                 ordinal
-                for ordinal, (page_index, word_index) in enumerate(preview._pdf_words)
+                for ordinal, (page_index, word_index, _character_index) in enumerate(
+                    preview._pdf_characters
+                )
                 if page_index == title_page
                 and text_pages[page_index][2][word_index][5] == title_line
             ]
-            title_center = preview._pdf_word_document_rect(
+            title_center = preview._pdf_character_document_rect(
                 title_line_ordinals[0]
             ).center().toPoint()
             self.assertEqual(
-                preview._pdf_word_at(title_center),
+                preview._pdf_character_at(title_center),
                 title_line_ordinals[0],
             )
             preview._pdf_selection_start = title_line_ordinals[0]
@@ -547,8 +566,11 @@ title: 测试报告
             copied = QApplication.clipboard().text().replace("\xa0", " ")
             self.assertEqual(copied.casefold(), "完整 tex 预览")
             selection_rects = preview._pdf_selection_rects()
-            self.assertEqual(len(selection_rects), len(title_line_ordinals))
+            self.assertEqual(len(selection_rects), 1)
             self.assertTrue(all(rect.width() > 1 for rect in selection_rects))
+            caret = preview._pdf_selection_caret_rect()
+            self.assertFalse(caret.isNull())
+            self.assertEqual(caret.width(), 2)
             self.assertFalse(preview.textCursor().hasSelection())
             saved_paths = []
             preview.image_saved.connect(saved_paths.append)
@@ -556,6 +578,9 @@ title: 测试报告
             self.assertFalse(QApplication.clipboard().image().isNull())
             self.assertEqual(len(saved_paths), 1)
             self.assertTrue(Path(saved_paths[0]).is_file())
+            preview._pdf_selection_start = title_ordinals[0]
+            preview._pdf_selection_end = title_ordinals[0]
+            self.assertEqual(len(preview._pdf_selection_text()), 1)
             anchor_names = []
             block = document.begin()
             while block.isValid():
@@ -771,34 +796,60 @@ title: 自动驾驶世界模型
             browser.shutdown = mock.Mock()
 
             self.assertTrue(window.chatgpt_dock.isHidden())
-            with mock.patch(
-                "markdown_editor.create_chatgpt_browser",
-                return_value=browser,
-            ) as create_browser:
-                window.chatgpt_action.trigger()
+            with mock.patch.object(
+                QMessageBox, "question", return_value=QMessageBox.Yes
+            ):
+                with mock.patch(
+                    "markdown_editor.create_chatgpt_browser",
+                    return_value=browser,
+                ) as create_browser:
+                    window.chatgpt_action.trigger()
 
-                self.assertFalse(window.chatgpt_dock.isHidden())
-                self.assertTrue(window.chatgpt_action.isChecked())
-                self.assertEqual(window.chatgpt_action.text(), "隐藏 ChatGPT")
-                self.assertIs(window.chatgpt_dock.widget(), browser)
-                self.assertEqual(
-                    window.dockWidgetArea(window.chatgpt_dock),
-                    Qt.LeftDockWidgetArea,
-                )
-                self.assertEqual(
-                    window.dockWidgetArea(window.toc_dock),
-                    Qt.LeftDockWidgetArea,
-                )
+                    self.assertFalse(window.chatgpt_dock.isHidden())
+                    self.assertTrue(window.chatgpt_action.isChecked())
+                    self.assertEqual(window.chatgpt_action.text(), "隐藏 ChatGPT")
+                    self.assertIs(window.chatgpt_dock.widget(), browser)
+                    self.assertEqual(
+                        window.dockWidgetArea(window.chatgpt_dock),
+                        Qt.LeftDockWidgetArea,
+                    )
+                    self.assertEqual(
+                        window.dockWidgetArea(window.toc_dock),
+                        Qt.LeftDockWidgetArea,
+                    )
 
-                window.chatgpt_action.trigger()
-                self.assertTrue(window.chatgpt_dock.isHidden())
-                self.assertEqual(window.chatgpt_action.text(), "ChatGPT")
-                browser.shutdown.assert_called_once()
+                    window.chatgpt_action.trigger()
+                    self.assertTrue(window.chatgpt_dock.isHidden())
+                    self.assertEqual(window.chatgpt_action.text(), "ChatGPT")
+                    browser.shutdown.assert_called_once()
 
-                window.chatgpt_action.trigger()
+                    window.chatgpt_action.trigger()
 
             self.assertEqual(create_browser.call_count, 2)
             self.assertIs(window.chatgpt_dock.widget(), browser)
+
+    def test_chatgpt_panel_warns_and_defaults_to_not_opening(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            with mock.patch.object(
+                QMessageBox,
+                "question",
+                return_value=QMessageBox.Cancel,
+            ) as question:
+                with mock.patch(
+                    "markdown_editor.create_chatgpt_browser",
+                ) as create_browser:
+                    window.chatgpt_action.trigger()
+
+            question.assert_called_once()
+            warning_text = question.call_args.args[2]
+            self.assertIn("内嵌 ChatGPT 暂时不推荐使用", warning_text)
+            self.assertIn("网页版或桌面版", warning_text)
+            self.assertEqual(question.call_args.args[-1], QMessageBox.Cancel)
+            create_browser.assert_not_called()
+            self.assertTrue(window.chatgpt_dock.isHidden())
+            self.assertFalse(window.chatgpt_action.isChecked())
 
     def test_chatgpt_panel_reports_missing_remote_chrome(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -808,8 +859,11 @@ title: 自动驾驶世界模型
                 "markdown_editor.create_chatgpt_browser",
                 side_effect=OSError("没有远程 Chrome"),
             ):
-                with mock.patch.object(QMessageBox, "warning") as warning:
-                    window.chatgpt_action.trigger()
+                with mock.patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.Yes
+                ):
+                    with mock.patch.object(QMessageBox, "warning") as warning:
+                        window.chatgpt_action.trigger()
 
             self.assertTrue(window.chatgpt_dock.isHidden())
             self.assertFalse(window.chatgpt_action.isChecked())
@@ -830,7 +884,10 @@ title: 自动驾驶世界模型
                 "markdown_editor.create_chatgpt_browser",
                 return_value=browser,
             ):
-                window.chatgpt_action.trigger()
+                with mock.patch.object(
+                    QMessageBox, "question", return_value=QMessageBox.Yes
+                ):
+                    window.chatgpt_action.trigger()
 
             window.chatgpt_dock.hide()
 
@@ -1277,15 +1334,89 @@ title: 自动驾驶世界模型
                 self.frame_id = frame_id
                 self.responses = []
                 self.sent_messages = []
+                self.closed = False
 
             def send(self, raw_message):
                 self.sent_messages.append(raw_message)
                 message = json.loads(raw_message)
-                result = (
-                    {"frameTree": {"frame": {"id": self.frame_id}}}
-                    if message["method"] == "Page.getFrameTree"
-                    else {}
+                if message["method"] == "Page.getFrameTree":
+                    result = {"frameTree": {"frame": {"id": self.frame_id}}}
+                elif message["method"] == "Runtime.evaluate":
+                    result = {"result": {"type": "boolean", "value": True}}
+                else:
+                    result = {}
+                self.responses.append(
+                    json.dumps({"id": message["id"], "result": result})
                 )
+
+            def recv(self):
+                if self.responses:
+                    return self.responses.pop(0)
+                raise BlockingIOError
+
+            def settimeout(self, _timeout):
+                pass
+
+            def close(self):
+                self.closed = True
+
+        target_socket = FakeSocket(frame_id="embedded-frame")
+        browser_socket = FakeSocket()
+        sockets = iter([target_socket, browser_socket])
+        capture = ChromeTargetDownloadCapture(
+            ChromeDebugTarget(
+                target_id="embedded-target",
+                url="https://chatgpt.com/",
+                websocket_url="ws://embedded-target",
+            ),
+            "ws://browser",
+            Path("/tmp"),
+            socket_factory=lambda *_args, **_kwargs: next(sockets),
+        )
+
+        target_messages = [json.loads(raw) for raw in target_socket.sent_messages]
+        methods = [message["method"] for message in target_messages]
+        self.assertIn("Emulation.setEmulatedMedia", methods)
+        self.assertIn("Page.addScriptToEvaluateOnNewDocument", methods)
+        self.assertIn("Runtime.evaluate", methods)
+        script = chatgpt_performance_script()
+        self.assertIn(r'data-testid^=\"conversation-turn-\"', script)
+        self.assertIn("content-visibility", script)
+        self.assertIn("mdviewEmbeddedChatgpt", script)
+        self.assertNotIn(":has(", script)
+        self.assertTrue(capture.performance_configured)
+        browser_methods = [
+            json.loads(raw)["method"] for raw in browser_socket.sent_messages
+        ]
+        self.assertEqual(browser_methods, ["Browser.setDownloadBehavior"])
+        capture.close()
+        self.assertTrue(target_socket.closed)
+
+    def test_embedded_target_freezes_only_after_it_is_idle_and_unfocused(self):
+        class FakeSocket:
+            def __init__(self, frame_id=None):
+                self.frame_id = frame_id
+                self.responses = []
+                self.sent_messages = []
+
+            def send(self, raw_message):
+                self.sent_messages.append(raw_message)
+                message = json.loads(raw_message)
+                method = message["method"]
+                expression = message.get("params", {}).get("expression", "")
+                if method == "Page.getFrameTree":
+                    result = {"frameTree": {"frame": {"id": self.frame_id}}}
+                elif method == "Runtime.evaluate" and "document.hasFocus" in expression:
+                    result = {
+                        "result": {
+                            "type": "object",
+                            "value": {"focused": False, "generating": False},
+                        }
+                    }
+                elif method == "Runtime.evaluate":
+                    result = {"result": {"type": "boolean", "value": True}}
+                else:
+                    result = {}
                 self.responses.append(
                     json.dumps({"id": message["id"], "result": result})
                 )
@@ -1315,21 +1446,107 @@ title: 自动驾驶世界模型
             socket_factory=lambda *_args, **_kwargs: next(sockets),
         )
 
-        target_messages = [json.loads(raw) for raw in target_socket.sent_messages]
-        methods = [message["method"] for message in target_messages]
-        self.assertIn("Emulation.setEmulatedMedia", methods)
-        self.assertIn("Page.addScriptToEvaluateOnNewDocument", methods)
-        self.assertIn("Runtime.evaluate", methods)
-        script = chatgpt_performance_script()
-        self.assertIn(r'data-testid^=\"conversation-turn-\"', script)
-        self.assertIn("content-visibility", script)
-        self.assertIn("data-writing-block", script)
-        self.assertIn("backdrop-filter", script)
-        browser_methods = [
-            json.loads(raw)["method"] for raw in browser_socket.sent_messages
+        self.assertEqual(capture.page_activity(), (False, False))
+        capture.set_page_active(False)
+        capture.set_page_active(False)
+        capture.set_page_active(True)
+
+        lifecycle_states = [
+            message["params"]["state"]
+            for message in map(json.loads, target_socket.sent_messages)
+            if message["method"] == "Page.setWebLifecycleState"
         ]
-        self.assertEqual(browser_methods, ["Browser.setDownloadBehavior"])
+        self.assertEqual(lifecycle_states, ["frozen", "active"])
         capture.close()
+
+    def test_embedded_widget_waits_before_freezing_an_unfocused_chatgpt_page(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=mock.Mock(),
+                    known_debug_targets=[],
+                )
+        capture = mock.Mock()
+        capture.page_activity.return_value = (False, False)
+        capture.page_active = True
+        browser.download_capture = capture
+
+        for _ in range(browser.INACTIVE_FOCUS_POLLS - 1):
+            browser.update_target_lifecycle()
+        capture.set_page_active.assert_not_called()
+
+        browser.update_target_lifecycle()
+        capture.set_page_active.assert_called_once_with(False)
+        capture.reset_mock()
+        capture.page_active = False
+        with mock.patch.object(browser, "isActiveWindow", return_value=True):
+            browser.update_target_lifecycle()
+        capture.set_page_active.assert_called_once_with(True)
+        capture.page_activity.assert_not_called()
+        browser.close()
+
+    def test_embedded_widget_retries_a_transient_target_connection_failure(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        target = ChromeDebugTarget(
+            target_id="embedded-target",
+            url="https://chatgpt.com/",
+            websocket_url="ws://embedded-target",
+        )
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=mock.Mock(),
+                    known_debug_targets=[],
+                )
+        capture = mock.Mock()
+        capture.performance_configured = True
+        capture.close.return_value = True
+        with mock.patch(
+            "markdown_editor.chrome_debug_targets",
+            return_value=[target],
+        ):
+            with mock.patch(
+                "markdown_editor.chrome_browser_websocket_url",
+                return_value="ws://browser",
+            ):
+                with mock.patch(
+                    "markdown_editor.ChromeTargetDownloadCapture",
+                    side_effect=[OSError("transient"), capture],
+                ):
+                    browser.attach_download_capture()
+                    self.assertTrue(browser.target_timer.isActive())
+                    browser.attach_download_capture()
+
+        self.assertIs(browser.download_capture, capture)
+        self.assertFalse(browser.target_timer.isActive())
+        self.assertTrue(browser.download_timer.isActive())
+        self.assertTrue(browser.lifecycle_timer.isActive())
+        browser.shutdown()
 
     def test_downloaded_markdown_replaces_the_current_document(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1410,6 +1627,7 @@ title: 自动驾驶世界模型
 
         self.assertGreaterEqual(browser.guard_timer.interval(), 1000)
         self.assertGreaterEqual(browser.download_timer.interval(), 250)
+        self.assertGreaterEqual(browser.lifecycle_timer.interval(), 1000)
         browser.close()
 
     def test_embedded_chrome_shutdown_closes_its_page_target(self):
@@ -1707,25 +1925,44 @@ title: 自动驾驶世界模型
 
         self.assertTrue(
             prompt.startswith(
-                "请修改你在本次对话中刚才提供的完整 LaTeX 源文件："
+                "请修改你在本次对话中提供的 LaTeX 源文件。"
             )
         )
-        self.assertIn("\n\nreport.tex\n\n", prompt)
+        self.assertNotIn("report.tex", prompt)
+        self.assertNotIn("/home/qwer", prompt)
         self.assertIn(
-            "请以该会话附件为唯一源文件，不要重新构建文档，"
-            "也不要使用其他历史版本。",
+            "请以该会话附件作为唯一源文件：",
             prompt,
         )
-        self.assertIn("需要修改的位置：", prompt)
-        self.assertIn("- PDF 物理页码：第 7 页", prompt)
-        self.assertIn("- 选中原文：", prompt)
-        self.assertIn("W_t 给出具体沿哪些点走。", prompt)
-        self.assertIn("修改要求（由我补充）：", prompt)
-        self.assertIn("只修改这一个位置", prompt)
-        self.assertIn("不要修改其他相同或相似的内容", prompt)
-        self.assertIn("保留原有结构、公式编号、label、引用、目录和排版", prompt)
-        self.assertIn("完成后检查 LaTeX 语法", prompt)
-        self.assertIn("返回可下载的完整 `.tex` 文件", prompt)
+        self.assertIn("不要使用其他历史版本", prompt)
+        self.assertIn("不要根据 PDF 重新构建整个文档", prompt)
+        self.assertIn("不要使用我本地路径中的文件", prompt)
+        self.assertIn("如果无法读取该附件，请先说明", prompt)
+        self.assertIn("【章节/页码】\nPDF 物理页码：第 7 页", prompt)
+        self.assertIn("【原文】\n<<<\nW_t 给出具体沿哪些点走。\n>>>", prompt)
+        self.assertNotIn("请在该位置进行以下修改：", prompt)
+        self.assertNotIn("（填写你的修改目标）", prompt)
+        self.assertNotIn("例如：", prompt)
+        self.assertIn("只修改对应位置", prompt)
+        self.assertIn("保留原有公式编号、label、引用、目录和排版风格", prompt)
+        self.assertIn("检查 LaTeX 语法是否有效", prompt)
+        self.assertIn("返回完整 `.tex` 文件", prompt)
+        self.assertNotIn("额外定制要求：", prompt)
+        self.assertEqual(prompt.count("【修改要求】"), 1)
+        self.assertTrue(prompt.endswith("【修改要求】\n"))
+
+    def test_chatgpt_edit_prompt_uses_generic_markdown_checks(self):
+        prompt = build_chatgpt_edit_prompt(
+            Path("/home/qwer/Downloads/notes.md"),
+            "选中的 Markdown 段落。",
+            "实时渲染预览",
+        )
+
+        self.assertIn("本次对话中提供的 Markdown 源文件", prompt)
+        self.assertIn("检查 Markdown 语法是否有效", prompt)
+        self.assertNotIn("XeLaTeX", prompt)
+        self.assertNotIn("undefined control sequence", prompt)
+        self.assertIn("返回完整 `.md` 文件", prompt)
 
     def test_pdf_selection_generates_its_physical_page_location(self):
         preview = MarkdownPreview()
@@ -1733,14 +1970,38 @@ title: 自动驾驶世界模型
             (100.0, 100.0, [(1, 1, 20, 10, "第一页", 1)]),
             (100.0, 100.0, [(1, 1, 20, 10, "第二页", 1)]),
         ]
-        preview._pdf_words = [(0, 0), (1, 0)]
+        preview._pdf_characters = [
+            *((0, 0, index) for index in range(len("第一页"))),
+            *((1, 0, index) for index in range(len("第二页"))),
+        ]
         preview._pdf_selection_start = 0
-        preview._pdf_selection_end = 1
+        preview._pdf_selection_end = len(preview._pdf_characters) - 1
 
         selected, location = preview.selected_text_and_location()
 
         self.assertEqual(selected, "第一页\n第二页")
         self.assertEqual(location, "PDF 物理页码：第 1–2 页")
+
+    def test_pdf_selection_keeps_the_text_cursor_while_dragging(self):
+        preview = MarkdownPreview()
+        preview._pdf_pages = [(100.0, 100.0, [(1, 1, 20, 10, "文字", 1)])]
+        preview._pdf_characters = [(0, 0, 0), (0, 0, 1)]
+        event = mock.Mock()
+        event.button.return_value = Qt.LeftButton
+
+        preview.viewport().setCursor(Qt.ArrowCursor)
+        with mock.patch.object(preview, "_pdf_character_at", return_value=0):
+            preview.mousePressEvent(event)
+        self.assertEqual(preview.viewport().cursor().shape(), Qt.IBeamCursor)
+
+        preview.viewport().setCursor(Qt.ArrowCursor)
+        with mock.patch.object(preview, "_pdf_character_at", return_value=1):
+            preview.mouseMoveEvent(event)
+        self.assertEqual(preview.viewport().cursor().shape(), Qt.IBeamCursor)
+
+        preview.viewport().setCursor(Qt.ArrowCursor)
+        preview.mouseReleaseEvent(event)
+        self.assertEqual(preview.viewport().cursor().shape(), Qt.IBeamCursor)
 
     def test_chatgpt_location_conversation_is_copied_without_an_extra_dialog(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1761,12 +2022,14 @@ title: 自动驾驶世界模型
 
             dialog.assert_not_called()
             copied = QApplication.clipboard().text()
-            self.assertIn("report.tex", copied)
+            self.assertNotIn("report.tex", copied)
             self.assertNotIn(str(source_path), copied)
             self.assertNotIn("本地参考路径", copied)
             self.assertIn("原来的定义。", copied)
             self.assertIn("第 3 页", copied)
-            self.assertTrue(copied.rstrip().endswith("修改要求（由我补充）："))
+            self.assertNotIn("请在该位置进行以下修改：", copied)
+            self.assertNotIn("额外定制要求：", copied)
+            self.assertTrue(copied.endswith("【修改要求】\n"))
 
     def test_clicking_file_path_copies_the_complete_file_path(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1776,13 +2039,67 @@ title: 自动驾驶世界模型
             settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
             window = MarkdownWindow(source_path, settings=settings)
 
-            window.path_button.click()
+            window.path_button.clicked.emit()
 
             self.assertEqual(QApplication.clipboard().text(), str(source_path))
+            self.assertIn("文件路径已复制", window.statusBar().currentMessage())
             self.assertEqual(
                 window.path_button.toolTip(),
-                "点击复制当前文件的完整路径",
+                "单击复制完整路径；双击编辑，按 Enter 在当前窗口打开",
             )
+
+    def test_file_path_has_its_own_toolbar_and_edits_in_place(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "notes.md"
+            other_path = root / "other.md"
+            source_path.write_text("# Notes", encoding="utf-8")
+            other_path.write_text("# Other", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(source_path, settings=settings)
+
+            self.assertIsInstance(window.path_toolbar, QToolBar)
+            self.assertIs(
+                window.path_toolbar.widgetForAction(window.path_widget_action),
+                window.path_button,
+            )
+            self.assertTrue(window.path_button.isReadOnly())
+            event = mock.Mock()
+            event.button.return_value = Qt.LeftButton
+            window.path_button.mouseDoubleClickEvent(event)
+            self.assertFalse(window.path_button.isReadOnly())
+            window.path_button.setText(str(other_path))
+            window.path_button.returnPressed.emit()
+
+            self.assertTrue(window.path_button.isReadOnly())
+            self.assertEqual(window.current_path, other_path)
+            self.assertEqual(window.editor.toPlainText(), "# Other")
+
+    def test_recent_file_history_persists_and_reopens_in_the_current_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            first_path = root / "first.md"
+            second_path = root / "second.md"
+            first_path.write_text("# First", encoding="utf-8")
+            second_path.write_text("# Second", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(first_path, settings=settings)
+
+            self.assertTrue(window.load_file(second_path))
+
+            stored = settings.value("recentFiles")
+            self.assertEqual(stored[:2], [str(second_path), str(first_path)])
+            first_action = next(
+                action
+                for action in window.history_menu.actions()
+                if action.data() == str(first_path)
+            )
+            with mock.patch("markdown_editor.subprocess.Popen") as launch:
+                first_action.trigger()
+
+            launch.assert_not_called()
+            self.assertEqual(window.current_path, first_path)
+            self.assertEqual(window.editor.toPlainText(), "# First")
 
 
 if __name__ == "__main__":
