@@ -1222,6 +1222,17 @@ title: 自动驾驶世界模型
             self.assertEqual(settings.value("borderColor"), "#7c3aed")
             self.assertEqual(window.border_action.text(), "边框颜色")
 
+    def test_chatgpt_and_toc_have_a_visible_vertical_divider(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+
+            window.set_border_color("#7c3aed")
+
+            stylesheet = window.styleSheet()
+            self.assertIn("QDockWidget#chatgptDock", stylesheet)
+            self.assertIn("border-right: 3px solid #7c3aed", stylesheet)
+
     def test_background_color_covers_app_and_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
             settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
