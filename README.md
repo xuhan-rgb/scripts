@@ -130,7 +130,7 @@ mdview /path/to/document.tex
 `mdview` 是指向 `~/scripts/markdown_editor.py` 的命令入口。窗口内也可点击“打开文件”选择 Markdown 或完整 LaTeX 文档。主工具栏只保留“打开文件 / 目录 / ChatGPT / 原文 / 预览 PDF / 导出 PDF / 设置”，并提供以下功能：
 
 - “显示原文 / 隐藏原文”：切换双栏与纯预览模式。
-- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧嵌入真实的系统 Chrome 窗口，形成“Chrome ChatGPT / 目录 / 正文”三栏布局。`mdview` 查找通过 `--remote-debugging-port=9223` 运行的 Chrome，复用其 `user-data-dir` 与登录状态，再让 Chrome 原生打开 `--app=https://chatgpt.com/`；官网样式、登录、会话、模型选择、上传、语音、复制和下载均由 Chrome 本身处理，不再使用 Qt WebEngine。下载捕获按本次内嵌页面的 Chrome target/frame ID 隔离：只有该页面下载完成的 `.md`、`.markdown`、`.tex`、`.latex` 或 `.ltx` 会自动替换当前 `mdview` 文档并立即渲染；普通 Chrome 窗口的下载不会触发。该窗口嵌入依赖 X11，不支持 Wayland。
+- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧嵌入真实的系统 Chrome 窗口，形成“Chrome ChatGPT / 目录 / 正文”三栏布局。`mdview` 查找通过 `--remote-debugging-port=9223` 运行的 Chrome，复用其 `user-data-dir` 与登录状态，再让 Chrome 原生打开 `--app=https://chatgpt.com/`；官网样式、登录、会话、模型选择、上传、语音、复制和下载均由 Chrome 本身处理，不再使用 Qt WebEngine。下载捕获按本次内嵌页面的 Chrome target/frame ID 隔离：只有该页面下载完成的 `.md`、`.markdown`、`.tex`、`.latex` 或 `.ltx` 会自动替换当前 `mdview` 文档并立即渲染；普通 Chrome 窗口的下载不会触发。隐藏面板、点击 Dock 关闭按钮或退出 `mdview` 时会同时关闭本次内嵌页面 target，避免 Chrome renderer 在后台累积并拖慢输入。该窗口嵌入依赖 X11，不支持 Wayland。
 - 预览右键复制：选中右侧渲染内容后，可选择“复制为文字”或“复制为图片”；图片会保留标题、表格和公式的排版，同时写入剪贴板和唯一文件 `/tmp/mdview-selection-*.png`，完整路径显示在状态栏。
 - “复制为 ChatGPT 对话…”：根据当前文件、选中原文和 PDF 物理页码自动生成定位对话，末尾保留“修改要求（由我补充）”；粘贴到 ChatGPT 后填写具体改法即可。提示词要求只修改命中位置并返回完整同格式文件。
 - 左侧目录：默认隐藏，点击“显示目录”后展示 Markdown 的一级至三级标题；点击目录项跳转到右侧对应章节，编辑时实时更新。

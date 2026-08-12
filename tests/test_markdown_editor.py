@@ -814,6 +814,29 @@ title: 自动驾驶世界模型
             self.assertFalse(window.chatgpt_action.isChecked())
             warning.assert_called_once()
 
+    def test_closing_the_chatgpt_dock_releases_its_browser_target(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(settings=settings)
+            window.show()
+            QApplication.processEvents()
+            browser = QLabel("ChatGPT browser")
+            browser.shutdown = mock.Mock()
+            with mock.patch(
+                "markdown_editor.create_chatgpt_browser",
+                return_value=browser,
+            ):
+                window.chatgpt_action.trigger()
+
+            window.chatgpt_dock.hide()
+
+            browser.shutdown.assert_called_once()
+            self.assertIsNone(window.chatgpt_view)
+            self.assertEqual(window.chatgpt_action.text(), "ChatGPT")
+
     def test_remote_chrome_discovery_reuses_the_browser_profile(self):
         with tempfile.TemporaryDirectory() as directory:
             proc_root = Path(directory)
@@ -966,6 +989,44 @@ title: 自动驾驶世界模型
         attach.assert_called_once_with(0x200)
         browser.close()
 
+    def test_embedded_chrome_scans_existing_windows_in_small_batches(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        existing_windows = set(range(0x100, 0x164))
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value=existing_windows,
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=mock.Mock(),
+                    known_debug_targets=[],
+                )
+        browser.poll_timer.stop()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value=existing_windows,
+        ):
+            with mock.patch(
+                "markdown_editor.read_x11_window_info",
+                return_value=None,
+            ) as read_info:
+                browser.attach_new_chrome_window()
+
+        self.assertLessEqual(
+            read_info.call_count,
+            browser.WINDOW_SCAN_BATCH_SIZE,
+        )
+        browser.close()
+
     def test_embedded_chrome_can_adopt_an_existing_chatgpt_app_window(self):
         session = RemoteChromeSession(
             executable="/opt/google/chrome/chrome",
@@ -1111,8 +1172,10 @@ title: 自动驾驶世界模型
                 self.frame_id = frame_id
                 self.events = list(events or [])
                 self.responses = []
+                self.sent_messages = []
 
             def send(self, raw_message):
+                self.sent_messages.append(raw_message)
                 message = json.loads(raw_message)
                 if message["method"] == "Page.getFrameTree":
                     result = {
@@ -1120,6 +1183,8 @@ title: 自动驾驶世界模型
                             "frame": {"id": self.frame_id},
                         }
                     }
+                elif message["method"] == "Target.closeTarget":
+                    result = {"success": True}
                 else:
                     result = {}
                 self.responses.append(
@@ -1198,7 +1263,12 @@ title: 自动驾驶世界模型
                 capture.poll_completed_downloads(),
                 [embedded_path.resolve()],
             )
-            capture.close()
+            self.assertTrue(capture.close(close_target=True))
+            sent_methods = [
+                json.loads(message)["method"]
+                for message in browser_socket.sent_messages
+            ]
+            self.assertIn("Target.closeTarget", sent_methods)
 
     def test_downloaded_markdown_replaces_the_current_document(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1238,6 +1308,80 @@ title: 自动驾驶世界模型
         ):
             with self.assertRaisesRegex(OSError, "父节点校验失败"):
                 controller.reparent(0x200, 0x300, 640, 720)
+
+    def test_x11_resize_flushes_without_blocking_for_server_sync(self):
+        x11 = mock.Mock()
+        controller = X11WindowController(library=x11, display=1)
+
+        controller.resize(0x200, 640, 720)
+
+        x11.XMoveResizeWindow.assert_called_once_with(
+            1,
+            0x200,
+            0,
+            0,
+            640,
+            720,
+        )
+        x11.XFlush.assert_called_once_with(1)
+        x11.XSync.assert_not_called()
+
+    def test_embedded_chrome_background_checks_leave_room_for_input_events(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=mock.Mock(),
+                    known_debug_targets=[],
+                )
+
+        self.assertGreaterEqual(browser.guard_timer.interval(), 1000)
+        self.assertGreaterEqual(browser.download_timer.interval(), 250)
+        browser.close()
+
+    def test_embedded_chrome_shutdown_closes_its_page_target(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        x11_connection = mock.Mock()
+        with mock.patch(
+            "markdown_editor.x11_client_window_ids",
+            return_value={0x100},
+        ):
+            with mock.patch("markdown_editor.subprocess.Popen"):
+                from markdown_editor import EmbeddedChromeWidget
+
+                browser = EmbeddedChromeWidget(
+                    session,
+                    x11_connection=x11_connection,
+                    known_debug_targets=[],
+                )
+        browser.window_id = 0x200
+        capture = mock.Mock()
+        capture.close.return_value = True
+        browser.download_capture = capture
+
+        browser.shutdown()
+
+        capture.close.assert_called_once_with(close_target=True)
+        x11_connection.destroy.assert_not_called()
+        x11_connection.close.assert_called_once()
 
     def test_preview_pdf_builds_a_cache_file_and_opens_it(self):
         with tempfile.TemporaryDirectory() as directory:

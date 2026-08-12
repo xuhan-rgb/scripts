@@ -1861,6 +1861,7 @@ class ChromeTargetDownloadCapture:
         *,
         socket_factory=None,
     ) -> None:
+        self.target_id = target.target_id
         self.download_directory = Path(download_directory).expanduser().resolve()
         self.socket_factory = socket_factory or websocket.create_connection
         self.request_id = 0
@@ -1972,8 +1973,26 @@ class ChromeTargetDownloadCapture:
             completed.append(path)
         return completed
 
-    def close(self) -> None:
+    def close(self, *, close_target: bool = False) -> bool:
+        target_closed = False
+        if close_target:
+            try:
+                self.browser_socket.settimeout(2)
+                result = self.request(
+                    self.browser_socket,
+                    "Target.closeTarget",
+                    {"targetId": self.target_id},
+                )
+                target_closed = bool(result.get("success"))
+            except (
+                OSError,
+                ValueError,
+                json.JSONDecodeError,
+                websocket.WebSocketException,
+            ) as error:
+                logging.warning("无法关闭内嵌 ChatGPT 页面 target：%s", error)
         self.browser_socket.close()
+        return target_closed
 
 
 @dataclass(frozen=True)
@@ -2189,6 +2208,7 @@ class X11WindowController:
         ]
         self.library.XMapWindow.argtypes = [display_pointer, window]
         self.library.XDestroyWindow.argtypes = [display_pointer, window]
+        self.library.XFlush.argtypes = [display_pointer]
         self.library.XSync.argtypes = [display_pointer, ctypes.c_int]
         self.library.XCloseDisplay.argtypes = [display_pointer]
         self.library.XChangeWindowAttributes.argtypes = [
@@ -2212,6 +2232,7 @@ class X11WindowController:
             "XMoveResizeWindow",
             "XMapWindow",
             "XDestroyWindow",
+            "XFlush",
             "XSync",
             "XCloseDisplay",
             "XChangeWindowAttributes",
@@ -2281,7 +2302,7 @@ class X11WindowController:
             max(width, 1),
             max(height, 1),
         )
-        self.library.XSync(self.display, False)
+        self.library.XFlush(self.display)
 
     def destroy(self, window_id: int) -> None:
         self.library.XDestroyWindow(self.display, window_id)
@@ -2300,6 +2321,7 @@ class EmbeddedChromeWidget(QWidget):
     attach_failed = pyqtSignal(str)
     document_downloaded = pyqtSignal(str)
     ATTACH_STABILITY_POLLS = 8
+    WINDOW_SCAN_BATCH_SIZE = 4
 
     def __init__(
         self,
@@ -2319,6 +2341,8 @@ class EmbeddedChromeWidget(QWidget):
         self.candidate_window_id: int | None = None
         self.candidate_seen_count = 0
         self.known_window_ids = x11_client_window_ids()
+        self.known_window_candidates = sorted(self.known_window_ids)
+        self.known_window_scan_index = 0
         self.download_directory = (
             Path(download_directory).expanduser().resolve()
             if download_directory is not None
@@ -2358,17 +2382,17 @@ class EmbeddedChromeWidget(QWidget):
             raise OSError(f"无法启动 Chrome：{error}") from error
 
         self.poll_timer = QTimer(self)
-        self.poll_timer.setInterval(100)
+        self.poll_timer.setInterval(150)
         self.poll_timer.timeout.connect(self.attach_new_chrome_window)
         self.poll_timer.start()
         self.guard_timer = QTimer(self)
-        self.guard_timer.setInterval(250)
+        self.guard_timer.setInterval(1000)
         self.guard_timer.timeout.connect(self.verify_embedded_window)
         self.target_timer = QTimer(self)
         self.target_timer.setInterval(100)
         self.target_timer.timeout.connect(self.attach_download_capture)
         self.download_timer = QTimer(self)
-        self.download_timer.setInterval(100)
+        self.download_timer.setInterval(250)
         self.download_timer.timeout.connect(self.poll_download_capture)
         if self.known_debug_target_ids is not None:
             self.target_timer.start()
@@ -2417,9 +2441,18 @@ class EmbeddedChromeWidget(QWidget):
             self.fail_attachment(str(error))
             return
         new_window_ids = current_window_ids - self.known_window_ids
-        candidates = list(sorted(new_window_ids)) + list(
-            sorted(current_window_ids & self.known_window_ids)
-        )
+        if self.candidate_window_id is not None:
+            candidates = [self.candidate_window_id]
+        elif new_window_ids:
+            candidates = list(sorted(new_window_ids))
+        else:
+            start = self.known_window_scan_index
+            stop = min(
+                start + self.WINDOW_SCAN_BATCH_SIZE,
+                len(self.known_window_candidates),
+            )
+            candidates = self.known_window_candidates[start:stop]
+            self.known_window_scan_index = stop
         matched_window_id = None
         for window_id in candidates:
             window = read_x11_window_info(window_id)
@@ -2440,7 +2473,7 @@ class EmbeddedChromeWidget(QWidget):
             self.candidate_seen_count = 0
         if self.poll_attempts >= 100:
             self.fail_attachment(
-                "Chrome 已启动，但 10 秒内没有找到新的 ChatGPT 窗口。"
+                "Chrome 已启动，但 15 秒内没有找到新的 ChatGPT 窗口。"
             )
 
     def attach_window(self, window_id: int) -> None:
@@ -2457,6 +2490,8 @@ class EmbeddedChromeWidget(QWidget):
         self.poll_timer.stop()
         self.window_id = window_id
         self.status_label.hide()
+        self.setAttribute(Qt.WA_NoSystemBackground, True)
+        self.setAttribute(Qt.WA_OpaquePaintEvent, True)
         self.guard_timer.start()
 
     def verify_embedded_window(self) -> None:
@@ -2500,9 +2535,12 @@ class EmbeddedChromeWidget(QWidget):
         self.guard_timer.stop()
         self.target_timer.stop()
         self.download_timer.stop()
+        target_closed = False
         if self.download_capture is not None:
-            self.download_capture.close()
+            target_closed = self.download_capture.close(close_target=True)
             self.download_capture = None
+        if target_closed:
+            self.window_id = None
         if self.window_id is not None:
             self.x11_connection.destroy(self.window_id)
             self.window_id = None
@@ -3063,7 +3101,9 @@ class MarkdownWindow(QMainWindow):
         self.chatgpt_action.setToolTip("在目录左侧嵌入或隐藏远程 Chrome ChatGPT")
         self.chatgpt_action.triggered.connect(self.set_chatgpt_visible)
         toolbar.addAction(self.chatgpt_action)
-        self.chatgpt_dock.visibilityChanged.connect(self.sync_chatgpt_action)
+        self.chatgpt_dock.visibilityChanged.connect(
+            self.handle_chatgpt_visibility_changed
+        )
         self.source_action = QAction("显示原文", self)
         self.source_action.setCheckable(True)
         self.source_action.triggered.connect(self.set_source_visible)
@@ -3148,13 +3188,8 @@ class MarkdownWindow(QMainWindow):
         self.chatgpt_dock.update()
 
     def set_chatgpt_visible(self, visible: bool) -> None:
-        if not visible and self.chatgpt_view is not None:
-            shutdown = getattr(self.chatgpt_view, "shutdown", None)
-            if shutdown is not None:
-                shutdown()
-            self.chatgpt_dock.setWidget(None)
-            self.chatgpt_view.deleteLater()
-            self.chatgpt_view = None
+        if not visible:
+            self.release_chatgpt_view()
         if visible and self.chatgpt_view is None:
             try:
                 self.chatgpt_view = create_chatgpt_browser(self.chatgpt_dock)
@@ -3185,6 +3220,22 @@ class MarkdownWindow(QMainWindow):
     def sync_chatgpt_action(self, visible: bool) -> None:
         self.chatgpt_action.setChecked(visible)
         self.chatgpt_action.setText("隐藏 ChatGPT" if visible else "ChatGPT")
+
+    def handle_chatgpt_visibility_changed(self, visible: bool) -> None:
+        self.sync_chatgpt_action(visible)
+        if not visible:
+            self.release_chatgpt_view()
+
+    def release_chatgpt_view(self) -> None:
+        if self.chatgpt_view is None:
+            return
+        view = self.chatgpt_view
+        self.chatgpt_view = None
+        shutdown = getattr(view, "shutdown", None)
+        if shutdown is not None:
+            shutdown()
+        self.chatgpt_dock.setWidget(None)
+        view.deleteLater()
 
     def open_downloaded_document(self, filename: str) -> None:
         document_path = Path(filename).expanduser().resolve()
@@ -3217,10 +3268,7 @@ class MarkdownWindow(QMainWindow):
         )
 
     def closeEvent(self, event) -> None:
-        if self.chatgpt_view is not None:
-            shutdown = getattr(self.chatgpt_view, "shutdown", None)
-            if shutdown is not None:
-                shutdown()
+        self.release_chatgpt_view()
         super().closeEvent(event)
 
     def navigate_to_toc_item(self, item: QTreeWidgetItem, _column: int) -> None:
