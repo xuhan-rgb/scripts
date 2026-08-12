@@ -5,6 +5,8 @@ from __future__ import annotations
 
 import argparse
 import base64
+import ctypes
+import ctypes.util
 import html
 import io
 import json
@@ -1885,33 +1887,114 @@ def x11_window_matches_session(
     )
 
 
-def x11_parent_window_id(window_id: int) -> int | None:
-    completed = subprocess.run(
-        ["xwininfo", "-id", hex(window_id), "-tree"],
-        check=False,
-        capture_output=True,
-        text=True,
-        timeout=3,
-    )
-    if completed.returncode != 0:
-        return None
-    match = re.search(r"Parent window id:\s*(0x[0-9a-fA-F]+)", completed.stdout)
-    return int(match.group(1), 16) if match else None
-
-
 class X11WindowController:
-    """Reparent and size one external X11 window via xdotool."""
+    """Reparent a Chrome window directly through libX11."""
 
-    def _run(self, arguments: list[str]) -> None:
-        completed = subprocess.run(
-            ["xdotool", *arguments],
-            check=False,
-            capture_output=True,
-            text=True,
-            timeout=5,
+    class SetWindowAttributes(ctypes.Structure):
+        _fields_ = [
+            ("background_pixmap", ctypes.c_ulong),
+            ("background_pixel", ctypes.c_ulong),
+            ("border_pixmap", ctypes.c_ulong),
+            ("border_pixel", ctypes.c_ulong),
+            ("bit_gravity", ctypes.c_int),
+            ("win_gravity", ctypes.c_int),
+            ("backing_store", ctypes.c_int),
+            ("backing_planes", ctypes.c_ulong),
+            ("backing_pixel", ctypes.c_ulong),
+            ("save_under", ctypes.c_int),
+            ("event_mask", ctypes.c_long),
+            ("do_not_propagate_mask", ctypes.c_long),
+            ("override_redirect", ctypes.c_int),
+            ("colormap", ctypes.c_ulong),
+            ("cursor", ctypes.c_ulong),
+        ]
+
+    def __init__(self, *, library=None, display=None) -> None:
+        if library is None:
+            library_path = ctypes.util.find_library("X11")
+            if library_path is None:
+                raise OSError("没有找到 libX11。")
+            library = ctypes.CDLL(library_path)
+        self.library = library
+        if isinstance(library, ctypes.CDLL):
+            self._configure_signatures()
+        if display is None:
+            display = self.library.XOpenDisplay(None)
+        if not display:
+            raise OSError("无法连接当前 X11 DISPLAY。")
+        self.display = display
+        self.closed = False
+
+    def _configure_signatures(self) -> None:
+        display_pointer = ctypes.c_void_p
+        window = ctypes.c_ulong
+        self.library.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.library.XOpenDisplay.restype = display_pointer
+        self.library.XUnmapWindow.argtypes = [display_pointer, window]
+        self.library.XReparentWindow.argtypes = [
+            display_pointer,
+            window,
+            window,
+            ctypes.c_int,
+            ctypes.c_int,
+        ]
+        self.library.XMoveResizeWindow.argtypes = [
+            display_pointer,
+            window,
+            ctypes.c_int,
+            ctypes.c_int,
+            ctypes.c_uint,
+            ctypes.c_uint,
+        ]
+        self.library.XMapWindow.argtypes = [display_pointer, window]
+        self.library.XDestroyWindow.argtypes = [display_pointer, window]
+        self.library.XSync.argtypes = [display_pointer, ctypes.c_int]
+        self.library.XCloseDisplay.argtypes = [display_pointer]
+        self.library.XChangeWindowAttributes.argtypes = [
+            display_pointer,
+            window,
+            ctypes.c_ulong,
+            ctypes.POINTER(self.SetWindowAttributes),
+        ]
+        self.library.XQueryTree.argtypes = [
+            display_pointer,
+            window,
+            ctypes.POINTER(window),
+            ctypes.POINTER(window),
+            ctypes.POINTER(ctypes.POINTER(window)),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self.library.XFree.argtypes = [ctypes.c_void_p]
+        for name in (
+            "XUnmapWindow",
+            "XReparentWindow",
+            "XMoveResizeWindow",
+            "XMapWindow",
+            "XDestroyWindow",
+            "XSync",
+            "XCloseDisplay",
+            "XChangeWindowAttributes",
+            "XQueryTree",
+            "XFree",
+        ):
+            getattr(self.library, name).restype = ctypes.c_int
+
+    def parent_window_id(self, window_id: int) -> int | None:
+        root = ctypes.c_ulong()
+        parent = ctypes.c_ulong()
+        children = ctypes.POINTER(ctypes.c_ulong)()
+        child_count = ctypes.c_uint()
+        result = self.library.XQueryTree(
+            self.display,
+            window_id,
+            ctypes.byref(root),
+            ctypes.byref(parent),
+            ctypes.byref(children),
+            ctypes.byref(child_count),
         )
-        if completed.returncode != 0:
-            raise OSError(completed.stderr.strip() or "X11 窗口操作失败。")
+        if children:
+            self.library.XFree(children)
+        return int(parent.value) if result else None
 
     def reparent(
         self,
@@ -1920,27 +2003,28 @@ class X11WindowController:
         width: int,
         height: int,
     ) -> None:
-        child = str(child_id)
-        self._run(
-            [
-                "windowunmap",
-                child,
-                "windowreparent",
-                child,
-                str(parent_id),
-                "windowmove",
-                child,
-                "0",
-                "0",
-                "windowsize",
-                child,
-                str(max(width, 1)),
-                str(max(height, 1)),
-                "windowmap",
-                child,
-            ]
+        attributes = self.SetWindowAttributes()
+        attributes.override_redirect = 1
+        self.library.XUnmapWindow(self.display, child_id)
+        self.library.XSync(self.display, False)
+        self.library.XChangeWindowAttributes(
+            self.display,
+            child_id,
+            1 << 9,
+            ctypes.byref(attributes),
         )
-        actual_parent = x11_parent_window_id(child_id)
+        self.library.XReparentWindow(self.display, child_id, parent_id, 0, 0)
+        self.library.XMoveResizeWindow(
+            self.display,
+            child_id,
+            0,
+            0,
+            max(width, 1),
+            max(height, 1),
+        )
+        self.library.XMapWindow(self.display, child_id)
+        self.library.XSync(self.display, False)
+        actual_parent = self.parent_window_id(child_id)
         if actual_parent != parent_id:
             actual = hex(actual_parent) if actual_parent is not None else "unknown"
             raise OSError(
@@ -1948,28 +2032,25 @@ class X11WindowController:
             )
 
     def resize(self, window_id: int, width: int, height: int) -> None:
-        window = str(window_id)
-        self._run(
-            [
-                "windowmove",
-                window,
-                "0",
-                "0",
-                "windowsize",
-                window,
-                str(max(width, 1)),
-                str(max(height, 1)),
-            ]
+        self.library.XMoveResizeWindow(
+            self.display,
+            window_id,
+            0,
+            0,
+            max(width, 1),
+            max(height, 1),
         )
+        self.library.XSync(self.display, False)
 
     def destroy(self, window_id: int) -> None:
-        try:
-            self._run(["windowclose", str(window_id)])
-        except OSError:
-            pass
+        self.library.XDestroyWindow(self.display, window_id)
+        self.library.XSync(self.display, False)
 
     def close(self) -> None:
-        return
+        if self.closed:
+            return
+        self.library.XCloseDisplay(self.display)
+        self.closed = True
 
 
 class EmbeddedChromeWidget(QWidget):
@@ -2079,7 +2160,7 @@ def create_chatgpt_browser(parent=None) -> EmbeddedChromeWidget:
         raise OSError("Chrome 窗口嵌入只支持 X11，当前桌面正在使用 Wayland。")
     if not os.environ.get("DISPLAY"):
         raise OSError("没有检测到 X11 DISPLAY，无法嵌入 Chrome 窗口。")
-    missing_tools = [tool for tool in ("xprop", "xwininfo", "xdotool") if shutil.which(tool) is None]
+    missing_tools = [tool for tool in ("xprop", "xwininfo") if shutil.which(tool) is None]
     if missing_tools:
         raise OSError(
             f"缺少 X11 工具：{', '.join(missing_tools)}。请运行 mdview 安装脚本。"

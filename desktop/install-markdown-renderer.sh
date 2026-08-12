@@ -60,6 +60,7 @@ packages=(
     desktop-file-utils
     fonts-noto-cjk
     graphviz
+    libx11-6
     libglib2.0-bin
     pandoc
     poppler-utils
@@ -72,7 +73,6 @@ packages=(
     texlive-xetex
     x11-utils
     xdg-utils
-    xdotool
 )
 
 if ! command -v node >/dev/null || ! command -v npm >/dev/null; then
@@ -111,7 +111,7 @@ import matplotlib
 import PyQt5
 PY
 
-for command in pandoc xelatex kpsewhich dot pdftocairo pdftotext pdfinfo xdotool xprop xwininfo; do
+for command in pandoc xelatex kpsewhich dot pdftocairo pdftotext pdfinfo xprop xwininfo; do
     command -v "$command" >/dev/null \
         || die "$command was not installed successfully."
 done

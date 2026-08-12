@@ -965,22 +965,28 @@ title: 自动驾驶世界模型
         x11_connection.close.assert_called_once()
 
     def test_x11_reparent_requires_the_expected_parent(self):
-        controller = X11WindowController()
-        with mock.patch.object(controller, "_run") as xdotool:
-            with mock.patch(
-                "markdown_editor.x11_parent_window_id",
-                return_value=0x300,
-            ):
-                controller.reparent(0x200, 0x300, 640, 720)
-        xdotool.assert_called_once()
+        x11 = mock.Mock()
+        controller = X11WindowController(library=x11, display=1)
+        with mock.patch.object(
+            controller,
+            "parent_window_id",
+            return_value=0x300,
+        ):
+            controller.reparent(0x200, 0x300, 640, 720)
 
-        with mock.patch.object(controller, "_run"):
-            with mock.patch(
-                "markdown_editor.x11_parent_window_id",
-                return_value=0x400,
-            ):
-                with self.assertRaisesRegex(OSError, "父节点校验失败"):
-                    controller.reparent(0x200, 0x300, 640, 720)
+        x11.XUnmapWindow.assert_called_once_with(1, 0x200)
+        x11.XChangeWindowAttributes.assert_called_once()
+        x11.XReparentWindow.assert_called_once_with(1, 0x200, 0x300, 0, 0)
+        x11.XMoveResizeWindow.assert_called_once_with(1, 0x200, 0, 0, 640, 720)
+        x11.XMapWindow.assert_called_once_with(1, 0x200)
+
+        with mock.patch.object(
+            controller,
+            "parent_window_id",
+            return_value=0x400,
+        ):
+            with self.assertRaisesRegex(OSError, "父节点校验失败"):
+                controller.reparent(0x200, 0x300, 640, 720)
 
     def test_preview_pdf_builds_a_cache_file_and_opens_it(self):
         with tempfile.TemporaryDirectory() as directory:

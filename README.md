@@ -165,7 +165,7 @@ python3 -m pip install -r requirements-markdown.txt
 PDF 导出必须具备 Pandoc + XeLaTeX。在 Ubuntu/Debian 安装：
 
 ```bash
-sudo apt install python3-pyqt5 pandoc texlive-xetex texlive-lang-chinese texlive-latex-extra texlive-pictures fonts-noto-cjk graphviz poppler-utils x11-utils xdotool
+sudo apt install python3-pyqt5 pandoc texlive-xetex texlive-lang-chinese texlive-latex-extra texlive-pictures fonts-noto-cjk graphviz poppler-utils x11-utils libx11-6
 ```
 
 导出使用 `markdown_pdf/template.tex`，生成封面、可选三级目录、页眉页脚、论文式表格和中文数学排版。封面与页眉可通过 Markdown 开头的 YAML 设置：
