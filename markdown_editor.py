@@ -2682,6 +2682,7 @@ class MarkdownWindow(QMainWindow):
         self.chatgpt_view = None
         self.chatgpt_dock = QDockWidget("ChatGPT", self)
         self.chatgpt_dock.setObjectName("chatgptDock")
+        self.chatgpt_dock.setProperty("tocVisible", True)
         self.chatgpt_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.chatgpt_dock.setMinimumWidth(380)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.chatgpt_dock)
@@ -2763,7 +2764,7 @@ class MarkdownWindow(QMainWindow):
         self.path_button.setObjectName("documentPathButton")
         self.path_button.setFlat(True)
         self.path_button.setCursor(Qt.PointingHandCursor)
-        self.path_button.clicked.connect(self.copy_current_directory)
+        self.path_button.clicked.connect(self.copy_current_file_path)
         self.statusBar().addPermanentWidget(self.path_button, 1)
 
         self.set_border_color(str(self.settings.value("borderColor", DEFAULT_BORDER_COLOR)))
@@ -2789,6 +2790,10 @@ class MarkdownWindow(QMainWindow):
     def sync_toc_action(self, visible: bool) -> None:
         self.toc_action.setChecked(visible)
         self.toc_action.setText("隐藏目录" if visible else "显示目录")
+        self.chatgpt_dock.setProperty("tocVisible", visible)
+        self.chatgpt_dock.style().unpolish(self.chatgpt_dock)
+        self.chatgpt_dock.style().polish(self.chatgpt_dock)
+        self.chatgpt_dock.update()
 
     def set_chatgpt_visible(self, visible: bool) -> None:
         if not visible and self.chatgpt_view is not None:
@@ -3001,7 +3006,8 @@ class MarkdownWindow(QMainWindow):
             "QSplitter#sourcePreviewSplitter {"
             f" border: 3px solid {self.border_color};"
             " }"
-            "QDockWidget#chatgptDock {"
+            "QDockWidget#chatgptDock { border-right: 0; }"
+            'QDockWidget#chatgptDock[tocVisible="true"] {'
             f" border-right: 3px solid {self.border_color};"
             " }"
             "QDockWidget#chatgptDock::title {"
@@ -3031,12 +3037,12 @@ class MarkdownWindow(QMainWindow):
             " }"
         )
 
-    def copy_current_directory(self) -> None:
+    def copy_current_file_path(self) -> None:
         if self.current_path is None:
             return
-        directory = str(self.current_path.parent)
-        QApplication.clipboard().setText(directory)
-        self.statusBar().showMessage(f"目录已复制：{directory}", 3000)
+        file_path = str(self.current_path)
+        QApplication.clipboard().setText(file_path)
+        self.statusBar().showMessage(f"文件路径已复制：{file_path}", 3000)
 
     def default_include_toc(self) -> bool:
         if self.document_mode == "latex":
@@ -3160,7 +3166,7 @@ class MarkdownWindow(QMainWindow):
             self.toc_dock.show()
         self.setWindowTitle(f"{self.current_path.name} — {APP_NAME}")
         self.path_button.setText(str(self.current_path))
-        self.path_button.setToolTip("点击复制当前 Markdown 所在目录")
+        self.path_button.setToolTip("点击复制当前文件的完整路径")
         self.refresh_preview()
         return True
 

@@ -142,7 +142,7 @@ mdview /path/to/document.tex
 - “预览 PDF”：在 `~/.cache/mdview/` 生成临时 PDF 并用系统默认阅读器打开；Markdown 预览默认不生成正文目录，完整 TeX 预览遵循源文件中的 `\tableofcontents`。
 - 完整 `.tex` 预览：自动运行两遍 XeLaTeX，再把真实 PDF 页面连续显示在软件内；鼠标选择框直接使用 Poppler 提取的 PDF 单词坐标，不叠加会发生错位的透明 HTML 排版，可选择和复制正文。左侧目录读取 XeLaTeX 生成的 `.toc` 与 PDF 命名目标，点击后按物理页及页内坐标精确跳转。TikZ、页码和排版不经过 Markdown/Pandoc。
 - “导出 PDF”：Markdown 使用 Pandoc → 论文风格 LaTeX 模板 → XeLaTeX；完整 `.tex` 文档直接使用 XeLaTeX。
-- 底部文件路径：点击后复制当前 Markdown 所在目录。实时预览不再画虚拟分页线或页码；PDF 仍使用 LaTeX 的真实分页和页码。
+- 底部文件路径：点击后复制当前 Markdown/LaTeX 文件的完整路径，包含文件名和扩展名。实时预览不再画虚拟分页线或页码；PDF 仍使用 LaTeX 的真实分页和页码。
 
 如果远程调试 Chrome 尚未运行，可先启动一次；端口只监听本机：
 

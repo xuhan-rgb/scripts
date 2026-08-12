@@ -1230,8 +1230,16 @@ title: 自动驾驶世界模型
             window.set_border_color("#7c3aed")
 
             stylesheet = window.styleSheet()
-            self.assertIn("QDockWidget#chatgptDock", stylesheet)
+            self.assertIn(
+                'QDockWidget#chatgptDock[tocVisible="true"]',
+                stylesheet,
+            )
             self.assertIn("border-right: 3px solid #7c3aed", stylesheet)
+            self.assertTrue(window.chatgpt_dock.property("tocVisible"))
+
+            window.set_toc_visible(False)
+
+            self.assertFalse(window.chatgpt_dock.property("tocVisible"))
 
     def test_background_color_covers_app_and_is_persisted(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1295,7 +1303,7 @@ title: 自动驾驶世界模型
             self.assertIn("复制为文字", action_texts)
             self.assertIn("复制为图片", action_texts)
 
-    def test_clicking_file_path_copies_its_directory(self):
+    def test_clicking_file_path_copies_the_complete_file_path(self):
         with tempfile.TemporaryDirectory() as directory:
             root = Path(directory)
             source_path = root / "notes.md"
@@ -1305,7 +1313,11 @@ title: 自动驾驶世界模型
 
             window.path_button.click()
 
-            self.assertEqual(QApplication.clipboard().text(), str(root))
+            self.assertEqual(QApplication.clipboard().text(), str(source_path))
+            self.assertEqual(
+                window.path_button.toolTip(),
+                "点击复制当前文件的完整路径",
+            )
 
 
 if __name__ == "__main__":
