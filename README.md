@@ -130,7 +130,7 @@ mdview /path/to/document.tex
 `mdview` 是指向 `~/scripts/markdown_editor.py` 的命令入口。窗口内也可点击“打开文件”选择 Markdown 或完整 LaTeX 文档。主工具栏只保留“打开文件 / 目录 / ChatGPT / 原文 / 预览 PDF / 导出 PDF / 设置”，并提供以下功能：
 
 - “显示原文 / 隐藏原文”：切换双栏与纯预览模式。
-- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧嵌入真实的系统 Chrome 窗口，形成“Chrome ChatGPT / 目录 / 正文”三栏布局。`mdview` 查找通过 `--remote-debugging-port=9223` 运行的 Chrome，复用其 `user-data-dir` 与登录状态，再让 Chrome 原生打开 `--app=https://chatgpt.com/`；官网样式、登录、会话、模型选择、上传、语音、复制和下载均由 Chrome 本身处理，不再使用 Qt WebEngine。该窗口嵌入依赖 X11，不支持 Wayland。
+- “ChatGPT / 隐藏 ChatGPT”：在文档目录左侧嵌入真实的系统 Chrome 窗口，形成“Chrome ChatGPT / 目录 / 正文”三栏布局。`mdview` 查找通过 `--remote-debugging-port=9223` 运行的 Chrome，复用其 `user-data-dir` 与登录状态，再让 Chrome 原生打开 `--app=https://chatgpt.com/`；官网样式、登录、会话、模型选择、上传、语音、复制和下载均由 Chrome 本身处理，不再使用 Qt WebEngine。ChatGPT 下载完成的 `.tex`、`.latex` 或 `.ltx` 文件会被捕获，并自动在新的 `mdview` 窗口渲染，不覆盖当前文档。该窗口嵌入依赖 X11，不支持 Wayland。
 - 预览右键复制：选中右侧渲染内容后，可选择“复制为文字”或“复制为图片”；图片会保留标题、表格和公式的排版，同时写入剪贴板和唯一文件 `/tmp/mdview-selection-*.png`，完整路径显示在状态栏。
 - 左侧目录：默认显示 Markdown 的一级至三级标题；点击目录项跳转到右侧对应章节，编辑时实时更新，可用“隐藏目录 / 显示目录”切换。
 - “设置”：收纳背景颜色、整体边框颜色和 Markdown 行间距；不再将低频选项平铺在主工具栏。

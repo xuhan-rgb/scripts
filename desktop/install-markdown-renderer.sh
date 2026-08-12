@@ -180,7 +180,7 @@ printf '  Command:       %s [document.md|document.tex]\n' "$command_path"
 printf '  PDF pipeline:  Pandoc -> XeLaTeX (ctexart)\n'
 printf '  PDF preview:   Real pages + coordinate-accurate Poppler selection\n'
 printf '  Image copies:  Clipboard + /tmp/mdview-selection-*.png\n'
-printf '  ChatGPT:       Real Chrome window embedded through X11 reparenting\n'
+printf '  ChatGPT:       Embedded Chrome + automatic downloaded TeX rendering\n'
 printf '  TikZ preview:  XeLaTeX -> pdftocairo (PDF export stays vector)\n'
 printf '  Mermaid:       %s + %s\n' "$(command -v npm)" "$browser"
 printf '  Desktop entry: %s\n' "$desktop_path"

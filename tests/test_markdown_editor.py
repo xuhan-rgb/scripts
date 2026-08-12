@@ -28,6 +28,7 @@ from markdown_editor import (
     ascii_flow_to_mermaid,
     compile_latex_document,
     configure_latex_toc,
+    chrome_download_directory,
     create_chatgpt_browser,
     extract_pdf_text_layout,
     extract_toc_entries,
@@ -850,6 +851,31 @@ title: 自动驾驶世界模型
             ],
         )
 
+    def test_chrome_download_directory_uses_the_remote_profile_setting(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            profile = root / "chrome" / "Default"
+            download_directory = root / "ChatGPT Downloads"
+            profile.mkdir(parents=True)
+            profile.joinpath("Preferences").write_text(
+                '{"download": {"default_directory": "'
+                + str(download_directory)
+                + '"}}',
+                encoding="utf-8",
+            )
+            session = RemoteChromeSession(
+                executable="/opt/google/chrome/chrome",
+                user_data_dir=str(root / "chrome"),
+                profile_directory="Default",
+                debug_port=9223,
+                pid=100,
+            )
+
+            self.assertEqual(
+                chrome_download_directory(session),
+                download_directory,
+            )
+
     def test_remote_chrome_window_match_rejects_auxiliary_windows(self):
         session = RemoteChromeSession(
             executable="/opt/google/chrome/chrome",
@@ -1037,6 +1063,69 @@ title: 自动驾驶世界模型
         )
         browser.window_id = None
         browser.close()
+
+    def test_embedded_chrome_emits_a_completed_tex_download_once(self):
+        session = RemoteChromeSession(
+            executable="/opt/google/chrome/chrome",
+            user_data_dir="/tmp/chrome-profile",
+            profile_directory="Default",
+            debug_port=9223,
+            pid=100,
+        )
+        x11_connection = mock.Mock()
+        with tempfile.TemporaryDirectory() as directory:
+            download_directory = Path(directory)
+            with mock.patch(
+                "markdown_editor.x11_client_window_ids",
+                return_value={0x100},
+            ):
+                with mock.patch("markdown_editor.subprocess.Popen"):
+                    from markdown_editor import EmbeddedChromeWidget
+
+                    browser = EmbeddedChromeWidget(
+                        session,
+                        x11_connection=x11_connection,
+                        download_directory=download_directory,
+                    )
+            browser.poll_timer.stop()
+            browser.download_timer.stop()
+            downloaded = []
+            browser.tex_downloaded.connect(downloaded.append)
+            partial_path = download_directory / "report.tex.crdownload"
+            final_path = download_directory / "report.tex"
+            partial_path.write_text("partial", encoding="utf-8")
+
+            browser.check_tex_downloads()
+            self.assertEqual(downloaded, [])
+
+            partial_path.unlink()
+            final_path.write_text("\\documentclass{article}", encoding="utf-8")
+            browser.check_tex_downloads()
+            browser.check_tex_downloads()
+            browser.check_tex_downloads()
+
+            self.assertEqual(downloaded, [str(final_path.resolve())])
+            browser.close()
+
+    def test_downloaded_tex_opens_in_a_new_mdview_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            tex_path = root / "report.tex"
+            tex_path.write_text("\\documentclass{article}", encoding="utf-8")
+
+            with mock.patch("markdown_editor.subprocess.Popen") as launch:
+                window.open_downloaded_tex(str(tex_path))
+
+            launch.assert_called_once_with(
+                [
+                    os.sys.executable,
+                    str(Path("markdown_editor.py").resolve()),
+                    str(tex_path.resolve()),
+                ],
+                start_new_session=True,
+            )
 
     def test_x11_reparent_requires_the_expected_parent(self):
         x11 = mock.Mock()

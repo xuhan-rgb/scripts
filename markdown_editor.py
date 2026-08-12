@@ -79,6 +79,7 @@ from PyQt5.QtWidgets import (
 
 APP_NAME = "Markdown Renderer"
 CHATGPT_URL = QUrl("https://chatgpt.com/")
+TEX_DOCUMENT_SUFFIXES = {".tex", ".latex", ".ltx"}
 MARKDOWN_EXTENSIONS = ("extra", "sane_lists")
 DEFAULT_BORDER_COLOR = "#2563eb"
 DEFAULT_BACKGROUND_COLOR = "#ffffff"
@@ -1736,6 +1737,29 @@ class RemoteChromeSession:
     pid: int
 
 
+def chrome_download_directory(
+    session: RemoteChromeSession,
+    fallback_home: Path | None = None,
+) -> Path:
+    """Return the download directory configured for the remote Chrome profile."""
+    fallback = (fallback_home or Path.home()).expanduser() / "Downloads"
+    if not session.user_data_dir:
+        return fallback.resolve()
+    preferences_path = (
+        Path(session.user_data_dir).expanduser()
+        / (session.profile_directory or "Default")
+        / "Preferences"
+    )
+    try:
+        preferences = json.loads(preferences_path.read_text(encoding="utf-8"))
+        configured = preferences.get("download", {}).get("default_directory")
+    except (OSError, json.JSONDecodeError, AttributeError):
+        configured = None
+    if not isinstance(configured, str) or not configured.strip():
+        return fallback.resolve()
+    return Path(os.path.expandvars(configured)).expanduser().resolve()
+
+
 @dataclass(frozen=True)
 class X11WindowInfo:
     window_id: int
@@ -2058,6 +2082,7 @@ class EmbeddedChromeWidget(QWidget):
     """Host a real Chrome app window inside Qt through an X11 foreign window."""
 
     attach_failed = pyqtSignal(str)
+    tex_downloaded = pyqtSignal(str)
     ATTACH_STABILITY_POLLS = 8
 
     def __init__(
@@ -2066,6 +2091,7 @@ class EmbeddedChromeWidget(QWidget):
         parent=None,
         *,
         x11_connection=None,
+        download_directory: Path | None = None,
     ) -> None:
         super().__init__(parent)
         self.setAttribute(Qt.WA_NativeWindow, True)
@@ -2076,6 +2102,13 @@ class EmbeddedChromeWidget(QWidget):
         self.candidate_window_id: int | None = None
         self.candidate_seen_count = 0
         self.known_window_ids = x11_client_window_ids()
+        self.download_directory = (
+            Path(download_directory).expanduser().resolve()
+            if download_directory is not None
+            else chrome_download_directory(session)
+        )
+        self.known_tex_files = self.tex_file_versions()
+        self.pending_tex_files: dict[Path, tuple[int, int]] = {}
 
         self.layout = QVBoxLayout(self)
         self.layout.setContentsMargins(0, 0, 0, 0)
@@ -2101,6 +2134,52 @@ class EmbeddedChromeWidget(QWidget):
         self.guard_timer = QTimer(self)
         self.guard_timer.setInterval(250)
         self.guard_timer.timeout.connect(self.verify_embedded_window)
+        self.download_timer = QTimer(self)
+        self.download_timer.setInterval(500)
+        self.download_timer.timeout.connect(self.check_tex_downloads)
+        self.download_timer.start()
+
+    def tex_file_versions(self) -> dict[Path, tuple[int, int]]:
+        if not self.download_directory.is_dir():
+            return {}
+        versions = {}
+        try:
+            paths = list(self.download_directory.iterdir())
+        except OSError:
+            return {}
+        for path in paths:
+            if (
+                not path.is_file()
+                or path.suffix.casefold() not in TEX_DOCUMENT_SUFFIXES
+            ):
+                continue
+            try:
+                stat = path.stat()
+            except OSError:
+                continue
+            versions[path.resolve()] = (stat.st_mtime_ns, stat.st_size)
+        return versions
+
+    def check_tex_downloads(self) -> None:
+        current_files = self.tex_file_versions()
+        current_paths = set(current_files)
+        for path in list(self.pending_tex_files):
+            if path not in current_paths:
+                self.pending_tex_files.pop(path, None)
+        for path, version in current_files.items():
+            if self.known_tex_files.get(path) == version:
+                self.pending_tex_files.pop(path, None)
+                continue
+            partial_path = path.with_name(path.name + ".crdownload")
+            if partial_path.exists() or version[1] <= 0:
+                self.pending_tex_files.pop(path, None)
+                continue
+            if self.pending_tex_files.get(path) != version:
+                self.pending_tex_files[path] = version
+                continue
+            self.pending_tex_files.pop(path, None)
+            self.known_tex_files[path] = version
+            self.tex_downloaded.emit(str(path))
 
     def attach_new_chrome_window(self) -> None:
         self.poll_attempts += 1
@@ -2191,6 +2270,7 @@ class EmbeddedChromeWidget(QWidget):
     def shutdown(self) -> None:
         self.poll_timer.stop()
         self.guard_timer.stop()
+        self.download_timer.stop()
         if self.window_id is not None:
             self.x11_connection.destroy(self.window_id)
             self.window_id = None
@@ -2818,6 +2898,9 @@ class MarkdownWindow(QMainWindow):
                 self.chatgpt_action.blockSignals(False)
                 QMessageBox.warning(self, "无法打开 ChatGPT", str(error))
                 return
+            tex_downloaded = getattr(self.chatgpt_view, "tex_downloaded", None)
+            if tex_downloaded is not None:
+                tex_downloaded.connect(self.open_downloaded_tex)
             self.chatgpt_dock.setWidget(self.chatgpt_view)
         self.chatgpt_dock.setVisible(visible)
         self.sync_chatgpt_action(visible)
@@ -2831,6 +2914,26 @@ class MarkdownWindow(QMainWindow):
     def sync_chatgpt_action(self, visible: bool) -> None:
         self.chatgpt_action.setChecked(visible)
         self.chatgpt_action.setText("隐藏 ChatGPT" if visible else "ChatGPT")
+
+    def open_downloaded_tex(self, filename: str) -> None:
+        document_path = Path(filename).expanduser().resolve()
+        if (
+            document_path.suffix.casefold() not in TEX_DOCUMENT_SUFFIXES
+            or not document_path.is_file()
+        ):
+            return
+        try:
+            subprocess.Popen(
+                [sys.executable, str(Path(__file__).resolve()), str(document_path)],
+                start_new_session=True,
+            )
+        except OSError as error:
+            QMessageBox.warning(self, "无法打开 TeX", str(error))
+            return
+        self.statusBar().showMessage(
+            f"已捕获 ChatGPT 下载并打开：{document_path}",
+            5000,
+        )
 
     def closeEvent(self, event) -> None:
         if self.chatgpt_view is not None:
