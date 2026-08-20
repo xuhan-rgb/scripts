@@ -12,6 +12,8 @@ from pathlib import Path
 from typing import Any, Callable
 
 from PyQt5.QtCore import (
+    QEvent,
+    QPoint,
     QProcess,
     QProcessEnvironment,
     QSettings,
@@ -142,7 +144,10 @@ class QuotaOverlay(QWidget):
     def __init__(self, settings: QSettings) -> None:
         super().__init__(
             None,
-            Qt.Tool | Qt.FramelessWindowHint | Qt.WindowStaysOnTopHint,
+            Qt.Tool
+            | Qt.FramelessWindowHint
+            | Qt.WindowStaysOnTopHint
+            | Qt.X11BypassWindowManagerHint,
         )
         self.settings = settings
         self.drag_offset = None
@@ -154,14 +159,17 @@ class QuotaOverlay(QWidget):
         frame = QFrame(self)
         frame.setObjectName("overlayFrame")
         layout = QVBoxLayout(frame)
-        layout.setContentsMargins(14, 10, 14, 10)
-        layout.setSpacing(3)
+        layout.setContentsMargins(12, 5, 12, 5)
+        layout.setSpacing(1)
         self.account_label = QLabel("Codex · checking")
         self.account_label.setObjectName("overlayAccount")
         self.quota_label = QLabel("Quota: --")
         self.quota_label.setObjectName("overlayQuota")
         layout.addWidget(self.account_label)
         layout.addWidget(self.quota_label)
+        self.drag_targets = (frame, self.account_label, self.quota_label)
+        for target in self.drag_targets:
+            target.installEventFilter(self)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(0, 0, 0, 0)
@@ -173,11 +181,51 @@ class QuotaOverlay(QWidget):
             QLabel#overlayQuota { color: #e2e8f0; font: 10px 'Ubuntu Sans'; }
             """
         )
+        self.adjustSize()
         position = settings.value("overlayPosition")
+        bypass_positioned = settings.value(
+            "overlayBypassPositioned", False, type=bool
+        )
+        if position is not None and not bypass_positioned:
+            screen = QApplication.primaryScreen()
+            position.setY(screen.geometry().top() + 4 if screen is not None else 4)
+            settings.setValue("overlayPosition", position)
+        settings.setValue("overlayBypassPositioned", True)
         if position is not None:
+            position = self.bounded_position(position)
             self.move(position)
+            settings.setValue("overlayPosition", position)
         else:
-            self.move(280, 8)
+            self.move_to_default_position()
+
+    def bounded_position(self, position: QPoint) -> QPoint:
+        screen = QApplication.screenAt(position)
+        if screen is None:
+            screen = QApplication.primaryScreen()
+        if screen is None:
+            return QPoint(max(0, position.x()), max(0, position.y()))
+
+        geometry = screen.geometry()
+        maximum_x = max(geometry.left(), geometry.right() - self.width() + 1)
+        maximum_y = max(geometry.top(), geometry.bottom() - self.height() + 1)
+        return QPoint(
+            max(geometry.left(), min(position.x(), maximum_x)),
+            max(geometry.top(), min(position.y(), maximum_y)),
+        )
+
+    def move_to_default_position(self) -> None:
+        screen = QApplication.primaryScreen()
+        if screen is None:
+            self.move(self.bounded_position(QPoint(16, 4)))
+            return
+        self.move(
+            self.bounded_position(
+                QPoint(
+                    screen.availableGeometry().left() + 16,
+                    screen.geometry().top() + 4,
+                )
+            )
+        )
 
     def set_quota(self, quota: dict[str, Any]) -> None:
         plan = f" · {quota['plan_type']}" if quota.get("plan_type") else ""
@@ -188,30 +236,48 @@ class QuotaOverlay(QWidget):
             f"resets in {format_countdown(window['resets_at'])}"
         )
         self.adjustSize()
+        self.move(self.bounded_position(self.pos()))
 
     def set_api_mode(self, provider: str) -> None:
         self.account_label.setText(f"Codex · API · {provider or 'provider'}")
         self.quota_label.setText("No account quota")
         self.adjustSize()
+        self.move(self.bounded_position(self.pos()))
 
     def set_error(self, account: str, message: str = "Quota unavailable") -> None:
         self.account_label.setText(f"Codex · {account or 'account'}")
         self.quota_label.setText(message)
         self.adjustSize()
+        self.move(self.bounded_position(self.pos()))
+
+    def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
+        if watched in self.drag_targets:
+            if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
+                self.mousePressEvent(event)
+                return True
+            if event.type() == QEvent.MouseMove and event.buttons() & Qt.LeftButton:
+                self.mouseMoveEvent(event)
+                return True
+            if event.type() == QEvent.MouseButtonRelease and event.button() == Qt.LeftButton:
+                self.mouseReleaseEvent(event)
+                return True
+        return super().eventFilter(watched, event)
 
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.LeftButton:
             self.drag_offset = event.globalPos() - self.frameGeometry().topLeft()
+            self.grabMouse()
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if self.drag_offset is not None and event.buttons() & Qt.LeftButton:
-            self.move(event.globalPos() - self.drag_offset)
+            self.move(self.bounded_position(event.globalPos() - self.drag_offset))
             event.accept()
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.LeftButton:
             self.drag_offset = None
+            self.releaseMouse()
             self.settings.setValue("overlayPosition", self.pos())
             event.accept()
 
@@ -327,10 +393,14 @@ class MainWindow(QMainWindow):
         quota_head = QHBoxLayout()
         self.quota_summary = QLabel("Waiting for account state…")
         self.quota_summary.setObjectName("quotaSummary")
+        self.overlay_button = QPushButton("Show on desktop")
+        self.overlay_button.setProperty("role", "quiet")
+        self.overlay_button.clicked.connect(self.toggle_overlay)
         refresh_button = QPushButton("Refresh")
         refresh_button.setProperty("role", "quiet")
         refresh_button.clicked.connect(self.refresh_quota)
         quota_head.addWidget(self.quota_summary, 1)
+        quota_head.addWidget(self.overlay_button)
         quota_head.addWidget(refresh_button)
         self.quota_details = QLabel("")
         self.quota_details.setObjectName("quotaDetails")
@@ -1518,7 +1588,15 @@ class MainWindow(QMainWindow):
     def set_overlay_visible(self, visible: bool) -> None:
         self.settings.setValue("overlayVisible", visible)
         self.overlay.setVisible(visible)
+        self.overlay_button.setText(
+            "Hide from desktop" if visible else "Show on desktop"
+        )
+        if visible:
+            self.overlay.raise_()
         self._rebuild_tray_menu()
+
+    def toggle_overlay(self) -> None:
+        self.set_overlay_visible(not self.overlay.isVisible())
 
     def show_manager(self) -> None:
         self.show()

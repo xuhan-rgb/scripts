@@ -223,6 +223,30 @@ env_key = "CRS_OPENAI_KEY"
         self.assertNotIn("127.0.0.1:8320", source)
         self.assertNotIn("claudex-manager.service", source)
 
+    def test_quota_card_can_show_a_draggable_desktop_overlay(self):
+        source = QT_APP_PATH.read_text(encoding="utf-8")
+
+        self.assertIn('QPushButton("Show on desktop")', source)
+        self.assertIn("self.overlay_button.clicked.connect(self.toggle_overlay)", source)
+        self.assertIn("def toggle_overlay", source)
+        self.assertIn('"Hide from desktop" if visible else "Show on desktop"', source)
+        self.assertIn("Qt.X11BypassWindowManagerHint", source)
+        self.assertIn('"overlayBypassPositioned", False, type=bool', source)
+        self.assertIn('settings.setValue("overlayBypassPositioned", True)', source)
+        self.assertIn("layout.setContentsMargins(12, 5, 12, 5)", source)
+        self.assertIn("screen.geometry().top() + 4", source)
+        self.assertIn("target.installEventFilter(self)", source)
+        self.assertIn("def eventFilter", source)
+        self.assertIn("self.grabMouse()", source)
+        self.assertIn("self.releaseMouse()", source)
+        self.assertIn("def bounded_position", source)
+        self.assertIn("max(geometry.left(), min(position.x(), maximum_x))", source)
+        self.assertIn("max(geometry.top(), min(position.y(), maximum_y))", source)
+        self.assertIn("self.move(self.bounded_position", source)
+        self.assertIn("def mousePressEvent", source)
+        self.assertIn("def mouseMoveEvent", source)
+        self.assertIn('self.settings.setValue("overlayPosition", self.pos())', source)
+
     def test_qt_application_uses_a_professional_desktop_visual_hierarchy(self):
         source = QT_APP_PATH.read_text(encoding="utf-8")
 

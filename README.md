@@ -1,6 +1,32 @@
-# 个人脚本工具集
+# Linux 桌面、AI CLI 与 GPU 工具集
 
-用于 Linux 桌面配置、ONNX 环境检测以及 TensorRT 模型转换与推理的个人脚本集合。
+这个仓库包含一组可直接运行的 Linux 工具，覆盖 Codex/Claude 多账号与 API provider 管理、Markdown/LaTeX 阅读与导出、论文工作区、GNOME 桌面配置、GPU 显存管理，以及 ONNX Runtime/TensorRT 环境验证和推理。
+
+## 工具索引
+
+| 工具 | 入口 | 用途 | 从哪里开始 |
+| --- | --- | --- | --- |
+| Codex 基础配置 | `bash claude/setup-codex.sh` | 安装多账号、provider、额度和 yolo 命令 | [Codex + 官方 Claude](#1-codex--官方-claude不安装网关) |
+| Claude-to-Codex 网关 | `bash claude/install-codex-bridge.sh` | 让 Claude Code 通过本地 Codex provider 工作 | [Codex 接入 Claude Code](#2-codex-接入-claude-code) |
+| Codex 多账号 | `codex-auth` | 添加、选择、归档隔离的 ChatGPT 登录 | [Codex / Claudex 使用教程](#4-codex--claudex-使用教程) |
+| Codex API provider 后端 | `python3 claude/codex_provider.py` | 新增、测试、切换自定义 API provider | [Provider 命令行管理](#5-provider-命令行管理) |
+| Codex 账号桌面管理 | `codex-account-manager` | 用 Qt 界面管理账号、provider、额度和托盘 | [原生账号与 API 管理软件](#6-原生账号与-api-管理软件) |
+| Codex 额度 | `codex-usage`、`codex-usage-widget` | 查询额度/token 活动，或显示桌面悬浮窗 | [额度命令与悬浮窗](#额度命令与悬浮窗) |
+| Claude 路由控制台 | `claudex-ui` | 选择网关模型、思考强度并查看请求用量 | [网页路由控制台](#7-网页路由控制台可选) |
+| mdview | `mdview [FILE]` | 预览 Markdown、HTML、完整 LaTeX 并导出 PDF | [文档渲染器](#markdown--html--latex-文档渲染器) |
+| Markdown 快速转 PDF | `bash markdown_to_pdf.sh INPUT OUTPUT` | 用 Pandoc + Chromium 快速生成 PDF | [快速转换](#独立-markdown-转-pdf) |
+| ScholarVault | `scholarvault` | 管理论文、PDF、TeX、Zotero 和相关代码 | [ScholarVault](#scholarvault-论文工作区c20--qt-6) |
+| Flameshot 快捷键 | `bash desktop/install-flameshot-shortcuts.sh` | 配置 GNOME 区域截图和路径复制 | [Flameshot](#安装-flameshot-并配置-gnome-快捷键) |
+| Zotero 输入法修复 | `bash desktop/fix-zotero-ime-candidate-position.sh` | 修复 Linux 中文候选窗位置异常 | [Zotero 修复](#修复-zotero-中文候选窗位置) |
+| DEB 文件查看 | `./deb-view-file PACKAGE.deb [PATH]` | 列出或读取 `.deb` 包内文件而不安装 | [DEB 查看](#查看-deb-包内文件) |
+| GPU Harbor | `python3 gpu_memory_keeper_gui.py` | 管理本机或 SSH 远程 NVIDIA GPU 显存 | [GPU Harbor](#gpu-harbor-桌面管理器) |
+| GPU Memory Keeper | `python3 gpu_memory_keeper.py COMMAND` | 从终端占用、监督和释放 GPU 显存 | [显存命令行](#gpu-memory-keeper-命令行) |
+| CUDA/ONNX 诊断 | `python get_onnx_dependencies.py` | 检查 CUDA、cuDNN、ONNX Runtime 动态库 | [环境诊断](#1-检测-cudacudnnonnx-runtime-环境) |
+| ONNX Runtime CUDA 验证 | `python test_onnx_env.py` | 创建最小模型并验证 CUDA Provider 推理 | [ORT 验证](#2-测试-onnx-runtime-推理) |
+| TensorRTModel | `tensorrt_inference.py` | 构建/缓存 TensorRT engine 并执行 NumPy 推理 | [TensorRT 核心模块](#3-tensorrt-推理核心模块) |
+| 深度估计示例 | `python convert_trt.py` | 执行固定输入深度模型并输出伪彩深度图 | [深度模型示例](#4-深度模型推理示例) |
+
+除已安装到 `~/.local/bin` 的命令外，下面的示例都默认在仓库根目录执行。
 
 ## Claude Code / Codex 网关
 
@@ -136,23 +162,67 @@ claudex-yolo --prompt-suggestions true
 
 如果命令未找到，重新执行 `source ~/.bashrc` 或打开一个新终端。由于 `claudex-yolo` 会跳过权限确认，只应在可信项目中使用。
 
-#### 5. 原生账号与 API 管理软件
+#### 5. Provider 命令行管理
+
+`claude/codex_provider.py` 是 GUI 和网关共用的 provider 后端，也可以直接用于命令行管理自定义 OpenAI-compatible API。无参数运行会打开交互菜单；脚本化时使用子命令。安装器不会创建单独的 `codex-provider` 命令，所以从仓库运行如下：
+
+```bash
+python3 claude/codex_provider.py                       # 交互菜单
+python3 claude/codex_provider.py list                  # 列出 provider，不显示密钥
+python3 claude/codex_provider.py show myproxy          # 查看非敏感配置
+python3 claude/codex_provider.py add myproxy \
+  --base-url https://example.com/v1 \
+  --model gpt-5.4 \
+  --prompt-key                       # 隐藏输入密钥，避免进入 shell history
+python3 claude/codex_provider.py test myproxy          # TCP 和模型接口
+python3 claude/codex_provider.py test myproxy --model gpt-5.4 # 最小请求
+python3 claude/codex_provider.py update myproxy --effort high
+python3 claude/codex_provider.py switch myproxy        # 设为默认 provider
+python3 claude/codex_provider.py set-key myproxy       # 安全替换密钥
+python3 claude/codex_provider.py delete myproxy --yes  # 删除非当前 provider
+```
+
+provider 配置写入 `~/.codex/config.toml` 及对应 profile；密钥单独保存在权限为 `0600` 的 `~/.config/codex/secrets.env`。日常输入密钥优先使用 `--prompt-key`、`set-key` 的隐藏提示，或通过标准输入传入，不要把真实密钥直接写进命令历史、README 或仓库。
+
+`codex-auth api myproxy` 与后端的 `switch myproxy` 都会选择 API 模式；前者适合日常账号/API 模式切换，后者还可以同步 provider 的模型、思考强度和输出设置。通常优先使用 `codex-account-manager`，只有自动化或排错时才需要直接调用后端。
+
+#### 6. 原生账号与 API 管理软件
 
 运行 `codex-account-manager`，或从 Linux 应用菜单打开 **Codex Account Manager**。这是独立的 PyQt5 桌面软件，不使用浏览器、WebEngine、8320 网页服务或 `claudex-manager.service`。
 
-软件集成 `codex-auth` 和本地 provider 管理后端：添加账号时邮箱输入为可选，留空后完成普通浏览器授权，软件会从登录令牌读取邮箱并自动命名；也可以预先填写邮箱。GUI 默认不使用设备码，因此不需要开启 OpenAI 的“为 Codex 启用设备代码授权”设置；只有在无头或远程终端显式运行 `codex-auth add-auto --device-auth` 时才需要该设置。未完成的浏览器授权可用 `Cancel login` 终止，随后账号和 API 操作按钮会恢复。账号页还可选择账号、查看额度和可恢复移除命名账号，旧版 `unnamed` 登录始终保留且禁止删除。API 页可以新增或编辑名称、Base URL、环境变量名和密钥，也可测试连接、删除非当前 provider 并切换使用。API 密钥通过进程标准输入保存，不出现在命令行参数中。关闭主窗口后软件驻留系统托盘；托盘可以快速切换账号/API、显示额度悬浮窗或彻底退出。
+软件集成 `codex-auth` 和本地 provider 管理后端：添加账号时邮箱输入为可选，留空后完成普通浏览器授权，软件会从登录令牌读取邮箱并自动命名；也可以预先填写邮箱。GUI 默认不使用设备码，因此不需要开启 OpenAI 的“为 Codex 启用设备代码授权”设置；只有在无头或远程终端显式运行 `codex-auth add-auto --device-auth` 时才需要该设置。未完成的浏览器授权可用 `Cancel login` 终止，随后账号和 API 操作按钮会恢复。账号页还可选择账号、查看额度和可恢复移除命名账号，旧版 `unnamed` 登录始终保留且禁止删除。API 页可以新增或编辑名称、Base URL、环境变量名和密钥，也可测试连接、删除非当前 provider 并切换使用。API 密钥通过进程标准输入保存，不出现在命令行参数中。额度卡片中的 `Show on desktop` 会把当前额度显示在桌面工作区左上角；悬浮窗可以按住鼠标左键拖动并记住位置，拖动范围会限制在屏幕以内，再次点击变为 `Hide from desktop`。关闭主窗口后软件驻留系统托盘；托盘可以快速切换账号/API、显示额度悬浮窗或彻底退出。
 
 Qt 软件、`codex-auth` 和 `codex-usage` 使用同一份状态。所有切换只影响新启动的 Codex，不会终止或改变已经运行的终端。额度通过本地 Codex app-server 查询，不需要打开 ChatGPT 网页。
 
-#### 6. 网页路由控制台（可选）
+##### 额度命令与悬浮窗
+
+`codex-usage` 默认查询 `codex-auth use` 当前选中的命名账号，也能显式选择账号或输出 JSON：
+
+```bash
+codex-usage
+codex-usage --account user@example.com
+codex-usage --json
+watch -n 30 codex-usage              # 每 30 秒刷新
+codex-usage --browser                 # 仅旧版 Chrome 登录方式
+codex-usage --browser --port 9223
+```
+
+桌面悬浮窗的控制命令为：
+
+```bash
+codex-usage-widget                    # 等同于 start，后台启动
+codex-usage-widget status
+codex-usage-widget stop
+codex-usage-widget foreground         # 前台运行，便于查看错误
+```
+
+悬浮窗跟随当前账号选择并显示最长额度周期；切到 API provider 时显示 `No account quota`，不会继续显示上一个账号的缓存。`codex-account-manager` 已包含托盘和额度悬浮能力，启动账号管理软件时会停止独立 widget，避免重复显示。
+
+#### 7. 网页路由控制台（可选）
 
 完整安装后运行 `claudex-ui`。页面中的 `Accounts` 抽屉可以新增 ChatGPT 登录、查看账号状态与额度、选择以后启动的 Codex 默认账号，或切回 API provider；设备码和登录进度会直接显示在抽屉里。每个已登录账号的 `Quota` 按钮通过 Codex 本地 app-server 读取套餐、剩余百分比和重置时间，不需要打开或登录 ChatGPT 网页。`Provider config` 继续用于配置、测试和选择某个具体 API provider，主页可以选择 GPT 模型、思考强度并查看用量。
 
 这个网页只用于 Claude-to-Codex 路由和用量控制台；原生 `codex-account-manager` 不依赖它，只运行 `setup-codex.sh` 也会安装 Qt 软件。
-
-`codex-usage` 默认读取 `codex-auth use` 选中的账号，也可通过 `--account NAME` 临时指定。旧的 Chrome 调试方式仍可显式使用 `codex-usage --browser`，但命名账号不需要它。
-
-`codex-usage-widget` 与 `codex-auth` 读取同一个当前模式：选择命名账号后显示账号名、套餐和最长额度周期，旧的未命名 ChatGPT 登录显示为 `unnamed`；在终端或 GUI 切换账号后会自动刷新。切到自定义 API provider 时显示 `API provider / No account quota`，不会继续展示上一个账号的缓存额度。
 
 ## 桌面工具
 
@@ -328,6 +398,17 @@ xdg-mime default markdown-renderer.desktop application/x-tex
 QT_QPA_PLATFORM=offscreen python3 -m unittest tests.test_markdown_editor -v
 ```
 
+### 独立 Markdown 转 PDF
+
+`markdown_to_pdf.sh` 是不启动 `mdview` 的轻量转换器，适合一次性把普通 GFM Markdown 转成 A4 PDF。它使用 Pandoc 生成 HTML，再调用本机 Chrome/Chromium 的 headless 打印功能：
+
+```bash
+bash markdown_to_pdf.sh notes.md
+bash markdown_to_pdf.sh notes.md output/report.pdf
+```
+
+只传输入文件时，PDF 写到输入文件旁并沿用同名文件名。输出目录必须事先存在。该工具需要 `pandoc`、Google Chrome 或 Chromium；它不使用 `markdown_pdf/template.tex`，也不提供 `mdview` 的 XeLaTeX、TikZ、目录定位和交互预览能力。需要论文式排版或完整 LaTeX 时应使用 `mdview` 的“导出 PDF”。
+
 ### 安装 Flameshot 并配置 GNOME 快捷键
 
 ```bash
@@ -340,6 +421,37 @@ bash desktop/install-flameshot-shortcuts.sh
 - `Alt+S`：截图保存到 `/tmp`，并将完整文件路径复制到剪贴板。
 
 该脚本仅支持 Ubuntu/Debian 的 GNOME 桌面环境，应当以当前桌面用户运行，不要直接使用 `sudo` 启动整个脚本。
+
+### 修复 Zotero 中文候选窗位置
+
+当 Zotero Linux 的中文输入法候选窗固定在屏幕左下角、不跟随光标时运行：
+
+```bash
+bash desktop/fix-zotero-ime-candidate-position.sh
+```
+
+脚本会定位 Zotero profiles，删除导致焦点窗口丢失的 `focusmanager.testmode=true`，并在需要时关闭、修复后重新启动 Zotero。高级用法：
+
+```bash
+bash desktop/fix-zotero-ime-candidate-position.sh \
+  --profile-root /path/to/Zotero/Profiles
+bash desktop/fix-zotero-ime-candidate-position.sh \
+  --no-process-control                 # 仅在 Zotero 已关闭时使用
+```
+
+完整原因、备份和手动验证方法见 [故障排查文档](docs/troubleshooting/zotero-linux-ime-candidate-position.md)。
+
+### 查看 DEB 包内文件
+
+`deb-view-file` 使用 `dpkg-deb` 解包查看 `.deb`，不会安装软件包：
+
+```bash
+./deb-view-file ./example.deb
+./deb-view-file ./example.deb /etc/example/config.conf
+./deb-view-file ./example.deb /usr/share/doc/example
+```
+
+只传 `.deb` 时，工具列出全部包内文件并保留临时解压目录，终端会打印目录路径；再传一个包内路径时，它会用 `less` 或 `cat` 显示文件，传目录则列出该目录内容，退出后自动清理临时目录。依赖 Ubuntu/Debian 的 `dpkg-deb`。
 
 ## ScholarVault 论文工作区（C++20 / Qt 6）
 
@@ -382,6 +494,66 @@ ctest --test-dir build/scholarvault --output-on-failure
 
 完整设计与持久化格式见 `docs/superpowers/specs/2026-08-13-scholarvault-design.md`。
 
+## GPU 显存管理
+
+GPU Memory Keeper 通过独立 CUDA 进程预留显存，方便在共享机器上提前占住空闲显存，并在真正任务启动前释放。它只预留显存，不会把 GPU 计算模式改为 exclusive，也不能阻止其他进程使用算力。
+
+### GPU Harbor 桌面管理器
+
+安装 `PyQt5` 后直接从仓库启动：
+
+```bash
+sudo apt install python3-pyqt5
+python3 gpu_memory_keeper_gui.py
+```
+
+界面默认连接本机并显示每张 NVIDIA GPU 的显存、利用率和 Keeper 状态：
+
+- `OCCUPY / 立即占用`：按界面中的上限启动显存预留。
+- `RELEASE / 释放`：释放对应 GPU 的 Keeper 显存。
+- `MONITOR / 递增监督`：让已有预留根据总显存使用量动态调整。
+- `释放全部`：停止当前目标机器上的全部 Keeper 预留。
+- SSH 目标：可填写 `host`、`user@host`、`ssh -p 2222 user@host` 或 `~/.ssh/config` 别名；GUI 会把 CLI 脚本部署到远端用户目录后执行。
+
+远程连接使用非交互 `BatchMode`，因此应先配置 SSH key 并确认 `ssh TARGET` 无需输入密码。远端需要 `python3`、PyTorch CUDA、`nvidia-smi` 和可用的 NVIDIA 驱动。日志保存在 `~/.local/state/gpu-harbor/`，Keeper 工作日志保存在目标机器的 `/tmp/gpu_memory_keeper_gpu<编号>.log`。
+
+### GPU Memory Keeper 命令行
+
+需要 PyTorch CUDA。无子命令或使用 `menu` 会打开交互式终端菜单：
+
+```bash
+python3 gpu_memory_keeper.py
+python3 gpu_memory_keeper.py menu
+```
+
+常用非交互命令：
+
+```bash
+# 后台预留：总使用量目标 99%，但 Keeper 自身最多占单卡 80%
+python3 gpu_memory_keeper.py occupy --gpu 0
+
+# 指定固定显存，或同时管理多张卡
+python3 gpu_memory_keeper.py occupy --gpu 0 --memory 8G
+python3 gpu_memory_keeper.py occupy --gpus 0,1 --percent 95
+
+# 逐步增加预留；需要登录后持续守护时使用 systemd user service
+python3 gpu_memory_keeper.py occupy --gpu 0 --incremental \
+  --step-percent 10 --interval 5
+python3 gpu_memory_keeper.py occupy --gpus 0,1 --systemd-guard
+
+# 查看、动态监督、修改实时上限和释放
+python3 gpu_memory_keeper.py status --gpu 0
+python3 gpu_memory_keeper.py list
+python3 gpu_memory_keeper.py list --json
+python3 gpu_memory_keeper.py monitor --gpu 0 --percent 95 --step-percent 10
+python3 gpu_memory_keeper.py configure --gpu 0 --keeper-percent 70
+python3 gpu_memory_keeper.py release --gpu 0
+python3 gpu_memory_keeper.py stop --gpu 0
+python3 gpu_memory_keeper.py release-all
+```
+
+`release` 会向 Keeper 发送正常释放请求并等待进程退出；`stop` 用终止信号停止 Keeper。两者都会处理并停用对应的 systemd guard。使用 `--systemd-guard` 创建的服务会在 worker 异常退出后自动重启，因此不要只杀 worker PID。查看完整参数可运行 `python3 gpu_memory_keeper.py COMMAND --help`。
+
 ## TensorRT / ONNX 工具
 
 `get_onnx_dependencies.py` 仅依赖 Linux 系统库和 `ldd`。ONNX Runtime 验证需要能实际加载 CUDA Execution Provider；TensorRT 推理则需要兼容的 NVIDIA 驱动、CUDA、cuDNN、TensorRT 和 PyCUDA。
@@ -421,6 +593,18 @@ finally:
 
 `TensorRTModel` 当前支持单输入、静态形状的 engine。它按 TensorRT 的 I/O mode 识别输入和输出，并采用 engine 声明的 dtype；`input_data` 的 shape 必须与输入 tensor 完全一致。
 
+已有 engine 可直接加载：
+
+```python
+model = TensorRTModel(engine_model_path='model/your_model.engine')
+```
+
+运行模块本身会导出一个最小全连接 ONNX 示例、构建 engine 并执行一次推理：
+
+```bash
+python tensorrt_inference.py
+```
+
 ### 4. 深度模型推理示例
 
 ```bash
@@ -436,20 +620,53 @@ python convert_trt.py --show
 
 脚本以 RGB、`[0, 1]` 范围的 `float32` NCHW `(1, 3, 352, 640)` 输入模型，并要求第一个输出为至少含一个 batch 和通道的 NCHW tensor，随后取 `[0, 0]` 生成伪彩深度图。默认结果写入 `images/depth_colormapped.jpg`；可通过 `--model`、`--image`、`--output` 改写路径。
 
+完整路径示例：
+
+```bash
+python convert_trt.py \
+  --model /data/models/depth.onnx \
+  --image /data/images/input.jpg \
+  --output /data/results/depth.jpg
+```
+
+## 配置检查与开发验证
+
+以下脚本用于检查安装后的 Claude/Codex 配置，不会安装或切换账号：
+
+```bash
+bash claude/verify-yolo-skills.sh   # 快速列出各 yolo 命令启用的 Skills
+bash claude/skill-status-report.sh  # Claude/Codex 配置、aliases 和 Skills 完整报告
+bash claude/final-verification.sh   # 汇总默认命令与 yolo 配置是否存在
+```
+
+这些检查读取 `~/.claude`、`~/.codex` 和 `~/.bashrc`，部分输出依赖 `jq`。如果刚运行过安装器，先执行 `source ~/.bashrc` 再检查。
+
+修改仓库后可运行不依赖 GPU 的回归检查：
+
+```bash
+bash -n claude/*.sh desktop/*.sh markdown_to_pdf.sh deb-view-file
+python -m unittest discover -s tests -v
+```
+
+ScholarVault 使用前文的 CMake/CTest 命令。CUDA、ONNX Runtime 和 TensorRT 检查需要对应 GPU 环境，不包含在纯 CPU 单元测试中。
+
 ## 依赖
 
-- 桌面快捷键安装：Ubuntu/Debian、GNOME、APT（缺失的软件包由脚本自动安装）
-- 环境检查：Python 标准库
-- ONNX Runtime 测试：`numpy`、`onnx`、`onnxruntime-gpu`
-- TensorRT 推理：`numpy`、`torch`、`tensorrt`、`pycuda`
-- 深度图示例：TensorRT 推理依赖，另加 `opencv-python`、`matplotlib`
+| 工作流 | 主要依赖 |
+| --- | --- |
+| Codex/Claude 配置 | Bash、Python 3、Codex CLI、Claude Code；桌面账号管理另需 `PyQt5` |
+| mdview | `PyQt5`、Qt WebEngine、Markdown、matplotlib；PDF/图表依赖由安装器检查 |
+| Markdown 快速转 PDF | Pandoc、Google Chrome 或 Chromium |
+| ScholarVault | C++20、CMake、Ninja、Qt 6、Qt PDF、SQLite、X11；安装器自动检查 APT 包 |
+| Flameshot 快捷键 | Ubuntu/Debian、GNOME、APT、Flameshot、Wayland/X11 剪贴板工具 |
+| GPU Harbor / Keeper | NVIDIA 驱动、`nvidia-smi`、PyTorch CUDA；GUI 另需 `PyQt5`，远程模式另需 SSH key |
+| 环境检查 | Python 标准库、Linux 系统库和 `ldd` |
+| ONNX Runtime 测试 | `numpy`、`onnx`、`onnxruntime-gpu` |
+| TensorRT 推理 | `numpy`、`torch`、`tensorrt`、`pycuda` |
+| 深度图示例 | TensorRT 推理依赖，另加 `opencv-python`、`matplotlib` |
 
 ## 故障排查笔记
 
 - [Zotero Linux 中文候选窗固定在左下角](docs/troubleshooting/zotero-linux-ime-candidate-position.md)：记录 Gecko `focusmanager.testmode` 导致焦点窗口丢失、候选窗无法跟随光标的诊断、修复和验证流程。
 
-一键修复：
-
-```bash
-bash ~/scripts/desktop/fix-zotero-ime-candidate-position.sh
-```
+对应的一键修复命令见上面的“修复 Zotero 中文候选窗位置”。
