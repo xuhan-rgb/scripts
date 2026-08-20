@@ -1,6 +1,6 @@
 # Skill 配置现状总结
 
-生成时间：2026-08-07
+更新时间：2026-08-13
 
 ## 快速概览
 
@@ -8,7 +8,7 @@
 |------|------------|----------|------|
 | `claude` | 6 用户 + 37 内置 | `~/.claude/settings.json` | 默认配置，包含大量 bundled skills |
 | `claude-yolo` | **5 核心** | `~/.claude/settings.yolo.json` | ✨ 精简配置 |
-| `codex` | 15 配置项 | `~/.codex/config.toml` | 默认配置（实际模型可见约 4-8 个） |
+| `codex` | **5 核心** | `~/.codex/config.toml` | 与 `codex-yolo` 使用相同白名单，保留审批 |
 | `codex-yolo` | **9 配置项** | `~/.codex/yolo.config.toml` | ✨ 精简配置 |
 | `claudex-yolo` | **9 配置项** | `~/.codex/yolo.config.toml` | 同 codex-yolo |
 
@@ -67,25 +67,20 @@ Claude Code 官方内置，无法禁用。包括：
 
 **配置文件**: `~/.codex/config.toml`
 
-### 启用的 skills (enabled = true): 8 个
+### 启用的 skills (enabled = true): 5 个
 1. agent-reach
 2. brainstorming
 3. domain-modeling
 4. grilling
-5. grill-me *(disable-model-invocation)*
-6. grill-with-docs *(disable-model-invocation)*
-7. handoff *(disable-model-invocation)*
-8. tdd
+5. tdd
 
 ### 统计
-- **配置项总数**: 259 个
-- **启用**: 15 个配置项（包括重复路径）
-- **禁用**: 244 个配置项
-- **实际模型可见**: 约 4 个（根据之前的 HTML 报告）
+- 安装器会记录发现的所有 Skill 路径，但只把上述 5 个名称的首个路径设为 `enabled = true`
+- 重复路径与其他 Skills 均设为 `enabled = false`
+- 启用集合与 `~/.codex/yolo.config.toml` 一致
 
 ### 注意
-- `grill-me`, `grill-with-docs`, `handoff` 设置了 `disable-model-invocation: true`，需要手动调用
-- 实际送入模型的 skill 数量比配置少
+- `codex` 与 `codex-yolo` 的区别是审批和沙箱策略，不是 Skill 集合
 
 ---
 
@@ -140,9 +135,9 @@ Claude Code 官方内置，无法禁用。包括：
 
 ---
 
-## Yolo 命令的 5 个核心 Skills
+## Codex 与 Yolo 命令的 5 个核心 Skills
 
-所有 yolo 命令（`claude-yolo`, `codex-yolo`, `claudex-yolo`）统一使用：
+`codex` 与所有 yolo 命令（`claude-yolo`, `codex-yolo`, `claudex-yolo`）统一使用：
 
 1. **agent-reach** - AI 代理增强
    - 跨 agent 协作
@@ -170,10 +165,13 @@ Claude Code 官方内置，无法禁用。包括：
 
 ```bash
 # 在 ~/.bashrc 中自动配置
-alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox -p yolo'
+codex() { codex-auth run -- "$@"; }
+alias codex-yolo='codex-auth run -- --dangerously-bypass-approvals-and-sandbox -p yolo'
 alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'
-alias claudex-yolo='CLAUDEX_YOLO=1 CLAUDEX_CODEX_CONFIG=~/.codex/yolo.config.toml claudex'
+alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 ```
+
+`codex` 使用函数而不是 alias，避免同一终端重复 `source ~/.bashrc` 时与 kitty-enhance 的 `codex()` 通知包装发生 Bash alias 展开冲突。
 
 ---
 
@@ -199,15 +197,12 @@ cd /home/qwer/scripts/claude
 
 ## 设计理念
 
-### 默认命令 (`claude`, `codex`)
-- **目标**: 功能全面，满足各种使用场景
-- **策略**: 保留大部分可用 skills
-- **适用**: 日常开发、探索新功能
+### 默认 Claude 命令 (`claude`)
+- **策略**: 保留可用 Skills
 
-### Yolo 命令 (`*-yolo`)
-- **目标**: 快速响应，减少 token 开销
+### Codex 与 Yolo 命令 (`codex`, `*-yolo`)
 - **策略**: 只保留最核心的 5 个 skills
-- **适用**: 高频任务、快速迭代、token 预算有限
+- **权限区别**: `codex` 保留审批；`codex-yolo` 跳过审批与沙箱
 
 ---
 
@@ -215,7 +210,7 @@ cd /home/qwer/scripts/claude
 
 | 维度 | Claude | Codex |
 |------|--------|-------|
-| 默认 Skills | 43 个（6+37） | 8 个配置（4 个模型可见） |
+| 默认 Skills | 43 个（6+37） | 5 个 |
 | Yolo Skills | 5 个 | 5 个 |
 | 配置复杂度 | 简单（JSON） | 复杂（TOML + 重复路径） |
 | Bundled Skills | 37 个（无法完全禁用） | 0 个 |
@@ -240,3 +235,4 @@ cd /home/qwer/scripts/claude
 ## 更新记录
 
 - **2026-08-07**: 初始版本，统一 yolo 命令使用 5 个核心 skills
+- **2026-08-13**: 普通 `codex` 改为使用与 `codex-yolo` 相同的 5 个核心 Skills

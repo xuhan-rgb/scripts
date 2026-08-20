@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=ScholarVault
+Comment=Local-first paper, source code, notes, and AI research workspace
+Exec=scholarvault
+TryExec=scholarvault
+Icon=scholarvault
+Terminal=false
+Categories=Education;Literature;
+StartupNotify=true

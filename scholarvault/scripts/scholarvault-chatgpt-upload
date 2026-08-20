@@ -1,0 +1,167 @@
+#!/usr/bin/python3
+import argparse
+import json
+import pathlib
+import sys
+import time
+import urllib.request
+
+import websocket
+
+
+def emit(progress, status, event="progress"):
+    print(json.dumps({"event": event, "progress": progress, "status": status},
+                     ensure_ascii=False), flush=True)
+
+
+class DevTools:
+    def __init__(self, url):
+        self.socket = websocket.create_connection(url, timeout=8,
+                                                  suppress_origin=True)
+        self.sequence = 0
+
+    def close(self):
+        self.socket.close()
+
+    def call(self, method, params=None):
+        self.sequence += 1
+        request_id = self.sequence
+        self.socket.send(json.dumps({"id": request_id, "method": method,
+                                     "params": params or {}}))
+        while True:
+            response = json.loads(self.socket.recv())
+            if response.get("id") != request_id:
+                continue
+            if "error" in response:
+                raise RuntimeError(response["error"].get("message", method))
+            return response.get("result", {})
+
+
+def devtools_port(profile):
+    path = profile / "DevToolsActivePort"
+    if not path.is_file():
+        raise RuntimeError("没有找到 Chrome 本地调试端口，请重启 ScholarVault 管理的 ChatGPT")
+    first = path.read_text(encoding="utf-8").splitlines()[0].strip()
+    port = int(first)
+    if port <= 0 or port > 65535:
+        raise RuntimeError("Chrome 本地调试端口无效")
+    return port
+
+
+def chatgpt_target(port):
+    with urllib.request.urlopen(f"http://127.0.0.1:{port}/json/list", timeout=5) as response:
+        targets = json.load(response)
+    for target in targets:
+        if (target.get("type") == "page" and
+                target.get("url", "").startswith("https://chatgpt.com/") and
+                target.get("webSocketDebuggerUrl")):
+            return target
+    raise RuntimeError("没有找到可用的 ChatGPT 页面，请先完成登录")
+
+
+def walk(node):
+    yield node
+    for child in node.get("children", []):
+        yield from walk(child)
+    for shadow in node.get("shadowRoots", []):
+        yield from walk(shadow)
+
+
+def file_input(client):
+    root = client.call("DOM.getDocument", {"depth": -1, "pierce": True})["root"]
+    for node in walk(root):
+        if node.get("nodeName", "").upper() != "INPUT":
+            continue
+        attributes = dict(zip(node.get("attributes", [])[::2],
+                              node.get("attributes", [])[1::2]))
+        if attributes.get("type", "").lower() == "file":
+            return node["nodeId"]
+    return None
+
+
+OPEN_ATTACHMENT = r"""
+(() => {
+  const visible = e => !!(e.offsetWidth || e.offsetHeight || e.getClientRects().length);
+  const controls = [...document.querySelectorAll('button,[role="button"]')].filter(visible);
+  const preferred = controls.find(e => {
+    const value = `${e.getAttribute('aria-label') || ''} ${e.getAttribute('data-testid') || ''} ${e.textContent || ''}`.toLowerCase();
+    return value.includes('attach') || value.includes('upload') || value.includes('附件') || value.includes('上传');
+  });
+  if (preferred) { preferred.click(); return true; }
+  const plus = controls.find(e => {
+    const value = `${e.getAttribute('aria-label') || ''} ${e.textContent || ''}`.trim().toLowerCase();
+    return value === '+' || value.includes('add files') || value.includes('添加文件');
+  });
+  if (plus) { plus.click(); return true; }
+  return false;
+})()
+"""
+
+
+FOCUS_COMPOSER = r"""
+(() => {
+  const composer = document.querySelector('#prompt-textarea, textarea, [contenteditable="true"]');
+  if (!composer) return false;
+  composer.focus();
+  return true;
+})()
+"""
+
+
+def upload(profile, pdf):
+    emit(5, "连接 ScholarVault ChatGPT 会话")
+    port = devtools_port(profile)
+    target = chatgpt_target(port)
+    client = DevTools(target["webSocketDebuggerUrl"])
+    try:
+        client.call("DOM.enable")
+        client.call("Runtime.enable")
+        emit(25, "查找 ChatGPT 附件入口")
+        node_id = file_input(client)
+        if node_id is None:
+            client.call("Runtime.evaluate", {"expression": OPEN_ATTACHMENT,
+                                               "returnByValue": True})
+            for _ in range(20):
+                time.sleep(0.25)
+                node_id = file_input(client)
+                if node_id is not None:
+                    break
+        if node_id is None:
+            raise RuntimeError("ChatGPT 附件入口发生变化，暂时无法自动上传")
+        emit(55, f"上传 {pdf.name}")
+        client.call("DOM.setFileInputFiles", {"nodeId": node_id,
+                                                "files": [str(pdf)]})
+        for _ in range(40):
+            time.sleep(0.25)
+            result = client.call("Runtime.evaluate", {
+                "expression": f"document.body.innerText.includes({json.dumps(pdf.name)})",
+                "returnByValue": True,
+            })
+            if result.get("result", {}).get("value") is True:
+                client.call("Runtime.evaluate", {"expression": FOCUS_COMPOSER,
+                                                   "returnByValue": True})
+                emit(100, "PDF 已附加，可以开始提问", "succeeded")
+                return
+        raise RuntimeError("ChatGPT 未确认 PDF 附件，请检查页面提示后重试")
+    finally:
+        client.close()
+
+
+def main():
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--profile", required=True)
+    parser.add_argument("--pdf", required=True)
+    args = parser.parse_args()
+    profile = pathlib.Path(args.profile).resolve()
+    pdf = pathlib.Path(args.pdf).resolve(strict=True)
+    if not profile.is_dir() or not pdf.is_file() or pdf.suffix.lower() != ".pdf":
+        raise RuntimeError("上传参数无效")
+    upload(profile, pdf)
+
+
+if __name__ == "__main__":
+    try:
+        main()
+    except Exception as error:
+        emit(100, str(error), "failed")
+        sys.exit(1)

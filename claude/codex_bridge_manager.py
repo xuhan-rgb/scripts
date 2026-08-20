@@ -40,6 +40,19 @@ CODEX_PROVIDER_BACKEND = Path(__file__).with_name("codex_provider.py")
 CODEX_SYNC = Path.home() / ".local" / "bin" / "claude-codex-sync"
 CODEX_SECRETS = Path.home() / ".config" / "codex" / "secrets.env"
 PROVIDER_LOCK = STATE_DIR / "provider.lock"
+CODEX_AUTH_BACKEND = Path.home() / ".local" / "bin" / "codex-auth"
+CODEX_AUTH_SOURCE = Path(__file__).with_name("switch-codex-auth.sh")
+CODEX_USAGE_BACKEND = Path.home() / ".local" / "bin" / "codex-usage"
+CODEX_USAGE_SOURCE = Path(__file__).with_name("codex-usage")
+CODEX_ACCOUNT_STATE = Path.home() / ".config" / "codex"
+CODEX_ACCOUNTS_DIR = Path(
+    os.environ.get("CODEX_ACCOUNTS_DIR", Path.home() / ".local" / "share" / "codex" / "accounts")
+)
+CODEX_ACTIVE_ACCOUNT = CODEX_ACCOUNT_STATE / "active-account"
+ACCOUNT_LOCK = STATE_DIR / "account.lock"
+ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._+@-]{0,127}$")
+ACCOUNT_LOGIN_LOCK = threading.Lock()
+ACCOUNT_LOGIN_TASK = {"name": "", "status": "idle", "output": "", "error": ""}
 
 
 def parse_top_level_strings(text):
@@ -480,6 +493,34 @@ def _run_provider_command(arguments, input_text=None):
     return result.stdout
 
 
+def _auth_backend_path():
+    for path in (CODEX_AUTH_BACKEND, CODEX_AUTH_SOURCE):
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise ValueError("Codex auth backend is unavailable; run setup-codex.sh")
+
+
+def _run_auth_command(arguments):
+    result = subprocess.run(
+        [str(_auth_backend_path()), *arguments],
+        capture_output=True,
+        text=True,
+        timeout=60,
+        check=False,
+    )
+    if result.returncode != 0:
+        message = result.stderr.strip() or result.stdout.strip() or "account update failed"
+        raise ValueError(message)
+    return result.stdout
+
+
+def _usage_backend_path():
+    for path in (CODEX_USAGE_SOURCE, CODEX_USAGE_BACKEND):
+        if path.is_file() and os.access(path, os.X_OK):
+            return path
+    raise ValueError("Codex usage backend is unavailable; run setup-codex.sh")
+
+
 def _sync_provider_gateway():
     if not CODEX_SYNC.is_file():
         raise ValueError(f"gateway sync command is unavailable: {CODEX_SYNC}")
@@ -515,6 +556,187 @@ def _provider_lock(path=PROVIDER_LOCK):
     os.chmod(path, 0o600)
     fcntl.flock(lock, fcntl.LOCK_EX)
     return lock
+
+
+def _account_lock(path=ACCOUNT_LOCK):
+    return _provider_lock(path)
+
+
+def _validate_account_name(name):
+    if not ACCOUNT_NAME_PATTERN.fullmatch(name):
+        raise ValueError("invalid account name")
+    return name
+
+
+def read_account_catalog(accounts_dir=CODEX_ACCOUNTS_DIR, active_file=CODEX_ACTIVE_ACCOUNT):
+    accounts_dir = Path(accounts_dir)
+    active_file = Path(active_file)
+    active = ""
+    try:
+        candidate = active_file.read_text(encoding="utf-8").strip()
+        if ACCOUNT_NAME_PATTERN.fullmatch(candidate):
+            active = candidate
+    except FileNotFoundError:
+        pass
+
+    accounts = []
+    if accounts_dir.is_dir():
+        for account_dir in sorted(accounts_dir.iterdir(), key=lambda path: path.name):
+            if account_dir.is_symlink() or not account_dir.is_dir():
+                continue
+            if not ACCOUNT_NAME_PATTERN.fullmatch(account_dir.name):
+                continue
+            auth_file = account_dir / "auth.json"
+            logged_in = auth_file.is_file() and not auth_file.is_symlink() and auth_file.stat().st_size > 0
+            accounts.append(
+                {"name": account_dir.name, "active": account_dir.name == active, "logged_in": logged_in}
+            )
+    return accounts
+
+
+def use_account(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("account payload must be an object")
+    name = _validate_account_name(_payload_text(payload, "name", required=True, maximum=128))
+    with _account_lock():
+        _run_auth_command(["use", name])
+    return name
+
+
+def activate_api_mode():
+    with _account_lock():
+        _run_auth_command(["api"])
+        _sync_provider_gateway()
+
+
+def _set_account_login_task(**values):
+    with ACCOUNT_LOGIN_LOCK:
+        ACCOUNT_LOGIN_TASK.update(values)
+
+
+def account_login_state():
+    with ACCOUNT_LOGIN_LOCK:
+        return dict(ACCOUNT_LOGIN_TASK)
+
+
+def _safe_account_login_line(line):
+    if re.search(r"(?i)(access[_ -]?token|refresh[_ -]?token|id[_ -]?token)\s*[:=]", line):
+        return "[credential output redacted]\n"
+    return line
+
+
+def _append_account_login_output(name, line):
+    with ACCOUNT_LOGIN_LOCK:
+        if ACCOUNT_LOGIN_TASK.get("name") != name:
+            return
+        output = ACCOUNT_LOGIN_TASK.get("output", "") + _safe_account_login_line(line)
+        ACCOUNT_LOGIN_TASK["output"] = output[-12000:]
+
+
+def _account_login_worker(name):
+    try:
+        with _account_lock():
+            process = subprocess.Popen(
+                [str(_auth_backend_path()), "add", name, "--device-auth"],
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                text=True,
+                bufsize=1,
+            )
+            if process.stdout is not None:
+                for line in process.stdout:
+                    _append_account_login_output(name, line)
+            returncode = process.wait()
+        if returncode == 0:
+            _set_account_login_task(status="succeeded", error="")
+        else:
+            _set_account_login_task(status="failed", error=f"codex-auth exited with status {returncode}")
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
+        _set_account_login_task(status="failed", error=str(error))
+
+
+def start_account_login(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("account payload must be an object")
+    name = _validate_account_name(_payload_text(payload, "name", required=True, maximum=128))
+    with ACCOUNT_LOGIN_LOCK:
+        if ACCOUNT_LOGIN_TASK.get("status") == "running":
+            raise ValueError("another account login is already running")
+        ACCOUNT_LOGIN_TASK.update({"name": name, "status": "running", "output": "", "error": ""})
+    thread = threading.Thread(
+        target=_account_login_worker,
+        args=(name,),
+        name=f"codex-login-{name}",
+        daemon=True,
+    )
+    thread.start()
+    return account_login_state()
+
+
+def _usage_number(value):
+    return value if isinstance(value, (int, float)) and not isinstance(value, bool) else None
+
+
+def read_account_usage(payload):
+    if not isinstance(payload, dict):
+        raise ValueError("account payload must be an object")
+    current = payload.get("current") is True
+    if current:
+        name = "unnamed"
+        arguments = [str(_usage_backend_path()), "--json", "--timeout", "12"]
+    else:
+        name = _validate_account_name(_payload_text(payload, "name", required=True, maximum=128))
+        arguments = [
+            str(_usage_backend_path()),
+            "--account",
+            name,
+            "--json",
+            "--timeout",
+            "12",
+        ]
+    result = subprocess.run(
+        arguments,
+        capture_output=True,
+        text=True,
+        timeout=20,
+        check=False,
+    )
+    if result.returncode != 0:
+        raise ValueError(result.stderr.strip() or "account quota lookup failed")
+    try:
+        snapshot = json.loads(result.stdout)
+    except json.JSONDecodeError as error:
+        raise ValueError("account quota returned invalid JSON") from error
+    if not isinstance(snapshot, dict):
+        raise ValueError("account quota returned an invalid payload")
+    snapshot_account = snapshot.get("account")
+    if current and isinstance(snapshot_account, str) and ACCOUNT_NAME_PATTERN.fullmatch(snapshot_account):
+        name = snapshot_account
+
+    limits = []
+    for limit in snapshot.get("rate_limits") or []:
+        if not isinstance(limit, dict):
+            continue
+        windows = []
+        for window in limit.get("windows") or []:
+            if not isinstance(window, dict):
+                continue
+            windows.append(
+                {
+                    "name": str(window.get("name") or "")[:64],
+                    "remaining_percent": _usage_number(window.get("remaining_percent")),
+                    "used_percent": _usage_number(window.get("used_percent")),
+                    "window_seconds": _usage_number(window.get("window_seconds")),
+                    "resets_at": _usage_number(window.get("resets_at")),
+                }
+            )
+        limits.append({"name": str(limit.get("name") or "")[:128], "windows": windows[:4]})
+    return {
+        "account": name,
+        "fetched_at": str(snapshot.get("fetched_at") or "")[:64],
+        "plan_type": str(snapshot.get("plan_type") or "")[:64],
+        "rate_limits": limits[:20],
+    }
 
 
 def save_provider(payload):
@@ -572,6 +794,7 @@ def switch_provider(payload):
         if not provider["key_set"]:
             raise ValueError(f"provider {name!r} has no API key")
         _run_provider_command(["switch", name])
+        _run_auth_command(["api"])
         _sync_provider_gateway()
     return name
 
@@ -601,6 +824,8 @@ def build_state():
         "client_route": {"model": CLIENT_MODEL, "effort": CLIENT_EFFORT},
         "provider": codex,
         "providers": read_provider_catalog(),
+        "accounts": read_account_catalog(),
+        "account_login": account_login_state(),
         "models": MODELS,
         "efforts": EFFORTS,
         "gateway": gateway_state(),
@@ -867,6 +1092,35 @@ HTML = r'''<!doctype html>
     .provider-test-result.warning { color: #a84a20; background: rgba(237,106,58,.09); border-color: rgba(237,106,58,.4); }
     .provider-test-result.error { color: var(--bad); background: rgba(180,72,53,.08); border-color: rgba(180,72,53,.34); }
     .provider-test-result.running::before { animation: test-pulse 1s ease-in-out infinite alternate; }
+    .account-form { display: grid; grid-template-columns: 1fr auto; gap: 10px; margin-top: 22px; }
+    .account-form input {
+      width: 100%;
+      min-width: 0;
+      padding: 11px 12px;
+      color: var(--ink);
+      background: #f6f1e7;
+      border: 1px solid var(--line);
+      border-radius: 10px;
+    }
+    .account-list { display: grid; gap: 10px; margin-top: 22px; }
+    .account-row { display: flex; align-items: center; justify-content: space-between; gap: 14px; padding: 13px 14px; background: #f6f1e7; border: 1px solid var(--line); border-radius: 11px; }
+    .account-name { display: grid; gap: 5px; min-width: 0; }
+    .account-name strong { overflow-wrap: anywhere; font: 800 13px "DejaVu Sans Mono", monospace; }
+    .account-badges { display: flex; flex-wrap: wrap; gap: 5px; }
+    .account-badge { padding: 3px 7px; color: var(--ink-soft); background: rgba(77,90,94,.08); border-radius: 999px; font: 800 9px "DejaVu Sans Mono", monospace; text-transform: uppercase; }
+    .account-badge.active { color: var(--good); background: rgba(40,118,80,.1); }
+    .account-row-actions { display: grid; grid-template-columns: auto auto; gap: 7px; }
+    .account-use, .account-quota, .account-api { padding: 9px 12px; border-radius: 9px; cursor: pointer; font-weight: 900; }
+    .account-use { flex: 0 0 auto; color: var(--panel); background: var(--ink); border: 1px solid var(--ink); }
+    .account-quota { color: var(--teal); background: transparent; border: 1px solid var(--teal); }
+    .account-use:disabled, .account-quota:disabled, .account-api:disabled { opacity: .45; cursor: not-allowed; }
+    .account-api { width: 100%; margin-top: 14px; color: var(--teal); background: transparent; border: 1px solid var(--teal); }
+    .account-empty { padding: 18px; color: var(--ink-soft); border: 1px dashed var(--line); border-radius: 11px; text-align: center; font-size: 11px; }
+    .account-login { display: grid; gap: 8px; margin-top: 18px; padding: 13px 14px; color: var(--ink-soft); background: #182629; border-radius: 11px; }
+    .account-login[hidden] { display: none; }
+    .account-login strong { color: #dce5e3; font-size: 12px; }
+    .account-login pre { max-height: 210px; margin: 0; overflow: auto; color: #a8ddd7; font: 10px/1.55 "DejaVu Sans Mono", monospace; white-space: pre-wrap; overflow-wrap: anywhere; }
+    .account-login.error pre { color: #f1a08e; }
     .config-footnote { margin: 18px 0 0; padding-top: 15px; color: var(--ink-soft); border-top: 1px solid var(--line); font-size: 10px; line-height: 1.55; }
     .toast { position: fixed; right: 22px; bottom: 22px; z-index: 30; max-width: 360px; padding: 13px 16px; border-radius: 11px; color: white; background: var(--good); box-shadow: var(--shadow); white-space: pre-line; transform: translateY(90px); opacity: 0; transition: .25s ease; }
     .toast.show { transform: translateY(0); opacity: 1; }
@@ -933,6 +1187,7 @@ HTML = r'''<!doctype html>
       <div><p class="eyebrow">Local inference control</p><h1>Codex Routing Desk</h1></div>
       <div class="top-actions">
         <div class="status-line"><span id="pulse" class="pulse"></span><span id="health">Connecting to gateway...</span></div>
+        <button id="account-config-open" class="config-open" type="button">Accounts</button>
         <button id="provider-config-open" class="config-open" type="button">Provider config</button>
       </div>
     </header>
@@ -1082,6 +1337,30 @@ HTML = r'''<!doctype html>
       <p class="config-footnote">The built-in provider backend handles all actions. Save stores the provider without changing the active route. The Key is stored locally with mode 0600 and is never returned to this page. Test sends a minimal live Responses request with the model currently selected on this page, which uses a small amount of Provider tokens. Activate switches Codex, regenerates the claudex gateway, and restarts CLIProxyAPI. Delete is available only for inactive providers.</p>
     </aside>
   </div>
+  <div id="account-config-layer" class="config-layer" hidden>
+    <button id="account-config-scrim" class="config-scrim" type="button" aria-label="Close account configuration"></button>
+    <aside class="config-drawer" role="dialog" aria-modal="true" aria-labelledby="account-config-title">
+      <header class="config-head">
+        <div><p class="eyebrow">Isolated login · shared conversations</p><h2 id="account-config-title">Codex accounts</h2></div>
+        <button id="account-config-close" class="config-close" type="button" aria-label="Close">x</button>
+      </header>
+      <form id="account-add-form" class="account-form">
+        <input id="account-add-name" name="name" maxlength="128" pattern="[a-z0-9][a-z0-9._+@-]{0,127}" placeholder="email@example.com" required autocomplete="off" aria-label="New account email">
+        <button id="account-add" class="secondary-action" type="submit">Add &amp; login</button>
+      </form>
+      <div id="account-login" class="account-login" role="status" aria-live="polite" hidden>
+        <strong id="account-login-title"></strong>
+        <pre id="account-login-output"></pre>
+      </div>
+      <div id="account-usage" class="account-login" role="status" aria-live="polite" hidden>
+        <strong id="account-usage-title"></strong>
+        <pre id="account-usage-output"></pre>
+      </div>
+      <div id="account-list" class="account-list"></div>
+      <button id="account-api" class="account-api" type="button">Use API provider for future terminals</button>
+      <p class="config-footnote">Each account keeps its own login credential. Conversations and history remain shared. Activating an account changes only new Codex processes; terminals that are already running stay on the account they started with.</p>
+    </aside>
+  </div>
   <div id="toast" class="toast" role="status" aria-live="polite"></div>
   <script>
     const app = {
@@ -1096,6 +1375,11 @@ HTML = r'''<!doctype html>
       providerSaving: false,
       providerAction: '',
       providerIsNew: false,
+      accountSaving: false,
+      accountUsageSaving: false,
+      accountUsage: null,
+      accountUsageName: '',
+      accountUsageError: '',
     };
     const $ = (id) => document.getElementById(id);
     const escapeText = (value) => value || '—';
@@ -1229,6 +1513,7 @@ HTML = r'''<!doctype html>
       $('save').disabled = app.saving || !app.dirty;
       $('save').textContent = app.saving ? 'Applying…' : app.dirty ? 'Apply selection' : 'Saved';
       $('save-state').textContent = app.saving ? 'Applying…' : `${app.draft.model} · ${app.draft.effort}`;
+      renderAccounts();
       renderUsage();
       renderRequests();
     }
@@ -1263,6 +1548,152 @@ HTML = r'''<!doctype html>
       const toast = $('toast'); toast.textContent = message; toast.className = `toast show${error ? ' error' : ''}`;
       clearTimeout(notify.timer); notify.timer = setTimeout(() => toast.classList.remove('show'), 3200);
     }
+
+    function renderAccounts() {
+      const accounts = app.state?.accounts || [];
+      const login = app.state?.account_login || {status: 'idle', output: '', error: ''};
+      const running = login.status === 'running';
+      const busy = running || app.accountSaving || app.accountUsageSaving;
+      const active = accounts.find((account) => account.active);
+      const apiMode = !active && app.state?.provider?.provider !== 'openai';
+      const unnamedAccountMode = !active && app.state?.provider?.provider === 'openai';
+      $('account-config-open').textContent = active
+        ? `Account · ${active.name}`
+        : unnamedAccountMode ? 'Account · unnamed' : `API · ${app.state?.provider?.provider || 'provider'}`;
+      $('account-list').innerHTML = accounts.length
+        ? accounts.map((account) => `
+          <article class="account-row">
+            <div class="account-name">
+              <strong>${escapeHtml(account.name)}</strong>
+              <span class="account-badges">
+                <span class="account-badge${account.active ? ' active' : ''}">${account.active ? 'active' : 'inactive'}</span>
+                <span class="account-badge">${account.logged_in ? 'logged in' : 'login needed'}</span>
+              </span>
+            </div>
+            <div class="account-row-actions">
+              <button class="account-quota" type="button" data-quota-account="${escapeHtml(account.name)}"${!account.logged_in || busy ? ' disabled' : ''}>Quota</button>
+              <button class="account-use" type="button" data-use-account="${escapeHtml(account.name)}"${account.active || !account.logged_in || busy ? ' disabled' : ''}>Activate</button>
+            </div>
+          </article>`).join('')
+        : unnamedAccountMode ? `
+          <article class="account-row">
+            <div class="account-name">
+              <strong>unnamed</strong>
+              <span class="account-badges">
+                <span class="account-badge active">active</span>
+                <span class="account-badge">legacy login</span>
+              </span>
+            </div>
+            <div class="account-row-actions">
+              <button class="account-quota" type="button" data-current-account="unnamed"${busy ? ' disabled' : ''}>Quota</button>
+            </div>
+          </article>`
+        : '<div class="account-empty">No named ChatGPT accounts yet.</div>';
+      $('account-list').querySelectorAll('[data-use-account]').forEach((button) => button.addEventListener('click', () => useAccount(button.dataset.useAccount)));
+      $('account-list').querySelectorAll('[data-quota-account]').forEach((button) => button.addEventListener('click', () => viewAccountUsage(button.dataset.quotaAccount)));
+      $('account-list').querySelectorAll('[data-current-account]').forEach((button) => button.addEventListener('click', () => viewAccountUsage(button.dataset.currentAccount, true)));
+      $('account-add-name').disabled = busy;
+      $('account-add').disabled = busy;
+      $('account-add').textContent = running ? 'Login running…' : 'Add & login';
+      $('account-api').disabled = apiMode || busy;
+      $('account-api').textContent = apiMode ? 'API provider mode is active' : 'Use API provider for future terminals';
+      $('account-login').hidden = login.status === 'idle';
+      $('account-login').classList.toggle('error', login.status === 'failed');
+      $('account-login-title').textContent = login.status === 'running'
+        ? `Logging in ${login.name}…`
+        : login.status === 'succeeded' ? `${login.name} is ready` : `Login failed for ${login.name}`;
+      $('account-login-output').textContent = [login.output, login.error].filter(Boolean).join('\n');
+      renderAccountUsage();
+    }
+
+    function renderAccountUsage() {
+      const panel = $('account-usage');
+      panel.hidden = !app.accountUsageSaving && !app.accountUsage && !app.accountUsageError;
+      panel.classList.toggle('error', Boolean(app.accountUsageError));
+      $('account-usage-title').textContent = app.accountUsageSaving
+        ? `Reading ${app.accountUsageName} quota…`
+        : app.accountUsageError ? `Quota unavailable for ${app.accountUsageName}` : `${app.accountUsageName} quota`;
+      if (app.accountUsageError) {
+        $('account-usage-output').textContent = app.accountUsageError;
+        return;
+      }
+      if (!app.accountUsage) {
+        $('account-usage-output').textContent = '';
+        return;
+      }
+      const lines = [`Plan: ${app.accountUsage.plan_type || 'unknown'}`];
+      (app.accountUsage.rate_limits || []).forEach((limit) => (limit.windows || []).forEach((window) => {
+        const remaining = window.remaining_percent !== null && Number.isFinite(Number(window.remaining_percent)) ? `${Number(window.remaining_percent).toFixed(1).replace(/\.0$/, '')}% left` : 'remaining unknown';
+        const resets = window.resets_at !== null && Number.isFinite(Number(window.resets_at)) ? new Date(Number(window.resets_at) * 1000).toLocaleString('zh-CN', {hour12: false}) : 'reset unknown';
+        lines.push(`${limit.name} / ${window.name}: ${remaining} · resets ${resets}`);
+      }));
+      $('account-usage-output').textContent = lines.join('\n');
+    }
+
+    function openAccountConfig() {
+      $('provider-config-layer').hidden = true;
+      $('account-config-layer').hidden = false;
+      document.body.style.overflow = 'hidden';
+      $('account-add-name').focus();
+    }
+    function closeAccountConfig() {
+      if (app.accountSaving) return;
+      $('account-config-layer').hidden = true;
+      document.body.style.overflow = '';
+      $('account-config-open').focus();
+    }
+    async function accountStateRequest(path, payload, successMessage) {
+      if (app.accountSaving) return;
+      app.accountSaving = true;
+      renderAccounts();
+      try {
+        const response = await fetch(path, {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+        const state = await response.json();
+        if (!response.ok) throw new Error(state.error || `HTTP ${response.status}`);
+        app.state = state;
+        if (!app.dirty) app.draft = {...state.selection};
+        render();
+        notify(successMessage);
+      } catch (error) {
+        notify(`Account update failed: ${error.message}`, true);
+      } finally {
+        app.accountSaving = false;
+        renderAccounts();
+      }
+    }
+    function startAccountLogin(event) {
+      event.preventDefault();
+      if (!$('account-add-form').reportValidity()) return;
+      const name = $('account-add-name').value.trim();
+      accountStateRequest('/api/accounts/login', {name}, `Device login started for ${name}.`);
+    }
+    function useAccount(name) {
+      accountStateRequest('/api/accounts/use', {name}, `Future Codex terminals will use ${name}.`);
+    }
+    function useApiMode() {
+      accountStateRequest('/api/accounts/api', {}, 'Future Codex terminals will use the API provider.');
+    }
+    async function viewAccountUsage(name, current = false) {
+      if (app.accountUsageSaving) return;
+      app.accountUsageSaving = true;
+      app.accountUsage = null;
+      app.accountUsageName = name;
+      app.accountUsageError = '';
+      renderAccounts();
+      try {
+        const payload = current ? {current: true} : {name};
+        const response = await fetch('/api/accounts/usage', {method: 'POST', headers: {'Content-Type': 'application/json'}, body: JSON.stringify(payload)});
+        const result = await response.json();
+        if (!response.ok) throw new Error(result.error || `HTTP ${response.status}`);
+        app.accountUsage = result;
+      } catch (error) {
+        app.accountUsageError = error.message;
+      } finally {
+        app.accountUsageSaving = false;
+        renderAccounts();
+      }
+    }
+
     function clearProviderTestResult() {
       const result = $('provider-test-result');
       result.hidden = true;
@@ -1284,8 +1715,9 @@ HTML = r'''<!doctype html>
     }
     function populateProviderPicker(selectedName) {
       const providers = app.state?.providers || [];
+      const namedAccountActive = (app.state?.accounts || []).some((account) => account.active);
       $('provider-picker').innerHTML = providers.length
-        ? providers.map((provider) => `<option value="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}${provider.active ? ' · active' : ''}</option>`).join('')
+        ? providers.map((provider) => `<option value="${escapeHtml(provider.name)}">${escapeHtml(provider.name)}${provider.active ? namedAccountActive ? ' · saved API' : ' · active' : ''}</option>`).join('')
         : '<option value="">No providers configured</option>';
       if (selectedName && providerByName(selectedName)) $('provider-picker').value = selectedName;
     }
@@ -1327,6 +1759,7 @@ HTML = r'''<!doctype html>
       updateProviderActions(provider);
     }
     function openProviderConfig() {
+      $('account-config-layer').hidden = true;
       const current = app.state?.provider?.provider || app.state?.providers?.[0]?.name;
       populateProviderPicker(current);
       editProvider(providerByName(current));
@@ -1467,6 +1900,11 @@ HTML = r'''<!doctype html>
 
     $('instant').addEventListener('click', toggleInstantSwitch);
     $('save').addEventListener('click', save);
+    $('account-config-open').addEventListener('click', openAccountConfig);
+    $('account-config-close').addEventListener('click', closeAccountConfig);
+    $('account-config-scrim').addEventListener('click', closeAccountConfig);
+    $('account-add-form').addEventListener('submit', startAccountLogin);
+    $('account-api').addEventListener('click', useApiMode);
     $('provider-config-open').addEventListener('click', openProviderConfig);
     $('provider-config-close').addEventListener('click', closeProviderConfig);
     $('provider-config-scrim').addEventListener('click', closeProviderConfig);
@@ -1481,6 +1919,7 @@ HTML = r'''<!doctype html>
     $('provider-delete').addEventListener('click', deleteSelectedProvider);
     $('provider-switch').addEventListener('click', useSelectedProvider);
     document.addEventListener('keydown', (event) => {
+      if (event.key === 'Escape' && !$('account-config-layer').hidden) { closeAccountConfig(); return; }
       if (event.key === 'Escape' && !$('provider-config-layer').hidden) { closeProviderConfig(); return; }
       if ((event.ctrlKey || event.metaKey) && event.key.toLowerCase() === 's' && !$('provider-config-layer').hidden) {
         event.preventDefault(); $('provider-form').requestSubmit(); return;
@@ -1565,6 +2004,10 @@ class ManagerHandler(BaseHTTPRequestHandler):
             "/api/providers/test",
             "/api/providers/switch",
             "/api/providers/delete",
+            "/api/accounts/login",
+            "/api/accounts/use",
+            "/api/accounts/api",
+            "/api/accounts/usage",
         }:
             self.send_error(404)
             return
@@ -1579,8 +2022,17 @@ class ManagerHandler(BaseHTTPRequestHandler):
                 return
             elif self.path == "/api/providers/switch":
                 switch_provider(payload)
-            else:
+            elif self.path == "/api/providers/delete":
                 delete_provider(payload)
+            elif self.path == "/api/accounts/login":
+                start_account_login(payload)
+            elif self.path == "/api/accounts/use":
+                use_account(payload)
+            elif self.path == "/api/accounts/usage":
+                self._send_json(200, read_account_usage(payload))
+                return
+            else:
+                activate_api_mode()
             time.sleep(0.35)
             self._send_json(200, build_state())
         except PermissionError as error:

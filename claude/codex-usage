@@ -1,0 +1,714 @@
+#!/usr/bin/env python3
+"""Read Codex quota and token activity from the current login or Chrome."""
+
+from __future__ import annotations
+
+import argparse
+import json
+import os
+import re
+import select
+import shutil
+import subprocess
+import sys
+import time
+import urllib.error
+import urllib.request
+from datetime import datetime
+from pathlib import Path
+from typing import Any
+from urllib.parse import urlparse
+
+
+DEFAULT_PORTS = (9223, 9222)
+LOCAL_URL_OPENER = urllib.request.build_opener(urllib.request.ProxyHandler({}))
+ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._+@-]{0,127}$")
+
+FETCH_EXPRESSION = r"""
+(async () => {
+  const sessionResponse = await fetch('/api/auth/session', {credentials: 'include'});
+  if (!sessionResponse.ok) {
+    throw new Error(`ChatGPT session request failed: HTTP ${sessionResponse.status}`);
+  }
+
+  const session = await sessionResponse.json();
+  if (!session?.accessToken) {
+    throw new Error('The Chrome tab is not logged in to ChatGPT');
+  }
+
+  const accountId = session?.account?.id ?? session?.account?.accountId ?? session?.account_id;
+  const headers = {
+    Accept: 'application/json',
+    Authorization: `Bearer ${session.accessToken}`
+  };
+  if (accountId) headers['ChatGPT-Account-Id'] = accountId;
+
+  const fetchJson = async path => {
+    const response = await fetch(path, {credentials: 'include', headers});
+    let body = null;
+    try { body = await response.json(); } catch {}
+    if (!response.ok) {
+      const detail = body?.detail ?? body?.error ?? body?.message;
+      throw new Error(`${path}: HTTP ${response.status}${detail ? `: ${detail}` : ''}`);
+    }
+    return body;
+  };
+
+  const windowView = value => value && typeof value === 'object' ? {
+    used_percent: value.used_percent,
+    limit_window_seconds: value.limit_window_seconds,
+    reset_after_seconds: value.reset_after_seconds,
+    reset_at: value.reset_at
+  } : null;
+
+  const rateView = value => value && typeof value === 'object' ? {
+    allowed: value.allowed,
+    limit_reached: value.limit_reached,
+    primary_window: windowView(value.primary_window),
+    secondary_window: windowView(value.secondary_window)
+  } : null;
+
+  const usage = await fetchJson('/backend-api/wham/usage');
+  let profile = null;
+  let profileError = null;
+  try {
+    profile = await fetchJson('/backend-api/wham/profiles/me');
+  } catch (error) {
+    profileError = error instanceof Error ? error.message : String(error);
+  }
+
+  const stats = profile?.stats;
+  return {
+    plan_type: usage?.plan_type ?? null,
+    rate_limit: rateView(usage?.rate_limit),
+    code_review_rate_limit: rateView(usage?.code_review_rate_limit),
+    additional_rate_limits: Array.isArray(usage?.additional_rate_limits)
+      ? usage.additional_rate_limits.map(item => ({
+          limit_name: item?.limit_name ?? null,
+          rate_limit: rateView(item?.rate_limit)
+        }))
+      : [],
+    credits: usage?.credits ? {
+      has_credits: usage.credits.has_credits,
+      unlimited: usage.credits.unlimited,
+      balance: usage.credits.balance
+    } : null,
+    spend_control_reached: usage?.spend_control?.reached ?? null,
+    token_usage: stats ? {
+      lifetime_tokens: stats.lifetime_tokens,
+      peak_daily_tokens: stats.peak_daily_tokens,
+      longest_running_turn_sec: stats.longest_running_turn_sec,
+      current_streak_days: stats.current_streak_days,
+      longest_streak_days: stats.longest_streak_days,
+      daily_usage_buckets: Array.isArray(stats.daily_usage_buckets)
+        ? stats.daily_usage_buckets.map(item => ({
+            start_date: item.start_date,
+            tokens: item.tokens
+          }))
+        : null
+    } : null,
+    token_usage_error: profileError
+  };
+})()
+"""
+
+
+class UsageError(RuntimeError):
+    pass
+
+
+def _top_level_config_string(path: Path, key: str) -> str | None:
+    try:
+        lines = path.read_text(encoding="utf-8").splitlines()
+    except OSError:
+        return None
+    pattern = re.compile(rf'^\s*{re.escape(key)}\s*=\s*"([^"]*)"')
+    for line in lines:
+        if line.lstrip().startswith("["):
+            break
+        match = pattern.match(line)
+        if match:
+            return match.group(1)
+    return None
+
+
+def _uses_unnamed_chatgpt_account(codex_home: Path) -> bool:
+    if _top_level_config_string(codex_home / "config.toml", "model_provider") != "openai":
+        return False
+    try:
+        auth = json.loads((codex_home / "auth.json").read_text(encoding="utf-8"))
+    except (OSError, json.JSONDecodeError):
+        return False
+    return isinstance(auth, dict) and auth.get("auth_mode") == "chatgpt" and isinstance(
+        auth.get("tokens"), dict
+    )
+
+
+def resolve_account_home(
+    account: str | None,
+    *,
+    codex_home: Path | None = None,
+    accounts_dir: Path | None = None,
+    active_file: Path | None = None,
+) -> tuple[str, Path, Path]:
+    codex_home = Path(codex_home or os.environ.get("CODEX_HOME", Path.home() / ".codex"))
+    accounts_dir = Path(
+        accounts_dir
+        or os.environ.get("CODEX_ACCOUNTS_DIR", Path.home() / ".local/share/codex/accounts")
+    )
+    active_file = Path(active_file or Path.home() / ".config/codex/active-account")
+    if account is None:
+        try:
+            account = active_file.read_text(encoding="utf-8").strip()
+        except FileNotFoundError as error:
+            if _uses_unnamed_chatgpt_account(codex_home):
+                return "unnamed", codex_home, codex_home
+            raise UsageError(
+                "No named account is selected; use 'codex-auth use NAME' or pass --account NAME"
+            ) from error
+    if not ACCOUNT_NAME_PATTERN.fullmatch(account):
+        raise UsageError("Invalid named account")
+    account_home = accounts_dir / account
+    auth_file = account_home / "auth.json"
+    if account_home.is_symlink() or not account_home.is_dir():
+        raise UsageError(f"Named account does not exist: {account}")
+    if auth_file.is_symlink() or not auth_file.is_file():
+        raise UsageError(f"Named account is not logged in: {account}")
+    return account, account_home, codex_home
+
+
+def _send_jsonrpc(process: subprocess.Popen[str], message: dict[str, Any]) -> None:
+    if process.stdin is None:
+        raise UsageError("Codex app-server input is unavailable")
+    try:
+        process.stdin.write(json.dumps(message, separators=(",", ":")) + "\n")
+        process.stdin.flush()
+    except OSError as error:
+        raise UsageError(f"Codex app-server connection closed: {error}") from error
+
+
+def _read_jsonrpc_response(
+    process: subprocess.Popen[str], request_id: int, timeout: float
+) -> dict[str, Any]:
+    if process.stdout is None:
+        raise UsageError("Codex app-server output is unavailable")
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        remaining = max(0.0, deadline - time.monotonic())
+        ready, _, _ = select.select([process.stdout], [], [], remaining)
+        if not ready:
+            break
+        line = process.stdout.readline()
+        if not line:
+            break
+        try:
+            message = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+        if message.get("id") != request_id:
+            continue
+        error = message.get("error")
+        if isinstance(error, dict):
+            raise UsageError(str(error.get("message") or "Codex app-server request failed"))
+        result = message.get("result")
+        if not isinstance(result, dict):
+            raise UsageError("Codex app-server returned an invalid response")
+        return result
+    raise UsageError("Timed out waiting for Codex account usage")
+
+
+def fetch_account_usage(
+    account: str | None, timeout: float
+) -> tuple[str, dict[str, Any], dict[str, Any] | None, str | None]:
+    account_name, account_home, shared_codex_home = resolve_account_home(account)
+    codex = shutil.which("codex")
+    if not codex:
+        raise UsageError("Codex executable not found")
+    command = [
+        codex,
+        "app-server",
+        "-c",
+        'model_provider="openai"',
+        "-c",
+        'preferred_auth_method="chatgpt"',
+        "-c",
+        'forced_login_method="chatgpt"',
+        "-c",
+        'cli_auth_credentials_store="file"',
+    ]
+    environment = os.environ.copy()
+    environment["CODEX_HOME"] = str(account_home)
+    environment["CODEX_SQLITE_HOME"] = str(shared_codex_home)
+    try:
+        process = subprocess.Popen(
+            command,
+            stdin=subprocess.PIPE,
+            stdout=subprocess.PIPE,
+            stderr=subprocess.DEVNULL,
+            text=True,
+            bufsize=1,
+            env=environment,
+        )
+    except OSError as error:
+        raise UsageError(f"Cannot start Codex app-server: {error}") from error
+
+    token_usage = None
+    token_usage_error = None
+    deadline = time.monotonic() + timeout
+
+    def remaining() -> float:
+        return max(0.001, deadline - time.monotonic())
+
+    try:
+        _send_jsonrpc(
+            process,
+            {
+                "id": 1,
+                "method": "initialize",
+                "params": {
+                    "clientInfo": {
+                        "name": "codex_usage",
+                        "title": "Codex Usage",
+                        "version": "1.0.0",
+                    }
+                },
+            },
+        )
+        _read_jsonrpc_response(process, 1, remaining())
+        _send_jsonrpc(process, {"method": "initialized"})
+        _send_jsonrpc(process, {"id": 2, "method": "account/rateLimits/read"})
+        rate_limits = _read_jsonrpc_response(process, 2, remaining())
+        try:
+            _send_jsonrpc(process, {"id": 3, "method": "account/usage/read"})
+            token_usage = _read_jsonrpc_response(process, 3, remaining())
+        except UsageError as error:
+            token_usage_error = str(error)
+        return account_name, rate_limits, token_usage, token_usage_error
+    finally:
+        if process.stdin is not None:
+            try:
+                process.stdin.close()
+            except OSError:
+                pass
+        if process.poll() is None:
+            process.terminate()
+        try:
+            process.wait(timeout=2)
+        except subprocess.TimeoutExpired:
+            process.kill()
+            process.wait(timeout=2)
+        if process.stdout is not None:
+            process.stdout.close()
+
+
+def _app_server_window(name: str, value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    used = _number(value.get("usedPercent"))
+    duration_mins = _number(value.get("windowDurationMins"))
+    return {
+        "name": name,
+        "used_percent": used,
+        "remaining_percent": None if used is None else max(0.0, min(100.0, 100.0 - used)),
+        "window_seconds": None if duration_mins is None else int(duration_mins * 60),
+        "reset_after_seconds": None,
+        "resets_at": value.get("resetsAt"),
+    }
+
+
+def build_app_server_snapshot(
+    account: str,
+    rate_payload: dict[str, Any],
+    token_payload: dict[str, Any] | None,
+    token_usage_error: str | None = None,
+    *,
+    fetched_at: str | None = None,
+) -> dict[str, Any]:
+    primary_snapshot = rate_payload.get("rateLimits")
+    snapshots = rate_payload.get("rateLimitsByLimitId")
+    if not isinstance(snapshots, dict) or not snapshots:
+        snapshots = {"codex": primary_snapshot}
+    limits = []
+    for limit_id, snapshot in sorted(snapshots.items(), key=lambda item: item[0] != "codex"):
+        if not isinstance(snapshot, dict):
+            continue
+        windows = [
+            window
+            for window in (
+                _app_server_window("primary", snapshot.get("primary")),
+                _app_server_window("secondary", snapshot.get("secondary")),
+            )
+            if window is not None
+        ]
+        if windows:
+            limits.append(
+                {
+                    "name": snapshot.get("limitName") or ("Codex" if limit_id == "codex" else limit_id),
+                    "allowed": None,
+                    "limit_reached": bool(snapshot.get("rateLimitReachedType")),
+                    "windows": windows,
+                }
+            )
+
+    primary_snapshot = primary_snapshot if isinstance(primary_snapshot, dict) else {}
+    summary = token_payload.get("summary") if isinstance(token_payload, dict) else None
+    buckets = token_payload.get("dailyUsageBuckets") if isinstance(token_payload, dict) else None
+    token_usage = None
+    if isinstance(summary, dict):
+        token_usage = {
+            "lifetime_tokens": summary.get("lifetimeTokens"),
+            "peak_daily_tokens": summary.get("peakDailyTokens"),
+            "longest_running_turn_sec": summary.get("longestRunningTurnSec"),
+            "current_streak_days": summary.get("currentStreakDays"),
+            "longest_streak_days": summary.get("longestStreakDays"),
+            "daily_usage_buckets": [
+                {"start_date": item.get("startDate"), "tokens": item.get("tokens")}
+                for item in buckets or []
+                if isinstance(item, dict)
+            ],
+        }
+    credits = primary_snapshot.get("credits")
+    if isinstance(credits, dict):
+        credits = {
+            "has_credits": credits.get("hasCredits"),
+            "unlimited": credits.get("unlimited"),
+            "balance": credits.get("balance"),
+        }
+    return {
+        "fetched_at": fetched_at or datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": "codex_app_server",
+        "account": account,
+        "plan_type": primary_snapshot.get("planType"),
+        "rate_limits": limits,
+        "credits": credits if isinstance(credits, dict) else None,
+        "spend_control_reached": primary_snapshot.get("spendControlReached"),
+        "token_usage": token_usage,
+        "token_usage_error": token_usage_error,
+        "remaining_tokens": None,
+        "remaining_tokens_note": (
+            "OpenAI exposes token activity and quota percentages, not a fixed token balance."
+        ),
+    }
+
+
+def _json_from_url(url: str, timeout: float) -> Any:
+    try:
+        with LOCAL_URL_OPENER.open(url, timeout=timeout) as response:
+            return json.load(response)
+    except (OSError, urllib.error.URLError, json.JSONDecodeError) as error:
+        raise UsageError(f"Cannot connect to {url}: {error}") from error
+
+
+def _find_chatgpt_target(port: int, timeout: float) -> dict[str, Any]:
+    targets = _json_from_url(f"http://127.0.0.1:{port}/json/list", timeout)
+    for target in targets:
+        parsed = urlparse(target.get("url", ""))
+        if (
+            target.get("type") == "page"
+            and parsed.hostname in {"chatgpt.com", "www.chatgpt.com"}
+            and target.get("webSocketDebuggerUrl")
+        ):
+            return target
+    raise UsageError(
+        f"Chrome on port {port} has no ChatGPT tab; open https://chatgpt.com first"
+    )
+
+
+def _evaluate(target: dict[str, Any], timeout: float) -> dict[str, Any]:
+    try:
+        import websocket
+    except ImportError as error:
+        raise UsageError(
+            "Missing dependency: install it with 'python3 -m pip install websocket-client'"
+        ) from error
+
+    try:
+        connection = websocket.create_connection(
+            target["webSocketDebuggerUrl"],
+            timeout=timeout,
+            suppress_origin=True,
+        )
+    except Exception as error:
+        raise UsageError(f"Cannot attach to the ChatGPT tab: {error}") from error
+
+    request_id = 1
+    request = {
+        "id": request_id,
+        "method": "Runtime.evaluate",
+        "params": {
+            "expression": FETCH_EXPRESSION,
+            "awaitPromise": True,
+            "returnByValue": True,
+        },
+    }
+
+    try:
+        connection.send(json.dumps(request, separators=(",", ":")))
+        while True:
+            message = json.loads(connection.recv())
+            if message.get("id") == request_id:
+                break
+    except Exception as error:
+        raise UsageError(f"Chrome DevTools request failed: {error}") from error
+    finally:
+        connection.close()
+
+    result = message.get("result", {}).get("result", {})
+    exception = message.get("result", {}).get("exceptionDetails") or {}
+    if exception or result.get("subtype") == "error":
+        description = result.get("description") or exception.get("text", "Unknown error")
+        raise UsageError(description.splitlines()[0])
+
+    value = result.get("value")
+    if not isinstance(value, dict):
+        raise UsageError("ChatGPT returned an unexpected usage response")
+    return value
+
+
+def fetch_usage(port: int | None, timeout: float) -> tuple[int, dict[str, Any]]:
+    errors: list[str] = []
+    for candidate in (port,) if port is not None else DEFAULT_PORTS:
+        try:
+            target = _find_chatgpt_target(candidate, timeout)
+            return candidate, _evaluate(target, timeout)
+        except UsageError as error:
+            errors.append(str(error))
+
+    details = "; ".join(errors)
+    raise UsageError(
+        "No usable Chrome debugging session found. Start Chrome with a loopback "
+        f"--remote-debugging-port and log in to ChatGPT. Details: {details}"
+    )
+
+
+def _number(value: Any) -> float | None:
+    if isinstance(value, bool) or value is None:
+        return None
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return None
+
+
+def _normalize_window(name: str, value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    used = _number(value.get("used_percent"))
+    remaining = None if used is None else max(0.0, min(100.0, 100.0 - used))
+    return {
+        "name": name,
+        "used_percent": used,
+        "remaining_percent": remaining,
+        "window_seconds": value.get("limit_window_seconds"),
+        "reset_after_seconds": value.get("reset_after_seconds"),
+        "resets_at": value.get("reset_at"),
+    }
+
+
+def _normalize_limit(name: str, value: Any) -> dict[str, Any] | None:
+    if not isinstance(value, dict):
+        return None
+    windows = [
+        window
+        for window in (
+            _normalize_window("primary", value.get("primary_window")),
+            _normalize_window("secondary", value.get("secondary_window")),
+        )
+        if window is not None
+    ]
+    if not windows:
+        return None
+    return {
+        "name": name,
+        "allowed": value.get("allowed"),
+        "limit_reached": value.get("limit_reached"),
+        "windows": windows,
+    }
+
+
+def build_snapshot(port: int, raw: dict[str, Any]) -> dict[str, Any]:
+    limits: list[dict[str, Any]] = []
+    main_limit = _normalize_limit("Codex", raw.get("rate_limit"))
+    if main_limit:
+        limits.append(main_limit)
+
+    review_limit = _normalize_limit("Code review", raw.get("code_review_rate_limit"))
+    if review_limit:
+        limits.append(review_limit)
+
+    for index, item in enumerate(raw.get("additional_rate_limits") or [], start=1):
+        if not isinstance(item, dict):
+            continue
+        name = item.get("limit_name") or f"Additional limit {index}"
+        limit = _normalize_limit(name, item.get("rate_limit"))
+        if limit:
+            limits.append(limit)
+
+    token_usage = raw.get("token_usage")
+    if isinstance(token_usage, dict) and isinstance(
+        token_usage.get("daily_usage_buckets"), list
+    ):
+        token_usage["daily_usage_buckets"] = sorted(
+            token_usage["daily_usage_buckets"],
+            key=lambda item: item.get("start_date", ""),
+        )
+
+    return {
+        "fetched_at": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "source": "chatgpt_chrome_session",
+        "chrome_debug_port": port,
+        "plan_type": raw.get("plan_type"),
+        "rate_limits": limits,
+        "credits": raw.get("credits"),
+        "spend_control_reached": raw.get("spend_control_reached"),
+        "token_usage": token_usage if isinstance(token_usage, dict) else None,
+        "token_usage_error": raw.get("token_usage_error"),
+        "remaining_tokens": None,
+        "remaining_tokens_note": (
+            "OpenAI exposes token activity and quota percentages, not a fixed token balance."
+        ),
+    }
+
+
+def _format_number(value: Any) -> str:
+    number = _number(value)
+    if number is None:
+        return "unknown"
+    if number.is_integer():
+        return f"{int(number):,}"
+    return f"{number:,.2f}"
+
+
+def _format_percent(value: Any) -> str:
+    number = _number(value)
+    if number is None:
+        return "unknown"
+    if number.is_integer():
+        return f"{int(number)}%"
+    return f"{number:.1f}%"
+
+
+def _format_duration(seconds: Any) -> str:
+    value = _number(seconds)
+    if value is None:
+        return "window unknown"
+    total = int(value)
+    if total % 86400 == 0:
+        return f"{total // 86400}d"
+    if total % 3600 == 0:
+        return f"{total // 3600}h"
+    if total % 60 == 0:
+        return f"{total // 60}m"
+    return f"{total}s"
+
+
+def _format_time(timestamp: Any) -> str:
+    value = _number(timestamp)
+    if value is None:
+        return "unknown"
+    return datetime.fromtimestamp(value).astimezone().strftime("%Y-%m-%d %H:%M:%S %Z")
+
+
+def format_human(snapshot: dict[str, Any]) -> str:
+    lines = [
+        f"Codex usage - {snapshot['fetched_at']}",
+        f"Account: {snapshot['account']}" if snapshot.get("account") else None,
+        f"Plan: {snapshot.get('plan_type') or 'unknown'}",
+        "",
+        "Rate limits",
+    ]
+    lines = [line for line in lines if line is not None]
+
+    limits = snapshot.get("rate_limits") or []
+    if not limits:
+        lines.append("  unavailable")
+    for limit in limits:
+        for window in limit["windows"]:
+            label = f"{limit['name']} / {window['name']} ({_format_duration(window['window_seconds'])})"
+            lines.append(
+                f"  {label}: {_format_percent(window['remaining_percent'])} left "
+                f"({_format_percent(window['used_percent'])} used), "
+                f"resets {_format_time(window['resets_at'])}"
+            )
+
+    credits = snapshot.get("credits")
+    if isinstance(credits, dict):
+        if credits.get("unlimited"):
+            lines.append("Credits: unlimited")
+        elif credits.get("has_credits"):
+            lines.append(f"Credits: {_format_number(credits.get('balance'))}")
+        else:
+            lines.append("Credits: not enabled")
+    if snapshot.get("spend_control_reached"):
+        lines.append("Spend control: reached")
+
+    lines.extend(["", "Token activity (usage, not a remaining-token balance)"])
+    token_usage = snapshot.get("token_usage")
+    if isinstance(token_usage, dict):
+        lines.append(f"  Lifetime: {_format_number(token_usage.get('lifetime_tokens'))}")
+        lines.append(f"  Peak day: {_format_number(token_usage.get('peak_daily_tokens'))}")
+        buckets = token_usage.get("daily_usage_buckets") or []
+        if buckets:
+            latest = buckets[-1]
+            lines.append(
+                f"  Latest day ({latest.get('start_date', 'unknown')}): "
+                f"{_format_number(latest.get('tokens'))}"
+            )
+    else:
+        lines.append(f"  unavailable: {snapshot.get('token_usage_error') or 'unknown error'}")
+
+    return "\n".join(lines)
+
+
+def parse_args() -> argparse.Namespace:
+    parser = argparse.ArgumentParser(
+        description=(
+            "Read Codex quota percentages and token activity from the current Codex account."
+        ),
+        epilog="Continuous refresh: watch -n 30 codex-usage",
+    )
+    parser.add_argument(
+        "--account",
+        help="named Codex account (default: current named or legacy unnamed account)",
+    )
+    parser.add_argument(
+        "--browser",
+        action="store_true",
+        help="use the legacy logged-in Chrome method instead of Codex app-server",
+    )
+    parser.add_argument(
+        "--port",
+        type=int,
+        help="Chrome remote-debugging port; implies --browser (default: try 9223, then 9222)",
+    )
+    parser.add_argument("--json", action="store_true", help="print machine-readable JSON")
+    parser.add_argument("--timeout", type=float, default=10.0, help="request timeout in seconds")
+    return parser.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    try:
+        if args.browser or args.port is not None:
+            port, raw = fetch_usage(args.port, args.timeout)
+            snapshot = build_snapshot(port, raw)
+        else:
+            account, rate_limits, token_usage, token_usage_error = fetch_account_usage(
+                args.account, args.timeout
+            )
+            snapshot = build_app_server_snapshot(
+                account, rate_limits, token_usage, token_usage_error
+            )
+    except UsageError as error:
+        print(f"codex-usage: {error}", file=sys.stderr)
+        return 2
+
+    if args.json:
+        print(json.dumps(snapshot, ensure_ascii=True, indent=2))
+    else:
+        print(format_human(snapshot))
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

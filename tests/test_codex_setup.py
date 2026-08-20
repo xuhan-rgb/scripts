@@ -1,3 +1,4 @@
+import base64
 import importlib.util
 import io
 import json
@@ -14,6 +15,11 @@ REPOSITORY = Path(__file__).parents[1]
 SETUP_SCRIPT = REPOSITORY / "claude" / "setup-codex.sh"
 INSTALL_SCRIPT = REPOSITORY / "claude" / "install-codex-bridge.sh"
 AUTH_SWITCH_SCRIPT = REPOSITORY / "claude" / "switch-codex-auth.sh"
+USAGE_SCRIPT = REPOSITORY / "claude" / "codex-usage"
+USAGE_WIDGET = REPOSITORY / "codex-usage-widget"
+ACCOUNT_MANAGER_QT = REPOSITORY / "claude" / "codex_account_manager_qt.py"
+ACCOUNT_MANAGER_BACKEND = REPOSITORY / "claude" / "codex_account_manager_backend.py"
+ACCOUNT_MANAGER_ICON = REPOSITORY / "claude" / "codex-account-manager.svg"
 PROVIDER_SCRIPT = REPOSITORY / "claude" / "codex_provider.py"
 PROVIDER_SPEC = importlib.util.spec_from_file_location("codex_provider", PROVIDER_SCRIPT)
 provider = importlib.util.module_from_spec(PROVIDER_SPEC)
@@ -116,6 +122,9 @@ class CodexSetupTests(unittest.TestCase):
         self.assertIn('cmp -s "${tmp_dir}/claudex" "${BIN_DIR}/claudex"', installer)
         self.assertIn('cmp -s "${tmp_dir}/${SERVICE_NAME}" "${UNIT_FILE}"', installer)
         self.assertIn('cmp -s "${tmp_dir}/${MANAGER_SERVICE_NAME}" "${MANAGER_UNIT_FILE}"', installer)
+        self.assertIn('readonly PROXY_ENV_FILE="${STATE_DIR}/proxy.env"', installer)
+        self.assertIn('EnvironmentFile=-%h/.cli-proxy-api/proxy.env', installer)
+        self.assertIn('install -m 0600 "${tmp_dir}/proxy.env" "${PROXY_ENV_FILE}"', installer)
         self.assertIn('"${LIB_DIR}/codex_provider.py"', installer)
         self.assertIn('systemctl --user disable --now "${SERVICE_NAME}"', installer)
         self.assertNotIn('"${BIN_DIR}/codex-provider"', installer)
@@ -178,7 +187,7 @@ class CodexSetupTests(unittest.TestCase):
             self.assertEqual(completed.returncode, 0, completed.stderr)
             self.assertIn(str(yolo_settings), completed.stdout.splitlines())
 
-    def test_default_modes_keep_all_skills_and_yolo_uses_dedicated_settings(self):
+    def test_claude_defaults_and_codex_minimal_skill_set_are_configured(self):
         setup = SETUP_SCRIPT.read_text(encoding="utf-8")
 
         self.assertIn(
@@ -220,7 +229,11 @@ class CodexSetupTests(unittest.TestCase):
             setup,
         )
         self.assertIn(
-            "alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox -p yolo'",
+            'codex-auth run -- "$@"',
+            setup,
+        )
+        self.assertIn(
+            "alias codex-yolo='codex-auth run -- --dangerously-bypass-approvals-and-sandbox -p yolo'",
             setup,
         )
         self.assertNotIn(" -c ~/.codex/config.yolo.toml", setup)
@@ -229,6 +242,11 @@ class CodexSetupTests(unittest.TestCase):
         with tempfile.TemporaryDirectory() as directory:
             home = Path(directory)
             bashrc = home / ".bashrc"
+            shell_functions = home / "shell-functions.sh"
+            shell_functions.write_text(
+                "codex() { command codex \"$@\"; }\n",
+                encoding="utf-8",
+            )
             legacy_provider = home / ".local" / "bin" / "codex-provider"
             legacy_provider.parent.mkdir(parents=True)
             legacy_provider.write_text("#!/bin/sh\nexit 0\n", encoding="utf-8")
@@ -254,6 +272,8 @@ class CodexSetupTests(unittest.TestCase):
                 )
             bashrc.write_text(
                 "# keep this line\n"
+                f'source "{shell_functions}"\n'
+                "alias codex='old-codex-launcher'\n"
                 "alias codex-yolo='old-codex-command'\n"
                 "  alias claude-yolo=\"old-claude-command\"\n"
                 "alias claudex-yolo='old-claudex-command'\n",
@@ -301,7 +321,18 @@ class CodexSetupTests(unittest.TestCase):
                         encoding="utf-8",
                     )
                     with config_path.open("a", encoding="utf-8") as config_file:
-                        config_file.write('\n[plugins."unused@example"]\nenabled = true\n')
+                        config_file.write(
+                            '\n[plugins."unused@example"]\nenabled = true\n\n'
+                            '[mcp_servers.node_repl]\n'
+                            'command = "/usr/bin/node-repl"\n'
+                            'enabled = false\n\n'
+                            '[mcp_servers.node_repl.env]\n'
+                            'NODE_PATH = "/usr/bin/node"\n'
+                            'enabled = false\n\n'
+                            '[[skills.config]]\n'
+                            'path = "/tmp/legacy-extra/SKILL.md"\n'
+                            'enabled = true\n'
+                        )
 
             config = home / ".codex" / "config.toml"
             yolo_config = home / ".codex" / "yolo.config.toml"
@@ -317,22 +348,22 @@ class CodexSetupTests(unittest.TestCase):
             self.assertIn("[mcp_servers.openaiDeveloperDocs]", config_text)
             self.assertIn('[plugins."unused@example"]\nenabled = false', config_text)
             self.assertIn("enabled = false", config_text)
+            node_repl = config_text.split("[mcp_servers.node_repl]", 1)[1].split(
+                "[mcp_servers.node_repl.env]", 1
+            )
+            node_repl_env = node_repl[1].split("\n[", 1)[0]
+            self.assertIn("enabled = false", node_repl[0])
+            self.assertNotIn("enabled =", node_repl_env)
+            yolo_node_repl = yolo_config_text.split(
+                "[mcp_servers.node_repl]", 1
+            )[1].split("[mcp_servers.node_repl.env]", 1)
+            yolo_node_repl_env = yolo_node_repl[1].split("\n[", 1)[0]
+            self.assertIn("enabled = false", yolo_node_repl[0])
+            self.assertNotIn("enabled =", yolo_node_repl_env)
+            self.assertNotIn("/tmp/legacy-extra/SKILL.md", config_text)
+            self.assertNotIn("/tmp/legacy-extra/SKILL.md", yolo_config_text)
             self.assertIn(str(skill), config_text)
             self.assertIn("[[skills.config]]", config_text)
-            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
-                self.assertIn(
-                    'path = "'
-                    + str(home / ".agents" / "skills" / skill_name / "SKILL.md")
-                    + '"\nenabled = true',
-                    config_text,
-                )
-                self.assertIn(
-                    'path = "'
-                    + str(home / ".claude" / "skills" / skill_name / "SKILL.md")
-                    + '"\nenabled = false',
-                    config_text,
-                )
-            self.assertIn(f'path = "{codex_skill}"\nenabled = true', config_text)
             yolo_skill_names = {
                 "agent-reach",
                 "brainstorming",
@@ -350,12 +381,23 @@ class CodexSetupTests(unittest.TestCase):
                     )
                     self.assertIn(
                         f'path = "{skill_root / skill_name / "SKILL.md"}"\nenabled = {expected}',
+                        config_text,
+                    )
+                    self.assertIn(
+                        f'path = "{skill_root / skill_name / "SKILL.md"}"\nenabled = {expected}',
                         yolo_config_text,
                     )
+            self.assertIn(f'path = "{skill}"\nenabled = false', config_text)
+            self.assertIn(f'path = "{skill}"\nenabled = false', yolo_config_text)
+            self.assertIn(f'path = "{codex_skill}"\nenabled = false', config_text)
             self.assertIn(f'path = "{codex_skill}"\nenabled = false', yolo_config_text)
+            managed_skills = config_text.split(
+                "# >>> scripts disabled Codex skills >>>", 1
+            )[1]
             managed_yolo_skills = yolo_config_text.split(
                 "# >>> scripts disabled Codex skills >>>", 1
             )[1]
+            self.assertEqual(managed_skills.count("enabled = true"), 5)
             self.assertEqual(managed_yolo_skills.count("enabled = true"), 5)
             self.assertNotIn(secret_value, config_text)
             self.assertIn(secret_value, secrets.read_text(encoding="utf-8"))
@@ -388,11 +430,14 @@ class CodexSetupTests(unittest.TestCase):
                 self.assertEqual(
                     claudex_yolo_settings["skillOverrides"][skill_name], "off"
                 )
+            self.assertEqual(bashrc_text.count("codex() {"), 1)
+            self.assertEqual(bashrc_text.count("alias codex="), 0)
             self.assertEqual(bashrc_text.count("alias codex-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claude-yolo="), 1)
             self.assertEqual(bashrc_text.count("alias claudex-yolo="), 1)
             self.assertIn("# keep this line", bashrc_text)
             self.assertNotIn("old-codex-command", bashrc_text)
+            self.assertNotIn("old-codex-launcher", bashrc_text)
             self.assertNotIn("old-claude-command", bashrc_text)
             self.assertNotIn("old-claudex-command", bashrc_text)
             self.assertEqual(
@@ -400,6 +445,16 @@ class CodexSetupTests(unittest.TestCase):
                     '[ -f "$HOME/.config/codex/secrets.env" ] && source "$HOME/.config/codex/secrets.env"'
                 ),
                 1,
+            )
+            self.assertIn(
+                "codex() {",
+                bashrc_text,
+            )
+            self.assertIn('codex-auth run -- "$@"', bashrc_text)
+            self.assertNotIn("alias codex='codex-auth run --'", bashrc_text)
+            self.assertIn(
+                "alias codex-yolo='codex-auth run -- --dangerously-bypass-approvals-and-sandbox -p yolo'",
+                bashrc_text,
             )
             self.assertIn(
                 "alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'",
@@ -418,6 +473,21 @@ class CodexSetupTests(unittest.TestCase):
             self.assertFalse(legacy_provider.exists())
             self.assertIn("Agent Reach disabled by CLAUDEX_AGENT_REACH=0", output)
             self.assertTrue((home / ".claude" / "settings.json").exists())
+
+            repeated_source = subprocess.run(
+                [
+                    "bash",
+                    "--noprofile",
+                    "--norc",
+                    "-ic",
+                    'source "$HOME/.bashrc" && source "$HOME/.bashrc" '
+                    '&& [[ $(type -t codex) == function ]]',
+                ],
+                capture_output=True,
+                text=True,
+                env=environment,
+            )
+            self.assertEqual(repeated_source.returncode, 0, repeated_source.stderr)
 
     def test_existing_active_provider_is_adopted_and_initialized(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -543,7 +613,11 @@ class CodexAuthSwitchTests(unittest.TestCase):
             '[model_providers.test_route]\n'
             'base_url = "https://example.invalid/openai"\n'
             'wire_api = "responses"\n'
-            'env_key = "TEST_ROUTE_KEY"\n',
+            'env_key = "TEST_ROUTE_KEY"\n\n'
+            '[model_providers.backup_route]\n'
+            'base_url = "https://backup.example.invalid/openai"\n'
+            'wire_api = "responses"\n'
+            'env_key = "BACKUP_ROUTE_KEY"\n',
             encoding="utf-8",
         )
         self.yolo_config = self.codex_home / "yolo.config.toml"
@@ -557,15 +631,33 @@ class CodexAuthSwitchTests(unittest.TestCase):
         self.fake_bin = self.home / "bin"
         self.fake_bin.mkdir()
         self.codex_log = self.home / "codex.log"
+        self.codex_home_log = self.home / "codex-home.log"
+        self.codex_sqlite_home_log = self.home / "codex-sqlite-home.log"
         fake_codex = self.fake_bin / "codex"
         fake_codex.write_text(
             "#!/bin/sh\n"
             "printf '%s\\n' \"$*\" >> \"$FAKE_CODEX_LOG\"\n"
-            "if [ \"$1 $2\" = 'login status' ]; then\n"
-            "  [ \"${FAKE_CHATGPT_LOGIN:-0}\" = 1 ] && printf '%s\\n' 'Logged in using ChatGPT' && exit 0\n"
-            "  printf '%s\\n' 'Not logged in'\n"
-            "  exit 1\n"
-            "fi\n"
+            "printf '%s\\n' \"${CODEX_HOME:-}\" >> \"$FAKE_CODEX_HOME_LOG\"\n"
+            "printf '%s\\n' \"${CODEX_SQLITE_HOME:-}\" >> \"$FAKE_CODEX_SQLITE_HOME_LOG\"\n"
+            "case \" $* \" in\n"
+            "  *' login status '*)\n"
+            "    if [ \"${FAKE_CHATGPT_LOGIN:-0}\" = 1 ] || [ -f \"$CODEX_HOME/.fake-chatgpt-login\" ]; then\n"
+            "      printf '%s\\n' 'Logged in using ChatGPT'\n"
+            "      exit 0\n"
+            "    fi\n"
+            "    printf '%s\\n' 'Not logged in'\n"
+            "    exit 1\n"
+            "    ;;\n"
+            "  *' login '*)\n"
+            "    mkdir -p \"$CODEX_HOME\"\n"
+            "    if [ -n \"${FAKE_LOGIN_ID_TOKEN:-}\" ]; then\n"
+            "      printf '{\"auth_mode\":\"chatgpt\",\"tokens\":{\"id_token\":\"%s\"}}\\n' \"$FAKE_LOGIN_ID_TOKEN\" > \"$CODEX_HOME/auth.json\"\n"
+            "    else\n"
+            "      printf '%s\\n' '{\"fake\":true}' > \"$CODEX_HOME/auth.json\"\n"
+            "    fi\n"
+            "    : > \"$CODEX_HOME/.fake-chatgpt-login\"\n"
+            "    ;;\n"
+            "esac\n"
             "exit 0\n",
             encoding="utf-8",
         )
@@ -577,6 +669,8 @@ class CodexAuthSwitchTests(unittest.TestCase):
                 "CODEX_HOME": str(self.codex_home),
                 "PATH": f"{self.fake_bin}:{self.environment['PATH']}",
                 "FAKE_CODEX_LOG": str(self.codex_log),
+                "FAKE_CODEX_HOME_LOG": str(self.codex_home_log),
+                "FAKE_CODEX_SQLITE_HOME_LOG": str(self.codex_sqlite_home_log),
             }
         )
 
@@ -627,6 +721,20 @@ class CodexAuthSwitchTests(unittest.TestCase):
         self.assertNotIn("forced_login_method", config_text)
         self.assertIn('model_provider = "test_route"', self.yolo_config.read_text(encoding="utf-8"))
 
+    def test_api_mode_can_select_a_specific_provider(self):
+        account_result = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")
+        self.assertEqual(account_result.returncode, 0, account_result.stderr)
+
+        completed = self.run_switch("api", "backup_route")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertIn('model_provider = "backup_route"', self.config.read_text(encoding="utf-8"))
+        self.assertIn('model_provider = "backup_route"', self.yolo_config.read_text(encoding="utf-8"))
+        self.assertEqual(
+            (self.home / ".config" / "codex" / "api-provider").read_text(encoding="utf-8"),
+            "backup_route\n",
+        )
+
     def test_status_reports_the_active_mode_without_showing_secrets(self):
         completed = self.run_switch("status")
 
@@ -634,6 +742,258 @@ class CodexAuthSwitchTests(unittest.TestCase):
         self.assertIn("mode: api", completed.stdout)
         self.assertIn("provider: test_route", completed.stdout)
         self.assertNotIn("TEST_ROUTE_KEY", completed.stdout)
+
+    def test_list_includes_the_legacy_unnamed_account_shown_by_the_ui(self):
+        account_result = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")
+        self.assertEqual(account_result.returncode, 0, account_result.stderr)
+        payload = base64.urlsafe_b64encode(
+            json.dumps({"email": "legacy.user@example.com"}).encode()
+        ).decode().rstrip("=")
+        (self.codex_home / "auth.json").write_text(
+            json.dumps(
+                {
+                    "auth_mode": "chatgpt",
+                    "tokens": {"id_token": f"header.{payload}.signature"},
+                }
+            )
+            + "\n",
+            encoding="utf-8",
+        )
+
+        legacy_only = self.run_switch("list")
+
+        self.assertEqual(legacy_only.returncode, 0, legacy_only.stderr)
+        self.assertEqual(legacy_only.stdout, "* legacy.user@example.com (unnamed)\n")
+
+        add_result = self.run_switch("add", "personal")
+        self.assertEqual(add_result.returncode, 0, add_result.stderr)
+        with_named_account = self.run_switch("list")
+
+        self.assertEqual(with_named_account.returncode, 0, with_named_account.stderr)
+        self.assertEqual(
+            with_named_account.stdout,
+            "  legacy.user@example.com (unnamed)\n* personal\n",
+        )
+
+    def test_add_named_account_isolates_auth_and_shares_conversation_state(self):
+        completed = self.run_switch("add", "personal")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        account_home = self.home / ".local" / "share" / "codex" / "accounts" / "personal"
+        self.assertTrue((account_home / "auth.json").is_file())
+        self.assertFalse((account_home / "auth.json").is_symlink())
+        for directory in (
+            "sessions",
+            "archived_sessions",
+            "thread-writer-locks",
+            "attachments",
+        ):
+            self.assertEqual(
+                (account_home / directory).resolve(),
+                (self.codex_home / directory).resolve(),
+            )
+            self.assertTrue((account_home / directory).is_symlink())
+        for filename in ("history.jsonl", "session_index.jsonl", "config.toml", "yolo.config.toml"):
+            self.assertEqual(
+                (account_home / filename).resolve(),
+                (self.codex_home / filename).resolve(),
+            )
+            self.assertTrue((account_home / filename).is_symlink())
+        active_account = self.home / ".config" / "codex" / "active-account"
+        self.assertEqual(active_account.read_text(encoding="utf-8"), "personal\n")
+        self.assertEqual(active_account.stat().st_mode & 0o777, 0o600)
+
+    def test_switching_default_keeps_existing_account_credentials_unchanged(self):
+        personal_result = self.run_switch("add", "personal")
+        self.assertEqual(personal_result.returncode, 0, personal_result.stderr)
+        personal_auth = (
+            self.home / ".local" / "share" / "codex" / "accounts" / "personal" / "auth.json"
+        )
+        personal_auth_before = personal_auth.read_bytes()
+
+        work_result = self.run_switch("add", "work")
+        self.assertEqual(work_result.returncode, 0, work_result.stderr)
+        use_result = self.run_switch("use", "work")
+
+        self.assertEqual(use_result.returncode, 0, use_result.stderr)
+        self.assertEqual(personal_auth.read_bytes(), personal_auth_before)
+        self.assertEqual(
+            (self.home / ".config" / "codex" / "active-account").read_text(encoding="utf-8"),
+            "work\n",
+        )
+
+    def test_run_pins_each_process_to_the_selected_account_home(self):
+        self.assertEqual(self.run_switch("add", "personal").returncode, 0)
+        self.assertEqual(self.run_switch("add", "work").returncode, 0)
+        self.codex_home_log.write_text("", encoding="utf-8")
+        self.codex_sqlite_home_log.write_text("", encoding="utf-8")
+        self.codex_log.write_text("", encoding="utf-8")
+
+        personal_run = self.run_switch("run", "--account", "personal", "--", "resume", "thread-a")
+        self.assertEqual(personal_run.returncode, 0, personal_run.stderr)
+        self.assertEqual(self.run_switch("use", "work").returncode, 0)
+        work_run = self.run_switch("run", "--", "resume", "thread-b")
+
+        self.assertEqual(work_run.returncode, 0, work_run.stderr)
+        homes = self.codex_home_log.read_text(encoding="utf-8").splitlines()
+        sqlite_homes = self.codex_sqlite_home_log.read_text(encoding="utf-8").splitlines()
+        commands = self.codex_log.read_text(encoding="utf-8").splitlines()
+        account_root = self.home / ".local" / "share" / "codex" / "accounts"
+        resume_records = [
+            (home, command)
+            for home, command in zip(homes, commands)
+            if " resume thread-" in command
+        ]
+        self.assertEqual(
+            [home for home, _ in resume_records],
+            [str(account_root / "personal"), str(account_root / "work")],
+        )
+        resume_sqlite_homes = [
+            sqlite_home
+            for sqlite_home, command in zip(sqlite_homes, commands)
+            if " resume thread-" in command
+        ]
+        self.assertEqual(resume_sqlite_homes, [str(self.codex_home), str(self.codex_home)])
+        for _, command in resume_records:
+            self.assertIn('cli_auth_credentials_store="file"', command)
+
+    def test_run_without_a_named_account_preserves_legacy_api_mode(self):
+        completed = self.run_switch("run", "--", "--version")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertEqual(
+            self.codex_home_log.read_text(encoding="utf-8").splitlines()[-1],
+            str(self.codex_home),
+        )
+        self.assertEqual(self.codex_log.read_text(encoding="utf-8").splitlines()[-1], "--version")
+
+    def test_api_mode_deactivates_named_account_without_deleting_it(self):
+        self.assertEqual(self.run_switch("add", "personal").returncode, 0)
+
+        completed = self.run_switch("api")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        self.assertFalse((self.home / ".config" / "codex" / "active-account").exists())
+        self.assertTrue(
+            (self.home / ".local" / "share" / "codex" / "accounts" / "personal" / "auth.json").is_file()
+        )
+
+    def test_named_account_rejects_unsafe_names(self):
+        completed = self.run_switch("add", "../work")
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("invalid account name", completed.stderr)
+
+    def test_email_address_can_be_used_as_the_named_account(self):
+        completed = self.run_switch("add", "user+codex@example.com")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        account_home = (
+            self.home
+            / ".local"
+            / "share"
+            / "codex"
+            / "accounts"
+            / "user+codex@example.com"
+        )
+        self.assertTrue(account_home.joinpath("auth.json").is_file())
+
+    def test_add_account_automatically_uses_the_login_email(self):
+        payload = base64.urlsafe_b64encode(
+            json.dumps(
+                {"https://api.openai.com/profile": {"email": "new.user@example.com"}}
+            ).encode()
+        ).decode().rstrip("=")
+
+        completed = self.run_switch(
+            "add-auto",
+            "--device-auth",
+            FAKE_LOGIN_ID_TOKEN=f"header.{payload}.signature",
+        )
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        account_home = (
+            self.home
+            / ".local"
+            / "share"
+            / "codex"
+            / "accounts"
+            / "new.user@example.com"
+        )
+        self.assertTrue(account_home.joinpath("auth.json").is_file())
+        self.assertEqual(
+            (self.home / ".config" / "codex" / "active-account").read_text(
+                encoding="utf-8"
+            ),
+            "new.user@example.com\n",
+        )
+        self.assertFalse(
+            list(account_home.parent.glob("pending-login-*")),
+            "temporary login accounts must not remain in the account catalog",
+        )
+
+    def test_add_account_without_an_email_claim_archives_the_temporary_login(self):
+        payload = base64.urlsafe_b64encode(json.dumps({"sub": "user"}).encode()).decode().rstrip("=")
+
+        completed = self.run_switch(
+            "add-auto",
+            "--device-auth",
+            FAKE_LOGIN_ID_TOKEN=f"header.{payload}.signature",
+        )
+
+        self.assertNotEqual(completed.returncode, 0)
+        accounts_dir = self.home / ".local" / "share" / "codex" / "accounts"
+        self.assertFalse(list(accounts_dir.glob("pending-login-*")))
+        archived = list(
+            (self.home / ".local" / "share" / "codex" / "deleted-accounts").glob(
+                "pending-login-*"
+            )
+        )
+        self.assertEqual(len(archived), 1)
+        self.assertTrue(archived[0].joinpath("auth.json").is_file())
+
+    def test_remove_named_account_archives_credentials_and_keeps_shared_conversations(self):
+        account = "user@example.com"
+        add_result = self.run_switch("add", account)
+        self.assertEqual(add_result.returncode, 0, add_result.stderr)
+        shared_session = self.codex_home / "sessions" / "shared-thread.jsonl"
+        shared_session.write_text("shared\n", encoding="utf-8")
+
+        completed = self.run_switch("remove", account, "--yes")
+
+        self.assertEqual(completed.returncode, 0, completed.stderr)
+        account_home = self.home / ".local" / "share" / "codex" / "accounts" / account
+        self.assertFalse(account_home.exists())
+        self.assertFalse((self.home / ".config" / "codex" / "active-account").exists())
+        archives = list(
+            (self.home / ".local" / "share" / "codex" / "deleted-accounts").glob(
+                f"{account}.*"
+            )
+        )
+        self.assertEqual(len(archives), 1)
+        self.assertTrue(archives[0].joinpath("auth.json").is_file())
+        self.assertEqual(shared_session.read_text(encoding="utf-8"), "shared\n")
+        self.assertIn(str(archives[0]), completed.stdout)
+
+    def test_remove_named_account_requires_confirmation(self):
+        account = "user@example.com"
+        self.assertEqual(self.run_switch("add", account).returncode, 0)
+
+        completed = self.run_switch("remove", account)
+
+        self.assertNotEqual(completed.returncode, 0)
+        self.assertIn("--yes", completed.stderr)
+        self.assertTrue(
+            (
+                self.home
+                / ".local"
+                / "share"
+                / "codex"
+                / "accounts"
+                / account
+                / "auth.json"
+            ).is_file()
+        )
 
     def test_setup_installs_the_auth_switch_command(self):
         environment = self.environment.copy()
@@ -660,6 +1020,77 @@ class CodexAuthSwitchTests(unittest.TestCase):
             installed.read_text(encoding="utf-8"),
             AUTH_SWITCH_SCRIPT.read_text(encoding="utf-8"),
         )
+        installed_usage = self.home / ".local" / "bin" / "codex-usage"
+        self.assertTrue(installed_usage.is_file())
+        self.assertTrue(os.access(installed_usage, os.X_OK))
+        self.assertEqual(
+            installed_usage.read_text(encoding="utf-8"),
+            USAGE_SCRIPT.read_text(encoding="utf-8"),
+        )
+        installed_widget = self.home / ".local" / "bin" / "codex-usage-widget"
+        self.assertTrue(installed_widget.is_file())
+        self.assertTrue(os.access(installed_widget, os.X_OK))
+        self.assertEqual(
+            installed_widget.read_text(encoding="utf-8"),
+            USAGE_WIDGET.read_text(encoding="utf-8"),
+        )
+        manager_lib = self.home / ".local" / "lib" / "codex-account-manager"
+        self.assertEqual(
+            manager_lib.joinpath("codex_account_manager_qt.py").read_text(encoding="utf-8"),
+            ACCOUNT_MANAGER_QT.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            manager_lib.joinpath("codex_account_manager_backend.py").read_text(encoding="utf-8"),
+            ACCOUNT_MANAGER_BACKEND.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            manager_lib.joinpath("codex_provider.py").read_text(encoding="utf-8"),
+            PROVIDER_SCRIPT.read_text(encoding="utf-8"),
+        )
+        self.assertEqual(
+            manager_lib.joinpath("codex-account-manager.svg").read_text(encoding="utf-8"),
+            ACCOUNT_MANAGER_ICON.read_text(encoding="utf-8"),
+        )
+        installed_icon = (
+            self.home
+            / ".local"
+            / "share"
+            / "icons"
+            / "hicolor"
+            / "scalable"
+            / "apps"
+            / "codex-account-manager.svg"
+        )
+        self.assertEqual(
+            installed_icon.read_text(encoding="utf-8"),
+            ACCOUNT_MANAGER_ICON.read_text(encoding="utf-8"),
+        )
+        manager_command = self.home / ".local" / "bin" / "codex-account-manager"
+        self.assertTrue(os.access(manager_command, os.X_OK))
+        self.assertIn("codex_account_manager_qt.py", manager_command.read_text(encoding="utf-8"))
+        self.assertIn("codex-usage-widget", manager_command.read_text(encoding="utf-8"))
+        desktop_entry = self.home / ".local" / "share" / "applications" / "codex-account-manager.desktop"
+        autostart_entry = self.home / ".config" / "autostart" / "codex-account-manager.desktop"
+        self.assertIn("Type=Application", desktop_entry.read_text(encoding="utf-8"))
+        self.assertIn("Terminal=false", desktop_entry.read_text(encoding="utf-8"))
+        self.assertIn(
+            f"Icon={self.home}/.local/share/icons/hicolor/scalable/apps/codex-account-manager.svg",
+            desktop_entry.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            "StartupWMClass=Codex Account Manager",
+            desktop_entry.read_text(encoding="utf-8"),
+        )
+        self.assertIn("--background", autostart_entry.read_text(encoding="utf-8"))
+        self.assertIn(
+            "StartupWMClass=Codex Account Manager",
+            autostart_entry.read_text(encoding="utf-8"),
+        )
+        self.assertIn(
+            f"Icon={self.home}/.local/share/icons/hicolor/scalable/apps/codex-account-manager.svg",
+            autostart_entry.read_text(encoding="utf-8"),
+        )
+        self.assertNotIn("http://", desktop_entry.read_text(encoding="utf-8"))
 
     def test_setup_preserves_account_mode(self):
         account_result = self.run_switch("account", FAKE_CHATGPT_LOGIN="1")

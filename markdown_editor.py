@@ -26,6 +26,7 @@ import urllib.request
 import warnings
 import weakref
 import xml.etree.ElementTree as ElementTree
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import date, datetime
 from functools import lru_cache
@@ -35,6 +36,7 @@ import markdown
 import websocket
 from PyQt5.QtCore import (
     QPointF,
+    QProcess,
     QRectF,
     QSettings,
     QTimer,
@@ -46,6 +48,7 @@ from PyQt5.QtGui import (
     QColor,
     QDesktopServices,
     QFont,
+    QIcon,
     QImage,
     QKeySequence,
     QPainter,
@@ -67,10 +70,12 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QMenu,
     QPlainTextEdit,
+    QProgressBar,
     QPushButton,
     QSizePolicy,
     QSplitter,
     QStyle,
+    QTabWidget,
     QTextBrowser,
     QToolBar,
     QToolButton,
@@ -80,11 +85,21 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QWidget,
 )
+from PyQt5.QtWebEngineWidgets import QWebEngineSettings, QWebEngineView
 
 
 APP_NAME = "Markdown Renderer"
+APP_ICON_PATH = Path(__file__).resolve().parent / "desktop" / "mdview.png"
 CHATGPT_URL = QUrl("https://chatgpt.com/")
-AUTO_OPEN_DOCUMENT_SUFFIXES = {".tex", ".latex", ".ltx", ".md", ".markdown"}
+AUTO_OPEN_DOCUMENT_SUFFIXES = {
+    ".tex",
+    ".latex",
+    ".ltx",
+    ".md",
+    ".markdown",
+    ".html",
+    ".htm",
+}
 CHATGPT_PERFORMANCE_STYLE_ID = "mdview-chatgpt-performance-style"
 MARKDOWN_EXTENSIONS = ("extra", "sane_lists")
 DEFAULT_BORDER_COLOR = "#2563eb"
@@ -159,6 +174,22 @@ TIKZ_LIBRARIES = (
     "arrows.meta,positioning,calc,fit,backgrounds,shapes.geometric,"
     "shapes.multipart,matrix,chains,decorations.pathreplacing"
 )
+
+
+def document_path_from_argument(value: str | Path) -> Path:
+    """Convert a regular path or file:// URL to a local filesystem path."""
+    if isinstance(value, Path):
+        return value.expanduser()
+    text = str(value).strip()
+    url = QUrl(text)
+    if url.isLocalFile():
+        local_path = url.toLocalFile()
+        if not local_path:
+            raise ValueError("file:// URL 中没有本地文件路径。")
+        return Path(local_path).expanduser()
+    if re.match(r"^[A-Za-z][A-Za-z0-9+.-]*:", text):
+        raise ValueError("仅支持本地路径或 file:// URL。")
+    return Path(text).expanduser()
 
 
 def split_front_matter(source: str) -> tuple[dict[str, str], str]:
@@ -1249,6 +1280,7 @@ def export_pdf(
     *,
     base_directory: Path | None = None,
     include_toc: bool = False,
+    progress_callback: Callable[[int, str], None] | None = None,
 ) -> str:
     """Export Markdown through Pandoc, the project template, and XeLaTeX."""
     output_path = output_path.expanduser().resolve()
@@ -1270,9 +1302,13 @@ def export_pdf(
         raise RuntimeError("PDF 导出模板不完整，请重新安装 mdview。")
 
     output_path.parent.mkdir(parents=True, exist_ok=True)
+    if progress_callback is not None:
+        progress_callback(15, "正在准备 Markdown 内容")
     with tempfile.TemporaryDirectory(prefix="mdview-pdf-") as temporary:
         assets_directory = Path(temporary) / "assets"
         prepared = prepare_markdown_for_pdf(source, assets_directory)
+        if progress_callback is not None:
+            progress_callback(35, "正在准备 PDF 资源")
         command = pandoc_pdf_command(
             output_path,
             base_directory,
@@ -1280,6 +1316,8 @@ def export_pdf(
             assets_directory,
             include_toc,
         )
+        if progress_callback is not None:
+            progress_callback(50, "正在通过 Pandoc 和 XeLaTeX 生成 PDF")
         result = subprocess.run(
             command,
             input=prepared,
@@ -1294,6 +1332,8 @@ def export_pdf(
             if len(details) > 4000:
                 details = details[-4000:]
             raise RuntimeError(f"Pandoc/XeLaTeX 导出失败：\n{details}")
+    if progress_callback is not None:
+        progress_callback(95, "正在检查导出结果")
     if not output_path.is_file() or output_path.stat().st_size == 0:
         raise RuntimeError("PDF 文件未能生成")
     return "Pandoc + XeLaTeX"
@@ -1501,6 +1541,7 @@ def compile_latex_document(
     *,
     base_directory: Path | None = None,
     toc_output_path: Path | None = None,
+    progress_callback: Callable[[int, int], None] | None = None,
 ) -> str:
     """Compile a complete LaTeX document twice with XeLaTeX."""
     xelatex = shutil.which("xelatex")
@@ -1556,6 +1597,8 @@ def compile_latex_document(
                 if len(details) > 5000:
                     details = details[-5000:]
                 raise RuntimeError(f"XeLaTeX 编译失败：\n{details}")
+            if progress_callback is not None:
+                progress_callback(_pass + 1, 2)
         if not compiled_path.is_file() or compiled_path.stat().st_size == 0:
             raise RuntimeError("XeLaTeX 未生成 PDF。")
         shutil.copy2(compiled_path, output_path)
@@ -1711,33 +1754,61 @@ def render_pdf_page_image(image_path: Path) -> str:
     )
 
 
-def render_pdf_pages_html(
+def pdf_page_raster_command(
     pdf_path: Path,
     pages_directory: Path,
-    background_color: str = DEFAULT_BACKGROUND_COLOR,
-) -> str:
-    """Rasterize real PDF pages and return a continuous in-app preview."""
+    *,
+    first_page: int = 1,
+    last_page: int | None = None,
+) -> list[str]:
+    """Build a pdftocairo command for a full document or a page range."""
     pdftocairo = shutil.which("pdftocairo")
     if not pdftocairo:
         raise RuntimeError(
             "软件内 PDF 页面预览需要 pdftocairo。\n"
             "Ubuntu 可执行：sudo apt install poppler-utils"
         )
-    pdf_path = pdf_path.expanduser().resolve()
+    if first_page < 1:
+        raise ValueError("PDF 起始页必须大于等于 1。")
+    if last_page is not None and last_page < first_page:
+        raise ValueError("PDF 结束页不能小于起始页。")
+    command = [
+        pdftocairo,
+        "-png",
+        "-r",
+        "120",
+        "-f",
+        str(first_page),
+    ]
+    if last_page is not None:
+        command.extend(["-l", str(last_page)])
+    command.extend(
+        [
+            str(pdf_path.expanduser().resolve()),
+            str(pages_directory.expanduser().resolve() / "page"),
+        ]
+    )
+    return command
+
+
+def rasterize_pdf_pages(
+    pdf_path: Path,
+    pages_directory: Path,
+    *,
+    first_page: int = 1,
+    last_page: int | None = None,
+) -> None:
+    """Rasterize a selected PDF page range without touching other page images."""
     pages_directory = pages_directory.expanduser().resolve()
     pages_directory.mkdir(parents=True, exist_ok=True)
-    for old_page in pages_directory.glob("page-*.png"):
-        old_page.unlink()
-    output_prefix = pages_directory / "page"
+    command = pdf_page_raster_command(
+        pdf_path,
+        pages_directory,
+        first_page=first_page,
+        last_page=last_page,
+    )
     result = subprocess.run(
-        [
-            pdftocairo,
-            "-png",
-            "-r",
-            "120",
-            str(pdf_path),
-            str(output_prefix),
-        ],
+        command,
         stdout=subprocess.PIPE,
         stderr=subprocess.PIPE,
         timeout=120,
@@ -1748,6 +1819,95 @@ def render_pdf_pages_html(
             "utf-8", errors="replace"
         ).strip()
         raise RuntimeError(f"PDF 页面预览生成失败：\n{details}")
+    if first_page not in pdf_page_image_map(pages_directory):
+        raise RuntimeError("PDF 页面预览没有生成请求的页面。")
+
+
+def pdf_page_image_map(pages_directory: Path) -> dict[int, Path]:
+    """Map Poppler page numbers while accepting padded and unpadded names."""
+    pages_directory = pages_directory.expanduser().resolve()
+    page_images: dict[int, Path] = {}
+    for path in pages_directory.glob("page-*.png"):
+        match = re.fullmatch(r"page-(\d+)\.png", path.name)
+        if match:
+            page_images[int(match.group(1))] = path
+    return page_images
+
+
+def pdf_page_image_paths(
+    pages_directory: Path,
+    page_count: int,
+) -> list[Path | None]:
+    """Return page-aligned image paths, leaving deferred pages as None."""
+    page_images = pdf_page_image_map(pages_directory)
+    return [page_images.get(page_number) for page_number in range(1, page_count + 1)]
+
+
+def render_pdf_pages_html_from_images(
+    pages_directory: Path,
+    page_layout: list[
+        tuple[
+            float,
+            float,
+            list[tuple[float, float, float, float, str, int]],
+        ]
+    ],
+    background_color: str = DEFAULT_BACKGROUND_COLOR,
+) -> str:
+    """Build preview HTML with fixed-size placeholders for deferred pages."""
+    pages_directory = pages_directory.expanduser().resolve()
+    background = QColor(background_color)
+    if not background.isValid():
+        background = QColor(DEFAULT_BACKGROUND_COLOR)
+    page_parts = []
+    page_images = pdf_page_image_map(pages_directory)
+    for index, (page_width, page_height, _words) in enumerate(page_layout, 1):
+        image_path = page_images.get(index)
+        if image_path is not None:
+            content = render_pdf_page_image(image_path)
+        else:
+            image_width = max(1, round(page_width * 120 / 72))
+            image_height = max(1, round(page_height * 120 / 72))
+            content = (
+                f'<table class="pdf-page-placeholder" width="{image_width}" '
+                f'height="{image_height}" cellspacing="0" cellpadding="0">'
+                f'<tbody><tr height="{image_height}"><td>'
+                f"第 {index} 页正在后台渲染…"
+                "</td></tr></tbody></table>"
+            )
+        page_parts.append(
+            f'<a name="pdf-page-{index}">&#8203;</a>'
+            f'<section class="pdf-page" id="pdf-page-{index}">'
+            + content
+            + "</section>"
+        )
+    return (
+        "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
+        f"body{{margin:24px;background:{background.name()};}}"
+        ".pdf-document{max-width:992px;margin:0 auto;}"
+        ".pdf-page{margin:0 auto 22px;background:#fff;box-shadow:0 3px 14px rgba(15,23,42,.18);}"
+        ".pdf-page img{display:block;width:100%;height:auto;}"
+        ".pdf-page-image,.pdf-page-placeholder{border:0;table-layout:fixed;}"
+        ".pdf-page-image td{border:0;background:transparent;}"
+        ".pdf-page-placeholder td{border:0;background:#f8fafc;color:#64748b;text-align:center;}"
+        "</style></head><body><main class=\"pdf-document\">"
+        + "".join(page_parts)
+        + "</main></body></html>"
+    )
+
+
+def render_pdf_pages_html(
+    pdf_path: Path,
+    pages_directory: Path,
+    background_color: str = DEFAULT_BACKGROUND_COLOR,
+) -> str:
+    """Rasterize real PDF pages and return a continuous in-app preview."""
+    pdf_path = pdf_path.expanduser().resolve()
+    pages_directory = pages_directory.expanduser().resolve()
+    pages_directory.mkdir(parents=True, exist_ok=True)
+    for old_page in pages_directory.glob("page-*.png"):
+        old_page.unlink()
+    rasterize_pdf_pages(pdf_path, pages_directory)
 
     def page_number(path: Path) -> int:
         match = re.search(r"-(\d+)\.png$", path.name)
@@ -1756,27 +1916,10 @@ def render_pdf_pages_html(
     pages = sorted(pages_directory.glob("page-*.png"), key=page_number)
     if not pages:
         raise RuntimeError("PDF 页面预览没有生成任何页面。")
-    background = QColor(background_color)
-    if not background.isValid():
-        background = QColor(DEFAULT_BACKGROUND_COLOR)
-    page_html = "".join(
-        f'<a name="pdf-page-{index}">&#8203;</a>'
-        f'<section class="pdf-page" id="pdf-page-{index}">'
-        + render_pdf_page_image(path)
-        + "</section>"
-        for index, path in enumerate(pages, 1)
-    )
-    return (
-        "<!doctype html><html><head><meta charset=\"utf-8\"><style>"
-        f"body{{margin:24px;background:{background.name()};}}"
-        ".pdf-document{max-width:992px;margin:0 auto;}"
-        ".pdf-page{margin:0 auto 22px;background:#fff;box-shadow:0 3px 14px rgba(15,23,42,.18);}"
-        ".pdf-page img{display:block;width:100%;height:auto;}"
-        ".pdf-page-image{border:0;table-layout:fixed;}"
-        ".pdf-page-image td{border:0;background:transparent;}"
-        "</style></head><body><main class=\"pdf-document\">"
-        + page_html
-        + "</main></body></html>"
+    return render_pdf_pages_html_from_images(
+        pages_directory,
+        [(0.0, 0.0, []) for _page in pages],
+        background_color,
     )
 
 
@@ -2898,7 +3041,7 @@ class MarkdownPreview(QTextBrowser):
                 list[tuple[float, float, float, float, str, int]],
             ]
         ] = []
-        self._pdf_images: list[Path] = []
+        self._pdf_images: list[Path | None] = []
         self._pdf_characters: list[tuple[int, int, int]] = []
         self._pdf_character_ordinals: dict[tuple[int, int, int], int] = {}
         self._pdf_selection_start: int | None = None
@@ -2913,7 +3056,7 @@ class MarkdownPreview(QTextBrowser):
     def set_pdf_document(
         self,
         page_html: str,
-        page_images: list[Path],
+        page_images: list[Path | None],
         text_pages: list[
             tuple[
                 float,
@@ -3255,7 +3398,10 @@ class MarkdownPreview(QTextBrowser):
         for page_index, word_indices in page_groups.items():
             if page_index >= len(self._pdf_images):
                 continue
-            image = QImage(str(self._pdf_images[page_index]))
+            image_path = self._pdf_images[page_index]
+            if image_path is None:
+                continue
+            image = QImage(str(image_path))
             if image.isNull():
                 continue
             page_width, page_height, words = self._pdf_pages[page_index]
@@ -3319,6 +3465,21 @@ class MarkdownPreview(QTextBrowser):
         menu.deleteLater()
 
 
+class HtmlPreview(QWebEngineView):
+    """Full browser-engine preview for local HTML documents."""
+
+    def __init__(self, parent=None) -> None:
+        super().__init__(parent)
+        self.setObjectName("htmlPreview")
+        self.settings().setAttribute(
+            QWebEngineSettings.LocalContentCanAccessFileUrls,
+            True,
+        )
+
+    def set_document(self, source: str, path: Path) -> None:
+        self.setHtml(source, QUrl.fromLocalFile(str(path)))
+
+
 class PdfExportDialog(QDialog):
     """Collect one-time PDF export options without changing app settings."""
 
@@ -3350,7 +3511,7 @@ class PdfExportDialog(QDialog):
         self.toc_checkbox.setToolTip("仅影响本次导出，不修改 Markdown/LaTeX 源文件")
         layout.addWidget(self.toc_checkbox)
         self.open_checkbox = QCheckBox("导出后打开 PDF")
-        self.open_checkbox.setChecked(True)
+        self.open_checkbox.setChecked(False)
         layout.addWidget(self.open_checkbox)
 
         hint = QLabel("这些选项只用于本次导出，不会写入全局设置。")
@@ -3391,6 +3552,13 @@ class PdfExportDialog(QDialog):
 
 class MarkdownWindow(QMainWindow):
     RECENT_FILES_LIMIT = 10
+    LATEX_INITIAL_PREVIEW_PAGES = 3
+    INITIAL_WINDOW_SIZE = (1100, 1140)
+    FAVORITES_SETTINGS_KEY = "latexFavoritesJson"
+    FAVORITE_KIND_ROLE = Qt.UserRole + 10
+    FAVORITE_PATH_ROLE = Qt.UserRole + 11
+    FAVORITE_ANCHOR_ROLE = Qt.UserRole + 12
+    FAVORITE_VERTICAL_ROLE = Qt.UserRole + 13
 
     def __init__(
         self,
@@ -3411,6 +3579,11 @@ class MarkdownWindow(QMainWindow):
             ignore_errors=True,
         )
         self.latest_tex_pdf_path: Path | None = None
+        self.latex_page_render_process: QProcess | None = None
+        self.latex_preview_generation = 0
+        self.latex_progress_pages_directory: Path | None = None
+        self.latex_progress_total_pages = 0
+        self.progress_operation: str | None = None
         self.border_color = DEFAULT_BORDER_COLOR
         self.background_color = DEFAULT_BACKGROUND_COLOR
         self.setProperty("tocVisible", False)
@@ -3418,11 +3591,13 @@ class MarkdownWindow(QMainWindow):
             self.settings.value("lineHeight", DEFAULT_LINE_HEIGHT)
         )
         self.setWindowTitle(APP_NAME)
-        self.resize(1280, 800)
+        if APP_ICON_PATH.is_file():
+            self.setWindowIcon(QIcon(str(APP_ICON_PATH)))
+        self.resize(*self.INITIAL_WINDOW_SIZE)
 
         self.editor = QPlainTextEdit()
         self.editor.setObjectName("markdownSource")
-        self.editor.setPlaceholderText("在这里输入 Markdown/LaTeX，或点击“打开文件”。")
+        self.editor.setPlaceholderText("在这里输入 Markdown/HTML/LaTeX，或点击“打开文件”。")
         self.editor.setLineWrapMode(QPlainTextEdit.NoWrap)
         self.editor.setFont(QFont("monospace", 11))
 
@@ -3443,12 +3618,14 @@ class MarkdownWindow(QMainWindow):
             self.copy_chatgpt_edit_request
         )
         self.preview.codex_edit_requested.connect(self.copy_codex_edit_request)
+        self.html_preview: HtmlPreview | None = None
 
         splitter = QSplitter(Qt.Horizontal)
         splitter.setObjectName("sourcePreviewSplitter")
         splitter.addWidget(self.editor)
         splitter.addWidget(self.preview)
         splitter.setSizes([0, 1280])
+        self.splitter = splitter
         self.setCentralWidget(splitter)
         self.editor.hide()
 
@@ -3457,12 +3634,47 @@ class MarkdownWindow(QMainWindow):
         self.toc_tree.setHeaderHidden(True)
         self.toc_tree.setIndentation(16)
         self.toc_tree.itemClicked.connect(self.navigate_to_toc_item)
+        self.toc_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.toc_tree.customContextMenuRequested.connect(
+            self.show_toc_favorite_menu
+        )
+        self.favorites_tree = QTreeWidget()
+        self.favorites_tree.setObjectName("documentFavorites")
+        self.favorites_tree.setHeaderHidden(True)
+        self.favorites_tree.setIndentation(12)
+        self.favorites_tree.itemClicked.connect(self.activate_favorite_item)
+        self.favorites_tree.setContextMenuPolicy(Qt.CustomContextMenu)
+        self.favorites_tree.customContextMenuRequested.connect(
+            self.show_favorite_item_menu
+        )
+        self.favorite_document_button = QPushButton("☆ 收藏当前 TeX")
+        self.favorite_document_button.setObjectName("favoriteCurrentDocument")
+        self.favorite_document_button.clicked.connect(
+            self.toggle_current_document_favorite
+        )
+        self.toc_tab = QWidget()
+        toc_layout = QVBoxLayout(self.toc_tab)
+        toc_layout.setContentsMargins(0, 0, 0, 0)
+        toc_layout.setSpacing(0)
+        toc_layout.addWidget(self.toc_tree, 1)
+        self.favorites_tab = QWidget()
+        favorites_layout = QVBoxLayout(self.favorites_tab)
+        favorites_layout.setContentsMargins(4, 4, 4, 4)
+        favorites_layout.setSpacing(5)
+        favorites_layout.addWidget(self.favorite_document_button)
+        favorites_layout.addWidget(self.favorites_tree, 1)
+        self.toc_tabs = QTabWidget()
+        self.toc_tabs.setObjectName("tocFavoritesTabs")
+        self.toc_tabs.addTab(self.toc_tab, "文档目录")
+        self.toc_tabs.addTab(self.favorites_tab, "收藏")
+        self.toc_tabs.setCurrentIndex(0)
         self.toc_dock = QDockWidget("目录", self)
         self.toc_dock.setObjectName("documentTocDock")
         self.toc_dock.setAllowedAreas(Qt.LeftDockWidgetArea)
         self.toc_dock.setMinimumWidth(220)
-        self.toc_dock.setWidget(self.toc_tree)
+        self.toc_dock.setWidget(self.toc_tabs)
         self.addDockWidget(Qt.LeftDockWidgetArea, self.toc_dock)
+        self.refresh_favorites_tree()
 
         self.chatgpt_view = None
         self.chatgpt_dock = QDockWidget("ChatGPT", self)
@@ -3486,9 +3698,18 @@ class MarkdownWindow(QMainWindow):
             self,
         )
         self.open_action.setShortcut(QKeySequence.Open)
-        self.open_action.setToolTip("打开 Markdown 或完整 LaTeX 文档")
+        self.open_action.setToolTip("打开 Markdown、HTML 或完整 LaTeX 文档")
         self.open_action.triggered.connect(self.open_file_dialog)
         toolbar.addAction(self.open_action)
+        self.reload_action = QAction(
+            self.style().standardIcon(QStyle.SP_BrowserReload),
+            "重新加载",
+            self,
+        )
+        self.reload_action.setShortcut(QKeySequence("F5"))
+        self.reload_action.setToolTip("重新读取当前文件并刷新预览（F5）")
+        self.reload_action.triggered.connect(self.reload_current_file)
+        toolbar.addAction(self.reload_action)
         self.toc_action = QAction("显示目录", self)
         self.toc_action.setCheckable(True)
         self.toc_action.setChecked(False)
@@ -3571,6 +3792,30 @@ class MarkdownWindow(QMainWindow):
         self.path_toolbar.addWidget(self.history_button)
         self.refresh_recent_files_menu()
 
+        self.render_progress = QProgressBar(self)
+        self.render_progress.setObjectName("latexRenderProgress")
+        self.render_progress.setRange(0, 100)
+        self.render_progress.setFixedSize(460, 46)
+        self.render_progress.setTextVisible(True)
+        self.render_progress.setStyleSheet(
+            "QProgressBar {"
+            "background: #ffffff; border: 2px solid #2563eb;"
+            "border-radius: 9px; color: #0f172a; font-size: 15px;"
+            "font-weight: 600; text-align: center; padding: 2px;"
+            "}"
+            "QProgressBar::chunk {"
+            "background: #38bdf8; border-radius: 5px;"
+            "}"
+        )
+        self.position_render_progress()
+        self.render_progress.hide()
+
+        self.latex_progress_timer = QTimer(self)
+        self.latex_progress_timer.setInterval(100)
+        self.latex_progress_timer.timeout.connect(
+            self.update_latex_page_render_progress
+        )
+
         self.set_border_color(str(self.settings.value("borderColor", DEFAULT_BORDER_COLOR)))
         self.set_background_color(
             str(self.settings.value("backgroundColor", DEFAULT_BACKGROUND_COLOR))
@@ -3586,6 +3831,24 @@ class MarkdownWindow(QMainWindow):
             self.load_file(initial_path)
         else:
             self.refresh_preview()
+
+    def ensure_html_preview(self) -> HtmlPreview:
+        if self.html_preview is None:
+            self.html_preview = HtmlPreview()
+        return self.html_preview
+
+    def activate_preview_for_mode(self) -> None:
+        target = self.ensure_html_preview() if self.document_mode == "html" else self.preview
+        current = self.splitter.widget(1)
+        if current is target:
+            target.show()
+            return
+        sizes = self.splitter.sizes()
+        replaced = self.splitter.replaceWidget(1, target)
+        if replaced is not None:
+            replaced.hide()
+        target.show()
+        self.splitter.setSizes(sizes)
 
     def set_toc_visible(self, visible: bool) -> None:
         self.toc_dock.setVisible(visible)
@@ -3717,9 +3980,292 @@ class MarkdownWindow(QMainWindow):
             8000,
         )
 
+    def set_latex_progress(self, value: int, label: str) -> None:
+        self.render_progress.setValue(max(0, min(100, value)))
+        self.render_progress.setFormat(f"{label}  %p%")
+        self.position_render_progress()
+        self.render_progress.show()
+        self.render_progress.raise_()
+
+    def position_render_progress(self) -> None:
+        if not hasattr(self, "render_progress"):
+            return
+        self.render_progress.move(
+            (self.width() - self.render_progress.width()) // 2,
+            (self.height() - self.render_progress.height()) // 2,
+        )
+
+    def repaint_latex_progress(self) -> None:
+        self.render_progress.repaint()
+        QApplication.processEvents()
+
+    def update_latex_compile_progress(self, completed: int, total: int) -> None:
+        value = 5 + round(45 * completed / max(total, 1))
+        self.set_latex_progress(
+            value,
+            f"正在编译 LaTeX（{completed}/{total}）",
+        )
+        self.repaint_latex_progress()
+
+    def update_latex_page_render_progress(self) -> None:
+        if (
+            self.progress_operation != "latex_preview"
+            or self.latex_progress_pages_directory is None
+            or self.latex_progress_total_pages <= 0
+        ):
+            return
+        ready_pages = sum(
+            path is not None
+            for path in pdf_page_image_paths(
+                self.latex_progress_pages_directory,
+                self.latex_progress_total_pages,
+            )
+        )
+        value = 60 + round(40 * ready_pages / self.latex_progress_total_pages)
+        self.set_latex_progress(
+            value,
+            f"正在生成预览页（{ready_pages}/{self.latex_progress_total_pages}）",
+        )
+
+    def finish_latex_progress(self, generation: int) -> None:
+        if self.progress_operation != "latex_preview":
+            return
+        self.latex_progress_timer.stop()
+        self.latex_progress_pages_directory = None
+        self.latex_progress_total_pages = 0
+        self.set_latex_progress(100, "LaTeX 预览已完成")
+        self.progress_operation = None
+        QTimer.singleShot(
+            1000,
+            lambda: (
+                self.render_progress.hide()
+                if generation == self.latex_preview_generation
+                else None
+            ),
+        )
+
+    def cancel_latex_page_render(self) -> None:
+        self.latex_progress_timer.stop()
+        self.latex_progress_pages_directory = None
+        self.latex_progress_total_pages = 0
+        self.progress_operation = None
+        self.render_progress.hide()
+        process = self.latex_page_render_process
+        self.latex_page_render_process = None
+        if process is None:
+            return
+        if process.state() != QProcess.NotRunning:
+            process.kill()
+            process.waitForFinished(1000)
+        process.deleteLater()
+
     def closeEvent(self, event) -> None:
+        self.cancel_latex_page_render()
         self.release_chatgpt_view()
         super().closeEvent(event)
+
+    def resizeEvent(self, event) -> None:
+        super().resizeEvent(event)
+        self.position_render_progress()
+
+    def favorite_entries(self) -> list[dict[str, object]]:
+        raw = self.settings.value(self.FAVORITES_SETTINGS_KEY, "[]")
+        try:
+            entries = json.loads(str(raw))
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return []
+        if not isinstance(entries, list):
+            return []
+        return [entry for entry in entries if isinstance(entry, dict)]
+
+    def save_favorite_entries(self, entries: list[dict[str, object]]) -> None:
+        self.settings.setValue(
+            self.FAVORITES_SETTINGS_KEY,
+            json.dumps(entries, ensure_ascii=False),
+        )
+        self.settings.sync()
+        self.refresh_favorites_tree()
+
+    @staticmethod
+    def favorite_entry_key(entry: dict[str, object]) -> tuple[str, str, str]:
+        return (
+            str(entry.get("kind", "")),
+            str(entry.get("path", "")),
+            str(entry.get("anchor", "")),
+        )
+
+    def current_document_favorite_entry(self) -> dict[str, object] | None:
+        if self.current_path is None or self.document_mode != "latex":
+            return None
+        return {
+            "kind": "document",
+            "path": str(self.current_path),
+            "title": self.current_path.name,
+        }
+
+    def refresh_favorites_tree(self) -> None:
+        self.favorites_tree.clear()
+        for entry in self.favorite_entries():
+            kind = str(entry.get("kind", ""))
+            path = Path(str(entry.get("path", ""))).expanduser()
+            if kind == "document":
+                text = f"★ {entry.get('title') or path.name}"
+            elif kind == "section":
+                title = str(entry.get("title", "未命名章节"))
+                text = f"☆ {title} — {path.name}"
+            else:
+                continue
+            item = QTreeWidgetItem([text])
+            item.setToolTip(0, str(path))
+            item.setData(0, self.FAVORITE_KIND_ROLE, kind)
+            item.setData(0, self.FAVORITE_PATH_ROLE, str(path))
+            item.setData(
+                0,
+                self.FAVORITE_ANCHOR_ROLE,
+                str(entry.get("anchor", "")),
+            )
+            item.setData(
+                0,
+                self.FAVORITE_VERTICAL_ROLE,
+                entry.get("vertical_ratio"),
+            )
+            self.favorites_tree.addTopLevelItem(item)
+        self.update_favorite_document_button()
+
+    def update_favorite_document_button(self) -> None:
+        entry = self.current_document_favorite_entry()
+        self.favorite_document_button.setEnabled(entry is not None)
+        if entry is None:
+            self.favorite_document_button.setText("☆ 收藏当前 TeX")
+            return
+        keys = {self.favorite_entry_key(item) for item in self.favorite_entries()}
+        is_favorite = self.favorite_entry_key(entry) in keys
+        self.favorite_document_button.setText(
+            "★ 取消收藏当前 TeX" if is_favorite else "☆ 收藏当前 TeX"
+        )
+
+    def toggle_current_document_favorite(self) -> None:
+        entry = self.current_document_favorite_entry()
+        if entry is None:
+            self.statusBar().showMessage("请先打开一个完整 TeX 文档", 5000)
+            return
+        entries = self.favorite_entries()
+        key = self.favorite_entry_key(entry)
+        if any(self.favorite_entry_key(item) == key for item in entries):
+            entries = [
+                item for item in entries if self.favorite_entry_key(item) != key
+            ]
+            message = f"已取消收藏：{self.current_path.name}"
+        else:
+            entries.append(entry)
+            message = f"已收藏完整 TeX：{self.current_path.name}"
+        self.save_favorite_entries(entries)
+        self.statusBar().showMessage(message, 5000)
+
+    def toc_favorite_entry(
+        self,
+        item: QTreeWidgetItem,
+    ) -> dict[str, object] | None:
+        if self.current_path is None or self.document_mode != "latex":
+            return None
+        anchor = item.data(0, Qt.UserRole)
+        if not anchor:
+            return None
+        return {
+            "kind": "section",
+            "path": str(self.current_path),
+            "title": item.text(0),
+            "anchor": str(anchor),
+            "vertical_ratio": item.data(0, Qt.UserRole + 1),
+        }
+
+    def toggle_toc_item_favorite(self, item: QTreeWidgetItem) -> None:
+        entry = self.toc_favorite_entry(item)
+        if entry is None:
+            return
+        entries = self.favorite_entries()
+        key = self.favorite_entry_key(entry)
+        if any(self.favorite_entry_key(existing) == key for existing in entries):
+            entries = [
+                existing
+                for existing in entries
+                if self.favorite_entry_key(existing) != key
+            ]
+            message = f"已取消章节收藏：{item.text(0)}"
+        else:
+            entries.append(entry)
+            message = f"已收藏章节：{item.text(0)}"
+        self.save_favorite_entries(entries)
+        self.statusBar().showMessage(message, 5000)
+
+    def show_toc_favorite_menu(self, position) -> None:
+        item = self.toc_tree.itemAt(position)
+        entry = self.toc_favorite_entry(item) if item is not None else None
+        if entry is None:
+            return
+        keys = {self.favorite_entry_key(existing) for existing in self.favorite_entries()}
+        is_favorite = self.favorite_entry_key(entry) in keys
+        menu = QMenu(self.toc_tree)
+        action = menu.addAction("取消收藏章节" if is_favorite else "收藏章节")
+        action.triggered.connect(lambda: self.toggle_toc_item_favorite(item))
+        menu.exec_(self.toc_tree.viewport().mapToGlobal(position))
+
+    def show_favorite_item_menu(self, position) -> None:
+        item = self.favorites_tree.itemAt(position)
+        if item is None:
+            return
+        menu = QMenu(self.favorites_tree)
+        remove_action = menu.addAction("取消收藏")
+        remove_action.triggered.connect(lambda: self.remove_favorite_item(item))
+        menu.exec_(self.favorites_tree.viewport().mapToGlobal(position))
+
+    def remove_favorite_item(self, item: QTreeWidgetItem) -> None:
+        key = (
+            str(item.data(0, self.FAVORITE_KIND_ROLE) or ""),
+            str(item.data(0, self.FAVORITE_PATH_ROLE) or ""),
+            str(item.data(0, self.FAVORITE_ANCHOR_ROLE) or ""),
+        )
+        entries = [
+            entry
+            for entry in self.favorite_entries()
+            if self.favorite_entry_key(entry) != key
+        ]
+        self.save_favorite_entries(entries)
+        self.statusBar().showMessage("已取消收藏", 5000)
+
+    def activate_favorite_item(
+        self,
+        item: QTreeWidgetItem,
+        _column: int,
+    ) -> None:
+        kind = str(item.data(0, self.FAVORITE_KIND_ROLE) or "")
+        path = Path(str(item.data(0, self.FAVORITE_PATH_ROLE) or "")).expanduser()
+        if not path.is_file():
+            QMessageBox.warning(self, "收藏文件不存在", f"找不到文件：\n{path}")
+            return
+        if kind == "document":
+            resolved = path.resolve()
+            if self.current_path == resolved and self.document_mode == "latex":
+                self.statusBar().showMessage(
+                    f"当前 TeX 已经打开，无需重新渲染：{resolved.name}",
+                    5000,
+                )
+                return
+            self.load_file(resolved)
+            return
+        if kind != "section":
+            return
+        resolved = path.resolve()
+        if self.current_path != resolved and not self.load_file(resolved):
+            return
+        target = QTreeWidgetItem([item.text(0)])
+        target.setData(0, Qt.UserRole, item.data(0, self.FAVORITE_ANCHOR_ROLE))
+        target.setData(
+            0,
+            Qt.UserRole + 1,
+            item.data(0, self.FAVORITE_VERTICAL_ROLE),
+        )
+        self.navigate_to_toc_item(target, 0)
 
     def navigate_to_toc_item(self, item: QTreeWidgetItem, _column: int) -> None:
         anchor = item.data(0, Qt.UserRole)
@@ -3750,7 +4296,7 @@ class MarkdownWindow(QMainWindow):
 
     def refresh_toc(self, source: str) -> None:
         self.toc_tree.clear()
-        if self.document_mode == "latex":
+        if self.document_mode != "markdown":
             return
         parents: list[tuple[int, QTreeWidgetItem]] = []
         for level, title, anchor in extract_toc_entries(source):
@@ -3910,13 +4456,36 @@ class MarkdownWindow(QMainWindow):
             f" background-color: {self.background_color}; color: {text_color};"
             " padding: 6px; text-align: left; font-weight: 600;"
             " }"
+            "QTabWidget#tocFavoritesTabs::pane {"
+            f" border: 1px solid {self.border_color}; border-top: 0;"
+            " }"
+            "QTabWidget#tocFavoritesTabs QTabBar::tab {"
+            f" background-color: {self.background_color}; color: {text_color};"
+            f" border: 1px solid {self.border_color};"
+            " padding: 7px 12px; font-weight: 600;"
+            " }"
+            "QTabWidget#tocFavoritesTabs QTabBar::tab:selected {"
+            f" background-color: {hover_color};"
+            " }"
             "QTreeWidget#documentToc {"
             f" border: 0; border-top: 1px solid {self.border_color};"
             " padding: 5px; outline: 0;"
             " }"
-            "QTreeWidget#documentToc::item { padding: 5px 3px; }"
-            "QTreeWidget#documentToc::item:selected {"
+            "QTreeWidget#documentFavorites {"
+            f" border: 1px solid {self.border_color}; border-radius: 5px;"
+            " padding: 3px; outline: 0;"
+            " }"
+            "QTreeWidget#documentToc::item, QTreeWidget#documentFavorites::item {"
+            " padding: 5px 3px;"
+            " }"
+            "QTreeWidget#documentToc::item:selected, "
+            "QTreeWidget#documentFavorites::item:selected {"
             f" background-color: {self.border_color}; color: #ffffff;"
+            " }"
+            "QPushButton#favoriteCurrentDocument {"
+            f" background-color: {hover_color}; color: {text_color};"
+            f" border: 1px solid {self.border_color}; border-radius: 5px;"
+            " padding: 6px; margin: 0 4px;"
             " }"
             "QPlainTextEdit#markdownSource {"
             f" background-color: {input_background}; color: {text_color};"
@@ -3934,7 +4503,14 @@ class MarkdownWindow(QMainWindow):
         self.statusBar().showMessage(f"文件路径已复制：{file_path}", 3000)
 
     def open_edited_file_path(self) -> None:
-        selected = Path(self.path_button.text().strip()).expanduser()
+        try:
+            selected = document_path_from_argument(self.path_button.text())
+        except ValueError as error:
+            self.statusBar().showMessage(str(error), 5000)
+            if self.current_path is not None:
+                self.path_button.setText(str(self.current_path))
+            self.path_button.finish_editing()
+            return
         if self.load_file(selected):
             self.path_button.finish_editing()
             self.statusBar().showMessage(f"已在当前窗口打开：{self.current_path}", 5000)
@@ -3980,25 +4556,86 @@ class MarkdownWindow(QMainWindow):
         return False
 
     def build_current_pdf(
-        self, output_path: Path, *, include_toc: bool | None = None
+        self,
+        output_path: Path,
+        *,
+        include_toc: bool | None = None,
+        progress_callback: Callable[[int, str], None] | None = None,
     ) -> str:
+        if self.document_mode == "html":
+            raise RuntimeError("HTML 模式目前只提供可视化预览，不使用 Markdown/LaTeX 导出器。")
         base_directory = self.current_path.parent if self.current_path else Path.cwd()
         if include_toc is None:
             include_toc = self.default_include_toc()
         if self.document_mode == "latex":
+            if progress_callback is not None:
+                progress_callback(15, "正在准备 LaTeX 文档")
             return compile_latex_document(
                 configure_latex_toc(
                     self.editor.toPlainText(), include_toc
                 ),
                 output_path,
                 base_directory=base_directory,
+                progress_callback=(
+                    lambda completed, total: progress_callback(
+                        20 + round(70 * completed / max(total, 1)),
+                        f"正在编译 LaTeX（{completed}/{total}）",
+                    )
+                    if progress_callback is not None
+                    else None
+                ),
             )
         return export_pdf(
             self.editor.toPlainText(),
             output_path,
             base_directory=base_directory,
             include_toc=include_toc,
+            progress_callback=progress_callback,
         )
+
+    def update_pdf_export_progress(self, value: int, label: str) -> None:
+        self.set_latex_progress(value, label)
+        self.repaint_latex_progress()
+
+    def show_pdf_export_complete(
+        self,
+        output_path: Path,
+        *,
+        open_immediately: bool,
+    ) -> None:
+        output_path = output_path.expanduser().resolve()
+        if open_immediately and not open_local_file(output_path):
+            QMessageBox.warning(
+                self,
+                "无法打开 PDF",
+                f"PDF 已生成，但系统阅读器未能打开：\n{output_path}",
+            )
+        message = QMessageBox(self)
+        message.setIcon(QMessageBox.Information)
+        message.setWindowTitle("PDF 导出完成")
+        message.setText("PDF 已成功导出")
+        message.setInformativeText(str(output_path))
+        copy_directory_button = message.addButton(
+            "复制文件目录",
+            QMessageBox.ActionRole,
+        )
+        open_file_button = message.addButton(
+            "打开 PDF",
+            QMessageBox.ActionRole,
+        )
+        message.addButton("关闭", QMessageBox.RejectRole)
+        message.exec_()
+        if message.clickedButton() is copy_directory_button:
+            directory = str(output_path.parent)
+            QApplication.clipboard().setText(directory)
+            self.statusBar().showMessage(f"文件目录已复制：{directory}", 5000)
+        elif message.clickedButton() is open_file_button:
+            if not open_local_file(output_path):
+                QMessageBox.warning(
+                    self,
+                    "无法打开 PDF",
+                    f"系统阅读器未能打开：\n{output_path}",
+                )
 
     def export_pdf_dialog(self) -> None:
         suggested = (
@@ -4024,21 +4661,31 @@ class MarkdownWindow(QMainWindow):
             )
             if answer != QMessageBox.Yes:
                 return
+        self.latex_progress_timer.stop()
+        self.progress_operation = "pdf_export"
+        self.export_action.setEnabled(False)
+        self.update_pdf_export_progress(5, "正在开始导出 PDF")
         try:
             backend = self.build_current_pdf(
                 output_path,
                 include_toc=dialog.include_toc(),
+                progress_callback=self.update_pdf_export_progress,
             )
-        except (OSError, RuntimeError) as error:
+        except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
+            self.progress_operation = None
+            self.render_progress.hide()
+            self.export_action.setEnabled(True)
             QMessageBox.critical(self, "PDF 导出失败", str(error))
             return
+        self.update_pdf_export_progress(100, "PDF 导出完成")
+        self.progress_operation = None
+        self.render_progress.hide()
+        self.export_action.setEnabled(True)
         self.statusBar().showMessage(f"已通过 {backend} 导出：{output_path}", 10_000)
-        if dialog.open_after_export() and not open_local_file(output_path):
-            QMessageBox.warning(
-                self,
-                "无法打开 PDF",
-                f"PDF 已生成，但系统阅读器未能打开：\n{output_path}",
-            )
+        self.show_pdf_export_complete(
+            output_path,
+            open_immediately=dialog.open_after_export(),
+        )
 
     def preview_pdf(self) -> None:
         cache_root = Path(
@@ -4065,35 +4712,59 @@ class MarkdownWindow(QMainWindow):
             self,
             "打开文档",
             str(self.current_path.parent if self.current_path else Path.home()),
-            "支持的文档 (*.md *.markdown *.tex *.latex *.ltx);;"
+            "支持的文档 (*.md *.markdown *.html *.htm *.tex *.latex *.ltx);;"
             "Markdown 文档 (*.md *.markdown);;"
+            "HTML 文档 (*.html *.htm);;"
             "LaTeX 文档 (*.tex *.latex *.ltx);;文本文件 (*.txt);;所有文件 (*)",
         )
         if selected:
             self.load_file(Path(selected))
 
-    def load_file(self, path: Path) -> bool:
+    def reload_current_file(self) -> None:
+        if self.current_path is None:
+            self.statusBar().showMessage("当前没有可重新加载的文件", 5000)
+            return
+        current_path = self.current_path
+        if self.load_file(current_path):
+            self.statusBar().showMessage(f"已重新加载：{current_path}", 5000)
+
+    def load_file(self, path: Path | str) -> bool:
         try:
-            source = path.expanduser().read_text(encoding="utf-8-sig")
-        except (OSError, UnicodeError) as error:
-            QMessageBox.critical(self, "无法打开文件", f"{path}\n\n{error}")
+            selected_path = document_path_from_argument(path)
+        except ValueError as error:
+            QMessageBox.critical(self, "无法打开文件", str(error))
             return False
-        self.current_path = path.expanduser().resolve()
-        self.document_mode = (
-            "latex"
-            if self.current_path.suffix.casefold() in {".tex", ".latex", ".ltx"}
-            else "markdown"
-        )
+        try:
+            source = selected_path.expanduser().read_text(encoding="utf-8-sig")
+        except (OSError, UnicodeError) as error:
+            QMessageBox.critical(self, "无法打开文件", f"{selected_path}\n\n{error}")
+            return False
+        self.current_path = selected_path.expanduser().resolve()
+        suffix = self.current_path.suffix.casefold()
+        if suffix in {".tex", ".latex", ".ltx"}:
+            self.document_mode = "latex"
+        elif suffix in {".html", ".htm"}:
+            self.document_mode = "html"
+        else:
+            self.document_mode = "markdown"
         self.render_timer.stop()
         self.render_timer.setInterval(900 if self.document_mode == "latex" else 120)
         self.editor.blockSignals(True)
         self.editor.setPlainText(source)
         self.editor.blockSignals(False)
-        latex_mode = self.document_mode == "latex"
-        self.line_height_action.setEnabled(not latex_mode)
-        self.toc_action.setEnabled(True)
-        if self.toc_action.isChecked():
+        html_mode = self.document_mode == "html"
+        self.line_height_action.setEnabled(self.document_mode == "markdown")
+        self.settings_button.setEnabled(not html_mode)
+        self.toc_action.setEnabled(not html_mode)
+        self.preview_pdf_action.setEnabled(not html_mode)
+        self.export_action.setEnabled(not html_mode)
+        if html_mode:
+            self.set_toc_visible(False)
+            self.toc_tree.clear()
+        elif self.toc_action.isChecked():
             self.toc_dock.show()
+        self.activate_preview_for_mode()
+        self.update_favorite_document_button()
         self.setWindowTitle(f"{self.current_path.name} — {APP_NAME}")
         self.path_button.setText(str(self.current_path))
         self.path_button.setToolTip(
@@ -4108,6 +4779,15 @@ class MarkdownWindow(QMainWindow):
         if self.document_mode == "latex":
             self.refresh_latex_preview(source)
             return
+        self.cancel_latex_page_render()
+        if self.document_mode == "html":
+            if self.current_path is None:
+                return
+            preview = self.ensure_html_preview()
+            preview.set_document(source, self.current_path)
+            self.toc_tree.clear()
+            self.statusBar().showMessage("已更新完整 HTML 预览", 3000)
+            return
         if self.current_path is not None:
             self.preview.document().setBaseUrl(
                 QUrl.fromLocalFile(f"{self.current_path.parent}/")
@@ -4117,11 +4797,115 @@ class MarkdownWindow(QMainWindow):
         )
         self.refresh_toc(source)
 
+    def start_deferred_latex_page_render(
+        self,
+        generation: int,
+        backend: str,
+        pdf_path: Path,
+        pages_directory: Path,
+        text_pages: list[
+            tuple[
+                float,
+                float,
+                list[tuple[float, float, float, float, str, int]],
+            ]
+        ],
+        first_page: int,
+    ) -> None:
+        command = pdf_page_raster_command(
+            pdf_path,
+            pages_directory,
+            first_page=first_page,
+            last_page=len(text_pages),
+        )
+        process = QProcess(self)
+        process.setProcessChannelMode(QProcess.MergedChannels)
+        process.finished.connect(
+            lambda exit_code, exit_status: self.finish_deferred_latex_page_render(
+                generation,
+                backend,
+                pages_directory,
+                text_pages,
+                process,
+                exit_code,
+                exit_status,
+            )
+        )
+        self.latex_page_render_process = process
+        process.start(command[0], command[1:])
+
+    def finish_deferred_latex_page_render(
+        self,
+        generation: int,
+        backend: str,
+        pages_directory: Path,
+        text_pages: list[
+            tuple[
+                float,
+                float,
+                list[tuple[float, float, float, float, str, int]],
+            ]
+        ],
+        process: QProcess,
+        exit_code: int,
+        exit_status: QProcess.ExitStatus,
+    ) -> None:
+        if (
+            generation != self.latex_preview_generation
+            or process is not self.latex_page_render_process
+        ):
+            process.deleteLater()
+            return
+        self.latex_page_render_process = None
+        if exit_status != QProcess.NormalExit or exit_code != 0:
+            self.latex_progress_timer.stop()
+            self.progress_operation = None
+            self.render_progress.hide()
+            details = bytes(process.readAllStandardOutput()).decode(
+                "utf-8", errors="replace"
+            ).strip()
+            message = "LaTeX 后台页面渲染失败"
+            if details:
+                message += f"：{details.splitlines()[-1]}"
+            self.statusBar().showMessage(message, 10_000)
+            process.deleteLater()
+            return
+        scroll_value = self.preview.verticalScrollBar().value()
+        preview_html = render_pdf_pages_html_from_images(
+            pages_directory,
+            text_pages,
+            self.background_color,
+        )
+        self.preview.document().setBaseUrl(
+            QUrl.fromLocalFile(f"{pages_directory}/")
+        )
+        self.preview.set_pdf_document(
+            preview_html,
+            pdf_page_image_paths(pages_directory, len(text_pages)),
+            text_pages,
+        )
+        QTimer.singleShot(
+            0,
+            lambda: self.preview.verticalScrollBar().setValue(scroll_value),
+        )
+        self.statusBar().showMessage(
+            f"已通过 {backend} 更新完整 TeX 预览（共 {len(text_pages)} 页）",
+            5000,
+        )
+        self.finish_latex_progress(generation)
+        process.deleteLater()
+
     def refresh_latex_preview(self, source: str) -> None:
+        self.cancel_latex_page_render()
+        self.latex_preview_generation += 1
+        generation = self.latex_preview_generation
+        self.progress_operation = "latex_preview"
+        self.set_latex_progress(5, "正在准备 LaTeX")
+        self.repaint_latex_progress()
         cache_root = self.preview_cache_path
-        pdf_path = cache_root / "latex-preview.pdf"
-        toc_path = cache_root / "latex-preview.toc"
-        pages_directory = cache_root / "latex-pages"
+        pdf_path = cache_root / f"latex-preview-{generation}.pdf"
+        toc_path = cache_root / f"latex-preview-{generation}.toc"
+        pages_directory = cache_root / f"latex-pages-{generation}"
         if toc_path.exists():
             toc_path.unlink()
         try:
@@ -4130,14 +4914,35 @@ class MarkdownWindow(QMainWindow):
                 pdf_path,
                 base_directory=self.current_path.parent if self.current_path else Path.cwd(),
                 toc_output_path=toc_path,
+                progress_callback=self.update_latex_compile_progress,
             )
-            preview_html = render_pdf_pages_html(
+            self.set_latex_progress(55, "正在提取 PDF 文字层")
+            self.repaint_latex_progress()
+            text_pages = extract_pdf_text_layout(pdf_path)
+            if not text_pages:
+                raise RuntimeError("PDF 文字层没有返回任何页面。")
+            initial_page_count = min(
+                self.LATEX_INITIAL_PREVIEW_PAGES,
+                len(text_pages),
+            )
+            self.set_latex_progress(60, "正在生成首批预览页")
+            self.repaint_latex_progress()
+            rasterize_pdf_pages(
                 pdf_path,
                 pages_directory,
+                first_page=1,
+                last_page=initial_page_count,
+            )
+            preview_html = render_pdf_pages_html_from_images(
+                pages_directory,
+                text_pages,
                 self.background_color,
             )
         except (OSError, RuntimeError, subprocess.TimeoutExpired) as error:
             self.latest_tex_pdf_path = None
+            self.latex_progress_timer.stop()
+            self.progress_operation = None
+            self.render_progress.hide()
             self.toc_tree.clear()
             self.preview.setHtml(
                 "<!doctype html><meta charset=\"utf-8\"><style>"
@@ -4152,25 +4957,46 @@ class MarkdownWindow(QMainWindow):
             return
         self.latest_tex_pdf_path = pdf_path
         self.preview.document().setBaseUrl(QUrl.fromLocalFile(f"{pages_directory}/"))
-        page_images = sorted(
-            pages_directory.glob("page-*.png"),
-            key=lambda path: int(re.search(r"-(\d+)\.png$", path.name).group(1)),
-        )
         self.preview.set_pdf_document(
             preview_html,
-            page_images,
-            extract_pdf_text_layout(pdf_path),
+            pdf_page_image_paths(pages_directory, len(text_pages)),
+            text_pages,
         )
         self.refresh_latex_toc(toc_path, pdf_path)
-        self.statusBar().showMessage(f"已通过 {backend} 更新完整 TeX 预览", 5000)
+        self.latex_progress_pages_directory = pages_directory
+        self.latex_progress_total_pages = len(text_pages)
+        self.update_latex_page_render_progress()
+        if initial_page_count == len(text_pages):
+            self.statusBar().showMessage(
+                f"已通过 {backend} 更新完整 TeX 预览（共 {len(text_pages)} 页）",
+                5000,
+            )
+            self.finish_latex_progress(generation)
+            return
+        self.statusBar().showMessage(
+            f"已显示前 {initial_page_count}/{len(text_pages)} 页；其余页面正在后台渲染",
+            10_000,
+        )
+        self.start_deferred_latex_page_render(
+            generation,
+            backend,
+            pdf_path,
+            pages_directory,
+            text_pages,
+            initial_page_count + 1,
+        )
+        self.latex_progress_timer.start()
 
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     parser = argparse.ArgumentParser(
-        description="打开原生 Markdown/LaTeX 原文与渲染预览窗口。"
+        description="打开 Markdown、HTML 或完整 LaTeX 文档预览窗口。"
     )
     parser.add_argument(
-        "file", nargs="?", type=Path, help="启动时打开的 Markdown 或 LaTeX 文件"
+        "file",
+        nargs="?",
+        type=document_path_from_argument,
+        help="启动时打开的本地文档路径或 file:// URL",
     )
     return parser.parse_args(argv)
 
@@ -4179,14 +5005,18 @@ def main(argv: list[str] | None = None) -> int:
     args = parse_args(sys.argv[1:] if argv is None else argv)
     app = QApplication(sys.argv[:1])
     app.setApplicationName(APP_NAME)
+    if APP_ICON_PATH.is_file():
+        app.setWindowIcon(QIcon(str(APP_ICON_PATH)))
     signal.signal(signal.SIGINT, lambda *_: app.quit())
     signal.signal(signal.SIGTERM, lambda *_: app.quit())
     signal_heartbeat = QTimer()
     signal_heartbeat.setInterval(200)
     signal_heartbeat.timeout.connect(lambda: None)
     signal_heartbeat.start()
-    window = MarkdownWindow(args.file)
+    window = MarkdownWindow()
     window.show()
+    if args.file is not None:
+        QTimer.singleShot(0, lambda path=args.file: window.load_file(path))
     return app.exec_()
 
 

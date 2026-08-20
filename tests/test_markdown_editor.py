@@ -19,6 +19,7 @@ from PyQt5.QtWidgets import (
     QSplitter,
     QToolBar,
     QTreeWidgetItem,
+    QTextBrowser,
 )
 
 from markdown_editor import (
@@ -36,6 +37,7 @@ from markdown_editor import (
     chatgpt_performance_script,
     compile_latex_document,
     configure_latex_toc,
+    document_path_from_argument,
     chrome_download_directory,
     create_chatgpt_browser,
     extract_pdf_text_layout,
@@ -55,11 +57,24 @@ from markdown_editor import (
     render_mermaid_data_url,
     render_math_data_url,
     render_markdown,
+    render_pdf_pages_html_from_images,
     render_pdf_pages_html,
     render_tikz_data_url,
+    pdf_page_raster_command,
     save_preview_image,
     strip_front_matter,
 )
+
+
+class FakeHtmlPreview(QTextBrowser):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.loaded_source = None
+        self.loaded_path = None
+
+    def set_document(self, source, path):
+        self.loaded_source = source
+        self.loaded_path = path
 
 
 SAMPLE = r"""---
@@ -93,12 +108,64 @@ class MarkdownRenderingTests(unittest.TestCase):
         self.assertIn(">LAW 世界模型核心定位</h1>", html)
         self.assertNotIn("<h2>Model</h2>", html)
 
+    def test_file_url_argument_resolves_to_a_local_document(self):
+        self.assertEqual(
+            document_path_from_argument(
+                "file:///home/qwer/uwb_analyse_test/uwb_full_analysis_report.html"
+            ),
+            Path("/home/qwer/uwb_analyse_test/uwb_full_analysis_report.html"),
+        )
+
     def test_renders_sample_quote_and_fenced_code(self):
         html = render_markdown(SAMPLE)
         self.assertIn("<blockquote>", html)
         self.assertIn('<pre class="code-block language-text">', html)
         self.assertNotIn("<pre><code", html)
         self.assertIn("V_t -&gt; World Model -&gt; V_(t+1)", html)
+
+    def test_deferred_pdf_page_html_keeps_placeholders_for_missing_pages(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pages = Path(directory)
+            image = QImage(200, 300, QImage.Format_ARGB32)
+            image.fill(Qt.white)
+            self.assertTrue(image.save(str(pages / "page-1.png"), "PNG"))
+            layout = [(120.0, 180.0, []), (120.0, 180.0, []), (120.0, 180.0, [])]
+
+            html = render_pdf_pages_html_from_images(pages, layout)
+
+        self.assertIn('id="pdf-page-1"', html)
+        self.assertIn('id="pdf-page-2"', html)
+        self.assertIn('id="pdf-page-3"', html)
+        self.assertEqual(html.count('class="pdf-page-placeholder"'), 2)
+        self.assertIn("第 2 页正在后台渲染", html)
+
+    def test_deferred_pdf_page_html_accepts_zero_padded_page_names(self):
+        with tempfile.TemporaryDirectory() as directory:
+            pages = Path(directory)
+            image = QImage(200, 300, QImage.Format_ARGB32)
+            image.fill(Qt.white)
+            self.assertTrue(image.save(str(pages / "page-01.png"), "PNG"))
+
+            html = render_pdf_pages_html_from_images(
+                pages,
+                [(120.0, 180.0, [])],
+            )
+
+        self.assertIn('class="pdf-page-image"', html)
+        self.assertNotIn('class="pdf-page-placeholder"', html)
+
+    def test_pdf_page_raster_command_can_limit_the_page_range(self):
+        command = pdf_page_raster_command(
+            Path("/tmp/report.pdf"),
+            Path("/tmp/pages"),
+            first_page=4,
+            last_page=12,
+        )
+
+        self.assertIn("-f", command)
+        self.assertIn("4", command)
+        self.assertIn("-l", command)
+        self.assertIn("12", command)
 
     def test_preview_uses_a_centered_reading_layout(self):
         html = render_markdown(
@@ -788,6 +855,64 @@ title: 自动驾驶世界模型
             self.assertEqual(window.source_action.text(), "隐藏原文")
             self.assertEqual(window.editor.toPlainText(), SAMPLE)
             self.assertIn("LAW 世界模型核心定位", window.preview.toPlainText())
+
+    def test_window_starts_with_the_reference_portrait_proportion(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(settings=settings)
+
+            self.assertEqual((window.width(), window.height()), (1100, 1140))
+
+    def test_latex_progress_bar_is_centered_over_the_window(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(settings=settings)
+            window.set_latex_progress(35, "正在编译 LaTeX")
+
+            progress_center = window.render_progress.geometry().center()
+            window_center = window.rect().center()
+            self.assertIs(window.render_progress.parent(), window)
+            self.assertLessEqual(abs(progress_center.x() - window_center.x()), 1)
+            self.assertLessEqual(abs(progress_center.y() - window_center.y()), 1)
+
+    def test_window_uses_web_preview_for_html_and_restores_markdown_preview(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            html_path = root / "report.html"
+            markdown_path = root / "notes.md"
+            html_path.write_text(
+                "<!doctype html><style>.grid{display:grid}</style>"
+                '<div class="grid"><img src="chart.png">报告</div>',
+                encoding="utf-8",
+            )
+            markdown_path.write_text("# Notes", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+
+            with mock.patch("markdown_editor.HtmlPreview", FakeHtmlPreview):
+                window = MarkdownWindow(html_path, settings=settings)
+
+                self.assertEqual(window.document_mode, "html")
+                self.assertIs(window.centralWidget().widget(1), window.html_preview)
+                self.assertEqual(window.html_preview.loaded_path, html_path.resolve())
+                self.assertIn("display:grid", window.html_preview.loaded_source)
+                self.assertFalse(window.toc_action.isEnabled())
+                self.assertFalse(window.preview_pdf_action.isEnabled())
+                self.assertFalse(window.export_action.isEnabled())
+
+                self.assertTrue(window.load_file(markdown_path))
+
+            self.assertEqual(window.document_mode, "markdown")
+            self.assertIs(window.centralWidget().widget(1), window.preview)
+            self.assertTrue(window.toc_action.isEnabled())
+            self.assertTrue(window.preview_pdf_action.isEnabled())
+            self.assertTrue(window.export_action.isEnabled())
+            self.assertIn("Notes", window.preview.toPlainText())
 
     def test_chatgpt_panel_is_lazy_and_opens_left_of_the_toc(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1693,13 +1818,15 @@ title: 自动驾驶世界模型
                 "markdown_editor.compile_latex_document", return_value="XeLaTeX"
             ) as compile_tex:
                 with mock.patch(
-                    "markdown_editor.render_pdf_pages_html",
+                    "markdown_editor.render_pdf_pages_html_from_images",
                     return_value='<div class="pdf-document">compiled</div>',
                 ):
                     with mock.patch(
-                        "markdown_editor.extract_pdf_text_layout", return_value=[]
+                        "markdown_editor.extract_pdf_text_layout",
+                        return_value=[(612.0, 792.0, [])],
                     ):
-                        window = MarkdownWindow(source_path, settings=settings)
+                        with mock.patch("markdown_editor.rasterize_pdf_pages"):
+                            window = MarkdownWindow(source_path, settings=settings)
 
             self.assertEqual(window.document_mode, "latex")
             self.assertIn("documentclass", window.editor.toPlainText())
@@ -1719,7 +1846,7 @@ title: 自动驾驶世界模型
 
             self.assertEqual(dialog.output_path(), source_path.with_suffix(".pdf"))
             self.assertFalse(dialog.include_toc())
-            self.assertTrue(dialog.open_after_export())
+            self.assertFalse(dialog.open_after_export())
 
             dialog.toc_checkbox.setChecked(True)
             dialog.output_edit.setText(str(root / "custom-name"))
@@ -1745,14 +1872,95 @@ title: 自动驾驶世界模型
                 with mock.patch.object(
                     window, "build_current_pdf", return_value="Pandoc + XeLaTeX"
                 ) as build:
-                    window.export_action.trigger()
+                    with mock.patch.object(
+                        window, "show_pdf_export_complete"
+                    ) as completed:
+                        window.export_action.trigger()
 
             dialog_type.assert_called_once_with(
                 source_path.with_suffix(".pdf"),
                 include_toc=False,
                 parent=window,
             )
-            build.assert_called_once_with(output_path, include_toc=True)
+            build.assert_called_once()
+            self.assertEqual(build.call_args.args, (output_path,))
+            self.assertTrue(build.call_args.kwargs["include_toc"])
+            self.assertTrue(callable(build.call_args.kwargs["progress_callback"]))
+            completed.assert_called_once_with(output_path, open_immediately=False)
+            self.assertTrue(window.render_progress.isHidden())
+
+    def test_pdf_export_completion_can_copy_the_output_directory(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            output_path = root / "exports" / "report.pdf"
+            copy_button = mock.Mock()
+            open_button = mock.Mock()
+            close_button = mock.Mock()
+            message_box = mock.Mock()
+            message_box.addButton.side_effect = [
+                copy_button,
+                open_button,
+                close_button,
+            ]
+            message_box.clickedButton.return_value = copy_button
+
+            with mock.patch(
+                "markdown_editor.QMessageBox",
+                return_value=message_box,
+            ):
+                window.show_pdf_export_complete(
+                    output_path,
+                    open_immediately=False,
+                )
+
+            self.assertEqual(QApplication.clipboard().text(), str(output_path.parent))
+            self.assertIn("目录已复制", window.statusBar().currentMessage())
+
+    def test_pdf_export_completion_can_open_the_exported_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            output_path = root / "report.pdf"
+            copy_button = mock.Mock()
+            open_button = mock.Mock()
+            close_button = mock.Mock()
+            message_box = mock.Mock()
+            message_box.addButton.side_effect = [
+                copy_button,
+                open_button,
+                close_button,
+            ]
+            message_box.clickedButton.return_value = open_button
+
+            with mock.patch(
+                "markdown_editor.QMessageBox",
+                return_value=message_box,
+            ):
+                with mock.patch(
+                    "markdown_editor.open_local_file",
+                    return_value=True,
+                ) as opened:
+                    window.show_pdf_export_complete(
+                        output_path,
+                        open_immediately=False,
+                    )
+
+            opened.assert_called_once_with(output_path.resolve())
+
+    def test_pdf_export_progress_is_reported_in_the_center_overlay(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(str(Path(directory) / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+
+            window.update_pdf_export_progress(45, "正在生成 PDF")
+
+            self.assertFalse(window.render_progress.isHidden())
+            self.assertEqual(window.render_progress.value(), 45)
+            self.assertIn("正在生成 PDF", window.render_progress.format())
+            self.assertIs(window.render_progress.parent(), window)
 
     def test_window_hides_the_live_left_toc_by_default_and_navigates_when_shown(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -1777,6 +1985,123 @@ title: 自动驾驶世界模型
                 window.toc_tree.itemClicked.emit(chapter.child(0), 0)
 
             scroll.assert_called_once_with(chapter.child(0).data(0, Qt.UserRole))
+
+    def test_document_toc_and_favorites_use_separate_tabs(self):
+        with tempfile.TemporaryDirectory() as directory:
+            settings = QSettings(
+                str(Path(directory) / "settings.ini"),
+                QSettings.IniFormat,
+            )
+            window = MarkdownWindow(settings=settings)
+
+            self.assertEqual(window.toc_tabs.count(), 2)
+            self.assertEqual(window.toc_tabs.tabText(0), "文档目录")
+            self.assertEqual(window.toc_tabs.tabText(1), "收藏")
+            self.assertEqual(window.toc_tabs.currentIndex(), 0)
+            self.assertTrue(window.toc_tab.isAncestorOf(window.toc_tree))
+            self.assertTrue(
+                window.favorites_tab.isAncestorOf(window.favorites_tree)
+            )
+            self.assertFalse(window.toc_tab.isAncestorOf(window.favorites_tree))
+
+    def test_current_tex_document_can_be_favorited_and_persists(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path.resolve()
+            window.document_mode = "latex"
+
+            window.toggle_current_document_favorite()
+
+            self.assertEqual(window.favorites_tree.topLevelItemCount(), 1)
+            self.assertIn("report.tex", window.favorites_tree.topLevelItem(0).text(0))
+            second_window = MarkdownWindow(settings=settings)
+            self.assertEqual(second_window.favorites_tree.topLevelItemCount(), 1)
+            self.assertIn(
+                "report.tex",
+                second_window.favorites_tree.topLevelItem(0).text(0),
+            )
+
+    def test_clicking_the_current_document_favorite_does_not_render_again(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path.resolve()
+            window.document_mode = "latex"
+            window.toggle_current_document_favorite()
+            favorite = window.favorites_tree.topLevelItem(0)
+
+            with mock.patch.object(window, "load_file", return_value=True) as load:
+                window.activate_favorite_item(favorite, 0)
+
+            load.assert_not_called()
+            self.assertIn("已经打开", window.statusBar().currentMessage())
+
+    def test_clicking_another_document_favorite_renders_the_complete_tex(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "report.tex"
+            other_path = root / "other.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            other_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path.resolve()
+            window.document_mode = "latex"
+            window.toggle_current_document_favorite()
+            favorite = window.favorites_tree.topLevelItem(0)
+            window.current_path = other_path.resolve()
+
+            with mock.patch.object(window, "load_file", return_value=True) as load:
+                window.activate_favorite_item(favorite, 0)
+
+            load.assert_called_once_with(source_path.resolve())
+
+    def test_latex_toc_section_can_be_favorited_and_reopened(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path.resolve()
+            window.document_mode = "latex"
+            toc_item = QTreeWidgetItem(["2.6 与 waypoint loss 的区别"])
+            toc_item.setData(0, Qt.UserRole, "pdf-page-10")
+            toc_item.setData(0, Qt.UserRole + 1, 0.75)
+
+            window.toggle_toc_item_favorite(toc_item)
+            favorite = window.favorites_tree.topLevelItem(0)
+
+            self.assertIn("2.6 与 waypoint loss 的区别", favorite.text(0))
+            with mock.patch.object(window, "navigate_to_toc_item") as navigate:
+                window.activate_favorite_item(favorite, 0)
+
+            target = navigate.call_args.args[0]
+            self.assertEqual(target.data(0, Qt.UserRole), "pdf-page-10")
+            self.assertEqual(target.data(0, Qt.UserRole + 1), 0.75)
+
+    def test_favorite_context_action_can_remove_an_entry(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "report.tex"
+            source_path.write_text("\\documentclass{article}", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(settings=settings)
+            window.current_path = source_path.resolve()
+            window.document_mode = "latex"
+            window.toggle_current_document_favorite()
+            favorite = window.favorites_tree.topLevelItem(0)
+
+            window.remove_favorite_item(favorite)
+
+            self.assertEqual(window.favorites_tree.topLevelItemCount(), 0)
 
     def test_latex_toc_navigation_uses_vertical_position_inside_pdf_page(self):
         with tempfile.TemporaryDirectory() as directory:
@@ -2089,6 +2414,22 @@ title: 自动驾驶世界模型
                 window.path_button.toolTip(),
                 "单击复制完整路径；双击编辑，按 Enter 在当前窗口打开",
             )
+
+    def test_reload_action_rereads_the_current_file(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            source_path = root / "notes.md"
+            source_path.write_text("# Before", encoding="utf-8")
+            settings = QSettings(str(root / "settings.ini"), QSettings.IniFormat)
+            window = MarkdownWindow(source_path, settings=settings)
+            source_path.write_text("# After", encoding="utf-8")
+
+            window.reload_action.trigger()
+
+            self.assertEqual(window.reload_action.shortcut().toString(), "F5")
+            self.assertEqual(window.editor.toPlainText(), "# After")
+            self.assertIn("After", window.preview.toPlainText())
+            self.assertIn("已重新加载", window.statusBar().currentMessage())
 
     def test_file_path_has_its_own_toolbar_and_edits_in_place(self):
         with tempfile.TemporaryDirectory() as directory:

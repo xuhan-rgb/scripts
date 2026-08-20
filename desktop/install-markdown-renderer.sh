@@ -34,6 +34,7 @@ repository_directory="$(dirname -- "$script_directory")"
 required_files=(
     "$repository_directory/markdown_editor.py"
     "$repository_directory/desktop/markdown-renderer.desktop"
+    "$repository_directory/desktop/mdview.png"
     "$repository_directory/markdown_pdf/template.tex"
     "$repository_directory/markdown_pdf/callout-boxes.lua"
     "$repository_directory/markdown_renderer_node/package.json"
@@ -67,6 +68,7 @@ packages=(
     python3-markdown
     python3-matplotlib
     python3-pyqt5
+    python3-pyqt5.qtwebengine
     python3-websocket
     texlive-lang-chinese
     texlive-latex-extra
@@ -142,10 +144,12 @@ printf '%s\n' '[4/5] Installing the mdview command and desktop entry...'
 command_path="$HOME/.local/bin/mdview"
 data_home="${XDG_DATA_HOME:-$HOME/.local/share}"
 desktop_path="$data_home/applications/markdown-renderer.desktop"
-mkdir -p "${command_path%/*}" "${desktop_path%/*}"
+icon_path="$data_home/icons/hicolor/256x256/apps/mdview.png"
+mkdir -p "${command_path%/*}" "${desktop_path%/*}" "${icon_path%/*}"
 chmod 0755 "$repository_directory/markdown_editor.py"
 ln -sfn "$repository_directory/markdown_editor.py" "$command_path"
 install -m 0644 "$repository_directory/desktop/markdown-renderer.desktop" "$desktop_path"
+install -m 0644 "$repository_directory/desktop/mdview.png" "$icon_path"
 desktop-file-edit \
     --set-key=Exec \
     --set-value="$command_path %f" \
@@ -156,6 +160,9 @@ desktop-file-edit \
     "$desktop_path"
 desktop-file-validate "$desktop_path"
 update-desktop-database "${desktop_path%/*}"
+if command -v gtk-update-icon-cache >/dev/null; then
+    gtk-update-icon-cache --force --ignore-theme-index "$data_home/icons/hicolor"
+fi
 
 printf '%s\n' '[5/5] Registering mdview for Markdown and LaTeX documents...'
 mime_types=(

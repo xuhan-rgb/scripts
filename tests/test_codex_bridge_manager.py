@@ -78,6 +78,21 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertIn("$('provider-edit-key').required = !provider?.key_set", manager.HTML)
         self.assertIn("provider?.active", manager.HTML)
 
+    def test_dashboard_exposes_named_account_management_without_deletion(self):
+        self.assertIn('id="account-config-open"', manager.HTML)
+        self.assertIn('id="account-config-layer"', manager.HTML)
+        self.assertIn('id="account-add-name"', manager.HTML)
+        self.assertIn('id="account-login-output"', manager.HTML)
+        self.assertIn('id="account-usage-output"', manager.HTML)
+        self.assertIn("/api/accounts/login", manager.HTML)
+        self.assertIn("/api/accounts/use", manager.HTML)
+        self.assertIn("/api/accounts/api", manager.HTML)
+        self.assertIn("/api/accounts/usage", manager.HTML)
+        self.assertIn("Use API provider for future terminals", manager.HTML)
+        self.assertIn("providerStateRequest('/api/providers/switch'", manager.HTML)
+        self.assertIn('data-current-account="unnamed"', manager.HTML)
+        self.assertNotIn("/api/accounts/delete", manager.HTML)
+
     def test_dashboard_renders_usage_periods_and_ttft_incrementally(self):
         self.assertIn('id="usage-day-total"', manager.HTML)
         self.assertIn('id="usage-week-total"', manager.HTML)
@@ -122,6 +137,137 @@ class CodexBridgeManagerTests(unittest.TestCase):
         self.assertTrue(provider_b["key_set"])
         self.assertNotIn("secret-never-return", json.dumps(providers))
 
+    def test_account_catalog_reports_login_state_without_exposing_credentials(self):
+        with tempfile.TemporaryDirectory() as directory:
+            root = Path(directory)
+            accounts = root / "accounts"
+            personal = accounts / "personal"
+            work = accounts / "work"
+            personal.mkdir(parents=True)
+            work.mkdir()
+            secret = "refresh-token-never-return"
+            (personal / "auth.json").write_text(secret, encoding="utf-8")
+            active = root / "active-account"
+            active.write_text("personal\n", encoding="utf-8")
+
+            catalog = manager.read_account_catalog(accounts, active)
+
+        self.assertEqual(
+            catalog,
+            [
+                {"name": "personal", "active": True, "logged_in": True},
+                {"name": "work", "active": False, "logged_in": False},
+            ],
+        )
+        self.assertNotIn(secret, json.dumps(catalog))
+
+    def test_activates_named_account_through_auth_backend(self):
+        with (
+            mock.patch.object(manager, "_run_auth_command") as run,
+            mock.patch.object(manager, "_account_lock", return_value=nullcontext()),
+        ):
+            name = manager.use_account({"name": "work"})
+
+        self.assertEqual(name, "work")
+        run.assert_called_once_with(["use", "work"])
+
+    def test_api_mode_uses_auth_backend_and_refreshes_gateway(self):
+        with (
+            mock.patch.object(manager, "_run_auth_command") as run,
+            mock.patch.object(manager, "_sync_provider_gateway") as sync,
+            mock.patch.object(manager, "_account_lock", return_value=nullcontext()),
+        ):
+            manager.activate_api_mode()
+
+        run.assert_called_once_with(["api"])
+        sync.assert_called_once_with()
+
+    def test_account_login_worker_streams_device_login_output(self):
+        class FakeProcess:
+            stdout = io.StringIO("Open https://auth.example/device\nCode: TEST-CODE\n")
+            returncode = 0
+
+            def wait(self):
+                return self.returncode
+
+        with (
+            mock.patch.object(manager.subprocess, "Popen", return_value=FakeProcess()) as popen,
+            mock.patch.object(manager, "_auth_backend_path", return_value=Path("/tmp/codex-auth")),
+            mock.patch.object(manager, "_account_lock", return_value=nullcontext()),
+        ):
+            manager._set_account_login_task(name="work", status="running", output="", error="")
+            manager._account_login_worker("work")
+
+        task = manager.account_login_state()
+        self.assertEqual(task["status"], "succeeded")
+        self.assertIn("TEST-CODE", task["output"])
+        popen.assert_called_once()
+        self.assertEqual(
+            popen.call_args.args[0],
+            ["/tmp/codex-auth", "add", "work", "--device-auth"],
+        )
+
+    def test_reads_named_account_quota_without_returning_backend_extras(self):
+        output = json.dumps(
+            {
+                "account": "work",
+                "fetched_at": "2026-08-11T12:00:00+08:00",
+                "plan_type": "plus",
+                "rate_limits": [
+                    {
+                        "name": "Codex",
+                        "windows": [
+                            {
+                                "name": "primary",
+                                "remaining_percent": 75,
+                                "used_percent": 25,
+                                "window_seconds": 18000,
+                                "resets_at": 2000,
+                            }
+                        ],
+                    }
+                ],
+                "unexpected_secret": "never-return-this",
+            }
+        )
+        completed = mock.Mock(returncode=0, stdout=output, stderr="")
+        with (
+            mock.patch.object(manager, "_usage_backend_path", return_value=Path("/tmp/codex-usage")),
+            mock.patch.object(manager.subprocess, "run", return_value=completed) as run,
+        ):
+            quota = manager.read_account_usage({"name": "work"})
+
+        self.assertEqual(quota["account"], "work")
+        self.assertEqual(quota["rate_limits"][0]["windows"][0]["remaining_percent"], 75)
+        self.assertNotIn("never-return-this", json.dumps(quota))
+        run.assert_called_once_with(
+            ["/tmp/codex-usage", "--account", "work", "--json", "--timeout", "12"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
+    def test_reads_the_current_unnamed_account_quota_without_an_account_argument(self):
+        output = json.dumps(
+            {"account": "unnamed", "plan_type": "plus", "rate_limits": []}
+        )
+        completed = mock.Mock(returncode=0, stdout=output, stderr="")
+        with (
+            mock.patch.object(manager, "_usage_backend_path", return_value=Path("/tmp/codex-usage")),
+            mock.patch.object(manager.subprocess, "run", return_value=completed) as run,
+        ):
+            quota = manager.read_account_usage({"current": True})
+
+        self.assertEqual(quota["account"], "unnamed")
+        run.assert_called_once_with(
+            ["/tmp/codex-usage", "--json", "--timeout", "12"],
+            capture_output=True,
+            text=True,
+            timeout=20,
+            check=False,
+        )
+
     def test_saves_provider_without_activating_or_putting_key_in_process_arguments(self):
         commands = []
 
@@ -163,6 +309,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
         with (
             mock.patch.object(manager, "read_provider_catalog", return_value=[provider]),
             mock.patch.object(manager, "_run_provider_command") as run,
+            mock.patch.object(manager, "_run_auth_command") as auth,
             mock.patch.object(manager, "_sync_provider_gateway") as sync,
             mock.patch.object(manager, "_provider_lock", return_value=nullcontext()),
         ):
@@ -170,6 +317,7 @@ class CodexBridgeManagerTests(unittest.TestCase):
 
         self.assertEqual(name, "saved_route")
         run.assert_called_once_with(["switch", "saved_route"])
+        auth.assert_called_once_with(["api"])
         sync.assert_called_once_with()
 
     def test_tests_unsaved_provider_fields_without_putting_key_in_process_arguments(self):

@@ -6,7 +6,7 @@ echo "=========================================="
 echo
 
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
-echo "1. 默认命令配置 (无限制)"
+echo "1. 默认命令配置"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
 
@@ -33,14 +33,9 @@ echo
 # Codex 默认
 echo "【codex】"
 if [[ -f ~/.codex/config.toml ]]; then
-  enabled=$(grep -c "enabled = true" ~/.codex/config.toml)
-  disabled=$(grep -c "enabled = false" ~/.codex/config.toml)
-  
-  if [[ $disabled -eq 0 ]]; then
-    echo "  ✅ 所有 skills 都启用 ($enabled 个)"
-  else
-    echo "  ⚠️  有 $disabled 个 skills 被禁用"
-  fi
+  skill_count=$(grep -B 1 "enabled = true" ~/.codex/config.toml | grep "path =" | sed 's|.*/\([^/]*\)/SKILL.md.*|\1|' | sort -u | wc -l)
+  echo "  ✅ 精简配置: $skill_count 个核心 skills（保留审批）"
+  grep -B 1 "enabled = true" ~/.codex/config.toml | grep "path =" | sed 's|.*/\([^/]*\)/SKILL.md.*|     - \1|' | sort -u
 else
   echo "  ⚠️  配置文件不存在"
 fi
@@ -77,12 +72,15 @@ echo "━━━━━━━━━━━━━━━━━━━━━━━━�
 echo "3. 总结"
 echo "━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━━"
 echo
-echo "✅ 默认命令 (claude, codex):"
+echo "✅ 默认 Claude 命令:"
 echo "   - 无 skill 限制"
 echo "   - 可使用所有已安装的 skills"
-echo "   - 适合功能全面的开发工作"
 echo
-echo "✅ Yolo 命令 (claude-yolo, codex-yolo, claudex-yolo):"
+echo "✅ Codex 命令 (codex, codex-yolo):"
+echo "   - 使用相同的 5 个核心 skills"
+echo "   - codex 保留审批；codex-yolo 跳过审批与沙箱"
+echo
+echo "✅ 其他 Yolo 命令 (claude-yolo, claudex-yolo):"
 echo "   - 只使用 5 个核心 skills"
 echo "   - 精简高效，减少 token 开销"
 echo "   - 适合快速迭代和高频任务"

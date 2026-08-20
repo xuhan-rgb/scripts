@@ -7,6 +7,15 @@ readonly CODEX_DIR="${CODEX_HOME:-${HOME}/.codex}"
 readonly CODEX_CONFIG="${CODEX_DIR}/config.toml"
 readonly CODEX_PROVIDER_SOURCE="${SCRIPT_DIR}/codex_provider.py"
 readonly CODEX_AUTH_SOURCE="${SCRIPT_DIR}/switch-codex-auth.sh"
+readonly CODEX_USAGE_SOURCE="${SCRIPT_DIR}/codex-usage"
+readonly CODEX_USAGE_WIDGET_SOURCE="${SCRIPT_DIR}/../codex-usage-widget"
+readonly ACCOUNT_MANAGER_QT_SOURCE="${SCRIPT_DIR}/codex_account_manager_qt.py"
+readonly ACCOUNT_MANAGER_BACKEND_SOURCE="${SCRIPT_DIR}/codex_account_manager_backend.py"
+readonly ACCOUNT_MANAGER_ICON_SOURCE="${SCRIPT_DIR}/codex-account-manager.svg"
+readonly ACCOUNT_MANAGER_LIB_DIR="${HOME}/.local/lib/codex-account-manager"
+readonly ACCOUNT_MANAGER_ICON_DIR="${HOME}/.local/share/icons/hicolor/scalable/apps"
+readonly APPLICATIONS_DIR="${HOME}/.local/share/applications"
+readonly AUTOSTART_DIR="${HOME}/.config/autostart"
 readonly SECRETS_DIR="${HOME}/.config/codex"
 readonly SECRETS_FILE="${SECRETS_DIR}/secrets.env"
 readonly BASHRC="${HOME}/.bashrc"
@@ -42,6 +51,15 @@ esac
 
 [[ -f ${CODEX_PROVIDER_SOURCE} ]] || fail "missing provider manager: ${CODEX_PROVIDER_SOURCE}"
 [[ -f ${CODEX_AUTH_SOURCE} ]] || fail "missing Codex auth switcher: ${CODEX_AUTH_SOURCE}"
+[[ -f ${CODEX_USAGE_SOURCE} ]] || fail "missing Codex usage command: ${CODEX_USAGE_SOURCE}"
+[[ -f ${CODEX_USAGE_WIDGET_SOURCE} ]] \
+  || fail "missing Codex usage widget: ${CODEX_USAGE_WIDGET_SOURCE}"
+[[ -f ${ACCOUNT_MANAGER_QT_SOURCE} ]] \
+  || fail "missing Qt account manager: ${ACCOUNT_MANAGER_QT_SOURCE}"
+[[ -f ${ACCOUNT_MANAGER_BACKEND_SOURCE} ]] \
+  || fail "missing Qt account manager backend: ${ACCOUNT_MANAGER_BACKEND_SOURCE}"
+[[ -f ${ACCOUNT_MANAGER_ICON_SOURCE} ]] \
+  || fail "missing Qt account manager icon: ${ACCOUNT_MANAGER_ICON_SOURCE}"
 
 create_claude_yolo_settings() {
   mkdir -p "${CLAUDE_DIR}"
@@ -155,20 +173,31 @@ update_bashrc() {
     mode="$(stat -c '%a' "${BASHRC}")"
   fi
   bashrc_tmp="$(mktemp "${HOME}/.bashrc.tmp.XXXXXX")"
+  cat >"${bashrc_tmp}" <<'EOF'
+# >>> scripts AI alias cleanup >>>
+unalias codex 2>/dev/null || true
+# <<< scripts AI alias cleanup <<<
+
+EOF
   if [[ -f ${BASHRC} ]]; then
     awk '
+      $0 == "# >>> scripts AI alias cleanup >>>" { cleanup = 1; next }
+      $0 == "# <<< scripts AI alias cleanup <<<" { cleanup = 0; next }
       $0 == "# >>> scripts AI yolo aliases >>>" { managed = 1; next }
       $0 == "# <<< scripts AI yolo aliases <<<" { managed = 0; next }
       $0 == "[ -f \"$HOME/.config/codex/secrets.env\" ] && source \"$HOME/.config/codex/secrets.env\"" { next }
-      $0 ~ "^[[:space:]]*alias[[:space:]]+(codex-yolo|claude-yolo|claudex-yolo)[[:space:]]*=" { next }
-      !managed { print }
-    ' "${BASHRC}" >"${bashrc_tmp}"
+      $0 ~ "^[[:space:]]*alias[[:space:]]+(codex|codex-yolo|claude-yolo|claudex-yolo|codex-account-manager)[[:space:]]*=" { next }
+      !cleanup && !managed { print }
+    ' "${BASHRC}" >>"${bashrc_tmp}"
   fi
   cat >>"${bashrc_tmp}" <<'EOF'
 
 # >>> scripts AI yolo aliases >>>
 [ -f "$HOME/.config/codex/secrets.env" ] && source "$HOME/.config/codex/secrets.env"
-alias codex-yolo='codex --dangerously-bypass-approvals-and-sandbox -p yolo'
+codex() {
+  codex-auth run -- "$@"
+}
+alias codex-yolo='codex-auth run -- --dangerously-bypass-approvals-and-sandbox -p yolo'
 alias claude-yolo='claude --dangerously-skip-permissions --settings ~/.claude/settings.yolo.json'
 alias claudex-yolo='CLAUDEX_YOLO=1 claudex'
 # <<< scripts AI yolo aliases <<<
@@ -370,10 +399,64 @@ provider_manager() {
 }
 
 printf '[1/3] Initializing Codex providers\n'
-mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}"
+mkdir -p "${BIN_DIR}" "${CODEX_DIR}" "${SECRETS_DIR}" "${ACCOUNT_MANAGER_LIB_DIR}" \
+  "${ACCOUNT_MANAGER_ICON_DIR}" "${APPLICATIONS_DIR}" "${AUTOSTART_DIR}"
 chmod 700 "${CODEX_DIR}" "${SECRETS_DIR}"
 rm -f -- "${BIN_DIR}/codex-provider"
 install -m 0755 "${CODEX_AUTH_SOURCE}" "${BIN_DIR}/codex-auth"
+rm -f -- "${BIN_DIR}/codex-usage"
+install -m 0755 "${CODEX_USAGE_SOURCE}" "${BIN_DIR}/codex-usage"
+rm -f -- "${BIN_DIR}/codex-usage-widget"
+install -m 0755 "${CODEX_USAGE_WIDGET_SOURCE}" "${BIN_DIR}/codex-usage-widget"
+install -m 0755 "${ACCOUNT_MANAGER_QT_SOURCE}" \
+  "${ACCOUNT_MANAGER_LIB_DIR}/codex_account_manager_qt.py"
+install -m 0644 "${ACCOUNT_MANAGER_BACKEND_SOURCE}" \
+  "${ACCOUNT_MANAGER_LIB_DIR}/codex_account_manager_backend.py"
+install -m 0644 "${CODEX_PROVIDER_SOURCE}" \
+  "${ACCOUNT_MANAGER_LIB_DIR}/codex_provider.py"
+install -m 0644 "${ACCOUNT_MANAGER_ICON_SOURCE}" \
+  "${ACCOUNT_MANAGER_LIB_DIR}/codex-account-manager.svg"
+install -m 0644 "${ACCOUNT_MANAGER_ICON_SOURCE}" \
+  "${ACCOUNT_MANAGER_ICON_DIR}/codex-account-manager.svg"
+
+cat >"${BIN_DIR}/codex-account-manager" <<EOF
+#!/usr/bin/env bash
+if [[ -x "${BIN_DIR}/codex-usage-widget" ]]; then
+  "${BIN_DIR}/codex-usage-widget" stop >/dev/null 2>&1 || true
+fi
+exec /usr/bin/env python3 "${ACCOUNT_MANAGER_LIB_DIR}/codex_account_manager_qt.py" "\$@"
+EOF
+chmod 755 "${BIN_DIR}/codex-account-manager"
+
+cat >"${APPLICATIONS_DIR}/codex-account-manager.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Codex Account Manager
+Comment=Switch Codex ChatGPT accounts and API providers
+Exec=${BIN_DIR}/codex-account-manager
+TryExec=${BIN_DIR}/codex-account-manager
+Icon=${ACCOUNT_MANAGER_ICON_DIR}/codex-account-manager.svg
+Terminal=false
+Categories=Utility;
+StartupNotify=true
+StartupWMClass=Codex Account Manager
+EOF
+chmod 644 "${APPLICATIONS_DIR}/codex-account-manager.desktop"
+
+cat >"${AUTOSTART_DIR}/codex-account-manager.desktop" <<EOF
+[Desktop Entry]
+Type=Application
+Name=Codex Account Manager
+Comment=Keep Codex account selection and quota available in the system tray
+Exec=${BIN_DIR}/codex-account-manager --background
+TryExec=${BIN_DIR}/codex-account-manager
+Icon=${ACCOUNT_MANAGER_ICON_DIR}/codex-account-manager.svg
+Terminal=false
+X-GNOME-Autostart-enabled=true
+NoDisplay=true
+StartupWMClass=Codex Account Manager
+EOF
+chmod 644 "${AUTOSTART_DIR}/codex-account-manager.desktop"
 
 toml_top_value() {
   awk -v wanted="$1" '
@@ -500,11 +583,13 @@ disable_extension_tables() {
   awk '
     /^\[/ {
       if (extension && !seen_enabled) print "enabled = false"
-      extension = ($0 ~ /^\[mcp_servers\.[^]]+\]$/ || $0 ~ /^\[plugins\.[^]]+\]$/)
+      nested_mcp = ($0 ~ /^\[mcp_servers\..+\.env\]$/)
+      extension = (!nested_mcp && ($0 ~ /^\[mcp_servers\.[^]]+\]$/ || $0 ~ /^\[plugins\.[^]]+\]$/))
       seen_enabled = 0
       print
       next
     }
+    nested_mcp && /^[[:space:]]*enabled[[:space:]]*=/ { next }
     extension && /^[[:space:]]*enabled[[:space:]]*=/ {
       if (!seen_enabled) print "enabled = false"
       seen_enabled = 1
@@ -532,6 +617,9 @@ configure_codex_skills() {
   local skill_path
   config_tmp="$(mktemp "${CODEX_CONFIG}.skills.XXXXXX")"
   awk '
+    /^\[\[skills\.config\]\]/ { in_skill = 1; next }
+    in_skill && /^$/ { in_skill = 0; next }
+    in_skill { next }
     $0 == "# >>> scripts disabled Codex skills >>>" { managed = 1; next }
     $0 == "# <<< scripts disabled Codex skills <<<" { managed = 0; next }
     !managed { print }
@@ -542,7 +630,8 @@ configure_codex_skills() {
     escaped_path="${escaped_path//\"/\\\"}"
     skill_name="$(basename "$(dirname "${skill_path}")")"
     enabled=false
-    if [[ ${enabled_skill_names} != *" ${skill_name} "* ]]; then
+    if [[ " ${YOLO_MINIMAL_SKILLS} " == *" ${skill_name} "* ]] \
+      && [[ ${enabled_skill_names} != *" ${skill_name} "* ]]; then
       enabled=true
       enabled_skill_names+="${skill_name} "
     fi
@@ -624,3 +713,8 @@ create_codex_yolo_config
 
 printf 'Shell aliases installed in: %s\n' "${BASHRC}"
 printf 'Codex auth switch installed: %s (use: codex-auth status)\n' "${BIN_DIR}/codex-auth"
+printf 'Codex usage command installed: %s (use: codex-usage)\n' "${BIN_DIR}/codex-usage"
+printf 'Codex usage widget installed: %s (use: codex-usage-widget)\n' \
+  "${BIN_DIR}/codex-usage-widget"
+printf 'Native Codex account manager installed: %s (use: codex-account-manager)\n' \
+  "${BIN_DIR}/codex-account-manager"

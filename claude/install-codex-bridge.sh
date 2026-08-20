@@ -6,6 +6,7 @@ readonly SERVICE_NAME="cli-proxy-api.service"
 readonly MANAGER_SERVICE_NAME="claudex-manager.service"
 readonly STATE_DIR="${HOME}/.cli-proxy-api"
 readonly MANAGEMENT_ENV_FILE="${STATE_DIR}/management.env"
+readonly PROXY_ENV_FILE="${STATE_DIR}/proxy.env"
 readonly BIN_DIR="${HOME}/.local/bin"
 readonly LIB_DIR="${HOME}/.local/lib/claudex"
 readonly UNIT_DIR="${XDG_CONFIG_HOME:-${HOME}/.config}/systemd/user"
@@ -65,6 +66,25 @@ fi
 chmod 600 "${MANAGEMENT_ENV_FILE}"
 grep -qE '^MANAGEMENT_PASSWORD=[0-9a-f]{64}$' "${MANAGEMENT_ENV_FILE}" \
   || fail "invalid management credential file: ${MANAGEMENT_ENV_FILE}"
+
+python3 - "${tmp_dir}/proxy.env" <<'PY'
+import json
+import os
+import sys
+
+names = (
+    "HTTP_PROXY", "HTTPS_PROXY", "ALL_PROXY", "NO_PROXY",
+    "http_proxy", "https_proxy", "all_proxy", "no_proxy",
+)
+with open(sys.argv[1], "w", encoding="utf-8") as output:
+    for name in names:
+        value = os.environ.get(name)
+        if value and "\n" not in value and "\r" not in value:
+            output.write(f"{name}={json.dumps(value, ensure_ascii=False)}\n")
+PY
+if [[ -s ${tmp_dir}/proxy.env ]]; then
+  install -m 0600 "${tmp_dir}/proxy.env" "${PROXY_ENV_FILE}"
+fi
 
 binary_file="${BIN_DIR}/cli-proxy-api"
 if [[ ! -x ${binary_file} ]] || ! "${binary_file}" -h 2>&1 | grep -q "Version: ${CLIPROXY_VERSION}"; then
@@ -357,6 +377,7 @@ Wants=network-online.target
 Type=simple
 WorkingDirectory=%h/.local/lib/claudex
 EnvironmentFile=%h/.cli-proxy-api/management.env
+EnvironmentFile=-%h/.cli-proxy-api/proxy.env
 ExecStart=/usr/bin/env python3 %h/.local/lib/claudex/codex_bridge_manager.py
 Restart=on-failure
 RestartSec=3

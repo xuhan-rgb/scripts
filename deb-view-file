@@ -1,0 +1,66 @@
+#!/usr/bin/env bash
+
+set -euo pipefail
+
+usage() {
+    cat <<'EOF'
+用法:
+  deb-view-file PACKAGE.deb [PATH-IN-PACKAGE]
+
+示例:
+  deb-view-file ./example.deb
+  deb-view-file ./example.deb /etc/example/config.conf
+EOF
+}
+
+if [[ $# -lt 1 || $# -gt 2 ]]; then
+    usage >&2
+    exit 2
+fi
+
+package=$1
+if [[ ! -f "$package" ]]; then
+    printf '错误: 找不到 deb 文件: %s\n' "$package" >&2
+    exit 1
+fi
+
+if ! command -v dpkg-deb >/dev/null 2>&1; then
+    printf '错误: 未找到 dpkg-deb，请先安装 dpkg。\n' >&2
+    exit 1
+fi
+
+tmpdir=$(mktemp -d "${TMPDIR:-/tmp}/deb-view-file.XXXXXX")
+
+if [[ $# -eq 1 ]]; then
+    dpkg-deb --extract "$package" "$tmpdir"
+    printf '已解压到: %s\n' "$tmpdir"
+    printf '\n包内文件:\n'
+    find "$tmpdir" -type f -printf '/%P\n' | sort
+    exit 0
+fi
+
+trap 'rm -rf "$tmpdir"' EXIT
+
+path=${2#./}
+path=${path#/}
+if [[ -z "$path" ]]; then
+    printf '错误: 包内路径不能为空。\n' >&2
+    exit 2
+fi
+
+dpkg-deb --extract "$package" "$tmpdir"
+target="$tmpdir/$path"
+if [[ ! -e "$target" ]]; then
+    printf '错误: 包内不存在文件: /%s\n' "$path" >&2
+    printf '\n包内文件列表:\n' >&2
+    find "$tmpdir" -type f -printf '/%P\n' | sort >&2
+    exit 1
+fi
+
+if [[ -d "$target" ]]; then
+    find "$target" -maxdepth 1 -printf '%M %u/%g %s %TY-%Tm-%Td %TH:%TM %p\n'
+elif command -v less >/dev/null 2>&1 && [[ -t 1 ]]; then
+    less "$target"
+else
+    cat "$target"
+fi

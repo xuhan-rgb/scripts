@@ -5,6 +5,7 @@
 这是一个面向 Linux 桌面与 NVIDIA GPU 服务器的轻量脚本工具集，用于：
 
 - 部署跟随本地 Codex provider、独立管理模型和思考强度的 Claude Code 桥接服务。
+- 使用原生 Qt 桌面软件在多个 Codex ChatGPT 账号与 API provider 间切换。
 - 安装 Flameshot 相关依赖并配置 GNOME 截图快捷键。
 - 诊断 CUDA、cuDNN 与 ONNX Runtime GPU 动态库环境。
 - 生成最小 ONNX 模型并验证 ONNX Runtime 的 CUDA Provider。
@@ -22,6 +23,8 @@
 | 工作流 | Python 依赖 |
 | --- | --- |
 | 环境检查 | 标准库 |
+| Codex 原生账号管理软件 | `PyQt5`（Ubuntu/Debian 包 `python3-pyqt5`） |
+| Markdown 渲染器 | `PyQt5`、`Markdown`、`matplotlib`；完整 Mermaid 另需 Node 依赖和 Chrome/Chromium；TikZ 预览需 XeLaTeX 和 `pdftocairo`；PDF 导出必须安装 Pandoc、XeLaTeX、中文 TeX 包和 Noto CJK 字体 |
 | ONNX Runtime 测试 | `numpy`、`onnx`、`onnxruntime-gpu` |
 | TensorRT 推理 | `numpy`、`torch`、`tensorrt`、`pycuda` |
 | 深度图示例 | TensorRT 推理依赖，另加 `opencv-python`、`matplotlib` |
@@ -37,11 +40,20 @@ bash claude/install-codex-bridge.sh
 # 打开本地模型与思考强度控制台
 claudex-ui
 
+# 打开原生 Codex 账号/API 管理软件
+codex-account-manager
+
 # Shell 语法检查；不会修改系统或用户服务
 bash -n claude/install-codex-bridge.sh
 
 # 检查并安装 Flameshot 依赖，配置 Alt+A 与 Alt+S
 bash desktop/install-flameshot-shortcuts.sh
+
+# 修复 Zotero Linux 中文候选窗固定在左下角
+bash desktop/fix-zotero-ime-candidate-position.sh
+
+# 安装 mdview 的预览/PDF/Mermaid 依赖、命令、桌面入口和 MIME 关联
+bash desktop/install-markdown-renderer.sh
 
 # Shell 语法检查；不会修改系统或桌面配置
 bash -n desktop/install-flameshot-shortcuts.sh
@@ -74,16 +86,26 @@ python convert_trt.py
 .
 |- claude/install-codex-bridge.sh     # 跟随本地 Codex provider 的 Claude Code 桥接服务
 |- claude/setup-codex.sh              # 新电脑 provider、Skills、私有密钥和 alias 初始化
-|- claude/switch-codex-auth.sh        # 在自定义 API provider 与 ChatGPT 账号间切换 Codex
-|- claude/codex_provider.py           # 安装器与 8320 网页共用的内部 provider/profile/key 后端
+|- claude/switch-codex-auth.sh        # 隔离多个 ChatGPT 登录，并在账号与 API provider 间切换 Codex
+|- claude/codex-usage                 # 通过命名账号的 Codex app-server 查询额度与 token 活动
+|- claude/codex_account_manager_backend.py # 原生软件的非敏感状态与额度解析
+|- claude/codex_account_manager_qt.py # PyQt5 主窗口、系统托盘与额度悬浮窗
+|- claude/codex_provider.py           # 安装器、Qt 软件与 8320 网页共用的 provider/profile/key 后端
 |- claude/codex_bridge_manager.py     # 实时模型路由与逐请求 usage 可视化控制台
 |- desktop/install-flameshot-shortcuts.sh  # Flameshot 安装与 GNOME 快捷键配置
+|- desktop/fix-zotero-ime-candidate-position.sh # 修复 Zotero Gecko 测试焦点配置
+|- desktop/install-markdown-renderer.sh # Markdown 软件与完整 PDF 链路安装器
+|- desktop/markdown-renderer.desktop # Markdown 渲染器的桌面入口和 MIME 关联
+|- markdown_editor.py            # 原生 Markdown/完整 LaTeX 预览、公式渲染与 PDF 导出
+|- markdown_pdf/                 # Pandoc/XeLaTeX 论文模板与提示框过滤器
+|- requirements-markdown.txt     # Markdown 桌面工具的 Python 依赖范围
 |- get_onnx_dependencies.py  # 动态库与 onnxruntime CUDA provider 依赖诊断
 |- test_onnx_env.py          # 最小 ONNX Runtime CUDA 推理验证
 |- tensorrt_inference.py     # TensorRTModel 引擎构建、加载、推理与释放
 |- convert_trt.py            # 固定尺寸深度估计模型示例和深度图可视化
 |- README.md                 # 面向使用者的快速开始
 |- tests/test_helpers.py     # 环境诊断和深度图辅助函数的无 GPU 回归测试
+|- tests/test_codex_account_manager_qt.py # 原生账号/API 软件的数据与非网页约束测试
 `- tests/test_codex_bridge_manager.py # Codex provider 解析与选择状态回归测试
 ```
 
@@ -100,6 +122,7 @@ python convert_trt.py
 ## 维护约定
 
 - 修改 Codex 桥接脚本后运行 `bash -n`；不得把 provider API key、管理密钥或 usage 数据库写入仓库。
+- 修改原生 Codex 账号管理软件后运行纯数据单元测试与 Python 语法检查；Qt 进程不得读取或显示凭据内容，也不得依赖 8320 网页服务。
 - 修改桌面安装脚本后运行 `bash -n`；已安装的依赖必须跳过，缺失依赖必须能够自动安装。
 - 保持脚本直接可运行，不引入框架、命令行包装或配置层，除非需求明确要求。
 - 修改 `TensorRTModel` 时，同时核对 ONNX 构建路径、已有 engine 加载路径和多输出返回行为。

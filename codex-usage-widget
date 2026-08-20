@@ -1,0 +1,348 @@
+#!/usr/bin/env python3
+"""Show the selected Codex account and its longest quota window."""
+
+from __future__ import annotations
+
+import fcntl
+import json
+import os
+import queue
+import re
+import shutil
+import signal
+import subprocess
+import sys
+import threading
+import time
+import tkinter as tk
+from pathlib import Path
+
+
+REFRESH_SECONDS = 300
+ACCOUNT_POLL_SECONDS = 2
+COMMAND_TIMEOUT_SECONDS = 20
+SCRIPT_PATH = Path(__file__).resolve()
+RUNTIME_DIR = Path(os.environ.get("XDG_RUNTIME_DIR", f"/tmp/codex-usage-widget-{os.getuid()}"))
+PID_FILE = RUNTIME_DIR / "codex-usage-widget.pid"
+ACTIVE_ACCOUNT_FILE = Path.home() / ".config/codex/active-account"
+CODEX_CONFIG = Path(os.environ.get("CODEX_HOME", Path.home() / ".codex")) / "config.toml"
+ACCOUNT_NAME_PATTERN = re.compile(r"^[a-z0-9][a-z0-9._+@-]{0,127}$")
+
+
+def codex_usage_command() -> str:
+    installed = shutil.which("codex-usage")
+    if installed:
+        return installed
+
+    user_install = Path.home() / ".local/bin/codex-usage"
+    if user_install.is_file() and os.access(user_install, os.X_OK):
+        return str(user_install)
+
+    raise RuntimeError("找不到 codex-usage")
+
+
+def selected_account(
+    active_file: Path = ACTIVE_ACCOUNT_FILE, codex_config: Path = CODEX_CONFIG
+) -> str | None:
+    try:
+        account = Path(active_file).read_text(encoding="utf-8").strip()
+    except OSError:
+        account = ""
+    if ACCOUNT_NAME_PATTERN.fullmatch(account):
+        return account
+    try:
+        for line in Path(codex_config).read_text(encoding="utf-8").splitlines():
+            if line.lstrip().startswith("["):
+                break
+            match = re.match(r'^\s*model_provider\s*=\s*"([^"]*)"', line)
+            if match:
+                return "unnamed" if match.group(1) == "openai" else None
+    except OSError:
+        pass
+    return None
+
+
+def format_window(window_seconds: float | int | None, fallback: str) -> str:
+    if isinstance(window_seconds, (int, float)) and not isinstance(window_seconds, bool):
+        seconds = int(window_seconds)
+        if seconds > 0 and seconds % 86400 == 0:
+            return f"{seconds // 86400}d"
+        if seconds > 0 and seconds % 3600 == 0:
+            return f"{seconds // 3600}h"
+        if seconds > 0 and seconds % 60 == 0:
+            return f"{seconds // 60}m"
+    return fallback
+
+
+def parse_usage(output: str) -> tuple[str, str, str, str, float]:
+    try:
+        snapshot = json.loads(output)
+        limits = snapshot["rate_limits"]
+    except (json.JSONDecodeError, KeyError, TypeError) as error:
+        raise RuntimeError("codex-usage 返回了无效的 JSON") from error
+
+    account = snapshot.get("account")
+    if not isinstance(account, str) or not ACCOUNT_NAME_PATTERN.fullmatch(account):
+        raise RuntimeError("codex-usage 没有返回当前命名账号")
+    plan = snapshot.get("plan_type")
+    plan = plan if isinstance(plan, str) else ""
+
+    candidates = []
+    for limit in limits:
+        if limit.get("name") != "Codex":
+            continue
+        for window in limit.get("windows", []):
+            left = window.get("remaining_percent")
+            reset_at = window.get("resets_at")
+            seconds = window.get("window_seconds")
+            if (
+                isinstance(left, (int, float))
+                and not isinstance(left, bool)
+                and isinstance(reset_at, (int, float))
+                and not isinstance(reset_at, bool)
+            ):
+                left_text = f"{left:.1f}".rstrip("0").rstrip(".")
+                duration = seconds if isinstance(seconds, (int, float)) else 0
+                candidates.append(
+                    (
+                        float(duration),
+                        account,
+                        plan,
+                        format_window(seconds, str(window.get("name") or "quota")),
+                        left_text,
+                        float(reset_at),
+                    )
+                )
+
+    if candidates:
+        _, account, plan, window_name, left, reset_at = max(candidates, key=lambda item: item[0])
+        return account, plan, window_name, left, reset_at
+
+    raise RuntimeError("codex-usage 没有返回可用的 Codex 额度数据")
+
+
+def fetch_usage() -> tuple[str, str, str, str, float]:
+    result = subprocess.run(
+        [codex_usage_command(), "--json"],
+        capture_output=True,
+        check=True,
+        text=True,
+        timeout=COMMAND_TIMEOUT_SECONDS,
+    )
+    return parse_usage(result.stdout)
+
+
+def format_countdown(reset_at: float, now: float | None = None) -> str:
+    remaining = int(reset_at - (time.time() if now is None else now))
+    if remaining <= 0:
+        return "now"
+
+    days, remainder = divmod(remaining, 86400)
+    hours, remainder = divmod(remainder, 3600)
+    minutes = remainder // 60
+    if days:
+        return f"{days}d {hours}h"
+    if hours:
+        return f"{hours}h {minutes}m"
+    return f"{max(1, minutes)}m"
+
+
+def process_is_widget(pid: int) -> bool:
+    try:
+        os.kill(pid, 0)
+        command_line = Path(f"/proc/{pid}/cmdline").read_bytes().split(b"\0")
+    except (OSError, ValueError):
+        return False
+    return os.fsencode(SCRIPT_PATH) in command_line
+
+
+def running_pid() -> int | None:
+    try:
+        pid = int(PID_FILE.read_text(encoding="ascii").strip())
+    except (OSError, ValueError):
+        return None
+    return pid if process_is_widget(pid) else None
+
+
+def serve() -> int:
+    RUNTIME_DIR.mkdir(mode=0o700, parents=True, exist_ok=True)
+    lock_file = PID_FILE.open("a+", encoding="ascii")
+    try:
+        fcntl.flock(lock_file, fcntl.LOCK_EX | fcntl.LOCK_NB)
+    except BlockingIOError:
+        lock_file.close()
+        return 0
+
+    root = tk.Tk(className="CodexUsageWidget")
+    root.title("Codex usage")
+    root.overrideredirect(True)
+    root.attributes("-topmost", True)
+    root.attributes("-alpha", 0.94)
+    root.configure(bg="#18181b", highlightbackground="#3f3f46", highlightthickness=1)
+    root.geometry("+282+8")
+
+    content = tk.Frame(root, bg="#18181b", padx=10, pady=5)
+    content.pack()
+    account_label = tk.Label(
+        content,
+        text="Codex · checking mode",
+        bg="#18181b",
+        fg="#a1a1aa",
+        font=("Ubuntu Sans", 10),
+    )
+    account_label.pack(anchor="w")
+    quota_label = tk.Label(
+        content,
+        text="Quota: --",
+        bg="#18181b",
+        fg="#a1a1aa",
+        font=("Ubuntu Sans", 10),
+    )
+    quota_label.pack(anchor="w")
+
+    updates: queue.Queue[tuple[str, str, str, str, str, float]] = queue.Queue()
+    stopping = threading.Event()
+
+    def wait_for_refresh(account: str | None) -> None:
+        deadline = time.monotonic() + REFRESH_SECONDS
+        while not stopping.is_set() and time.monotonic() < deadline:
+            remaining = deadline - time.monotonic()
+            if stopping.wait(min(ACCOUNT_POLL_SECONDS, remaining)):
+                return
+            if selected_account() != account:
+                return
+
+    def refresh() -> None:
+        while not stopping.is_set():
+            account = selected_account()
+            if account is None:
+                updates.put(("api", "", "", "", "", 0.0))
+            else:
+                try:
+                    fetched_account, plan, window_name, left, reset_at = fetch_usage()
+                    account = fetched_account
+                    updates.put(("account", account, plan, window_name, left, reset_at))
+                except (OSError, RuntimeError, subprocess.SubprocessError):
+                    updates.put(("error", account, "", "", "", 0.0))
+            wait_for_refresh(account)
+
+    def apply_updates() -> None:
+        try:
+            while True:
+                mode, account, plan, window_name, left, reset_at = updates.get_nowait()
+                if mode == "account":
+                    plan_suffix = f" · {plan}" if plan else ""
+                    account_label.configure(
+                        text=f"Codex · {account}{plan_suffix}", fg="#a7f3d0"
+                    )
+                    quota_label.configure(
+                        text=f"{window_name}: {left}% left · resets in {format_countdown(reset_at)}",
+                        fg="#a1a1aa",
+                    )
+                elif mode == "api":
+                    account_label.configure(text="Codex · API provider", fg="#a1a1aa")
+                    quota_label.configure(text="No account quota", fg="#a1a1aa")
+                else:
+                    account_label.configure(text=f"Codex · {account}", fg="#fca5a5")
+                    quota_label.configure(text="Quota unavailable", fg="#fca5a5")
+        except queue.Empty:
+            pass
+        if not stopping.is_set():
+            root.after(200, apply_updates)
+
+    def close() -> None:
+        stopping.set()
+        root.destroy()
+
+    signal.signal(signal.SIGTERM, lambda *_: close())
+    signal.signal(signal.SIGINT, lambda *_: close())
+
+    lock_file.seek(0)
+    lock_file.truncate()
+    lock_file.write(str(os.getpid()))
+    lock_file.flush()
+
+    threading.Thread(target=refresh, name="codex-usage-refresh", daemon=True).start()
+    root.after(100, apply_updates)
+    try:
+        root.mainloop()
+    finally:
+        stopping.set()
+        try:
+            if running_pid() == os.getpid():
+                PID_FILE.unlink()
+        except OSError:
+            pass
+        lock_file.close()
+    return 0
+
+
+def start() -> int:
+    pid = running_pid()
+    if pid is not None:
+        print(f"codex-usage-widget 已在运行 (PID {pid})")
+        return 0
+
+    process = subprocess.Popen(
+        [sys.executable, str(SCRIPT_PATH), "--serve"],
+        stdin=subprocess.DEVNULL,
+        stdout=subprocess.DEVNULL,
+        stderr=subprocess.DEVNULL,
+        start_new_session=True,
+        close_fds=True,
+    )
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline:
+        pid = running_pid()
+        if pid is not None:
+            time.sleep(0.15)
+            if process.poll() is None:
+                print(f"codex-usage-widget 已启动 (PID {pid})")
+                return 0
+        if process.poll() is not None:
+            break
+        time.sleep(0.05)
+
+    print("codex-usage-widget 启动失败；请运行 foreground 查看错误", file=sys.stderr)
+    return 1
+
+
+def stop() -> int:
+    pid = running_pid()
+    if pid is None:
+        print("codex-usage-widget 未运行")
+        return 0
+
+    os.kill(pid, signal.SIGTERM)
+    deadline = time.monotonic() + 3
+    while time.monotonic() < deadline and process_is_widget(pid):
+        time.sleep(0.05)
+    if process_is_widget(pid):
+        print(f"codex-usage-widget 未能停止 (PID {pid})", file=sys.stderr)
+        return 1
+
+    print("codex-usage-widget 已停止")
+    return 0
+
+
+def main() -> int:
+    action = sys.argv[1] if len(sys.argv) > 1 else "start"
+    if action == "start":
+        return start()
+    if action == "stop":
+        return stop()
+    if action == "status":
+        pid = running_pid()
+        print(f"运行中 (PID {pid})" if pid is not None else "未运行")
+        return 0 if pid is not None else 1
+    if action == "foreground":
+        return serve()
+    if action == "--serve":
+        return serve()
+
+    print(f"用法: {SCRIPT_PATH.name} [start|stop|status|foreground]", file=sys.stderr)
+    return 2
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())
