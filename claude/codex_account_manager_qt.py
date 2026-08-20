@@ -23,7 +23,16 @@ from PyQt5.QtCore import (
     QUrl,
     pyqtSignal,
 )
-from PyQt5.QtGui import QColor, QDesktopServices, QFont, QIcon, QPainter, QPixmap, QTextCursor
+from PyQt5.QtGui import (
+    QColor,
+    QCursor,
+    QDesktopServices,
+    QFont,
+    QIcon,
+    QPainter,
+    QPixmap,
+    QTextCursor,
+)
 from PyQt5.QtNetwork import QLocalServer, QLocalSocket
 from PyQt5.QtWidgets import (
     QAction,
@@ -151,6 +160,9 @@ class QuotaOverlay(QWidget):
         )
         self.settings = settings
         self.drag_offset = None
+        self.drag_timer = QTimer(self)
+        self.drag_timer.setInterval(16)
+        self.drag_timer.timeout.connect(self.track_drag)
         self.setObjectName("quotaOverlay")
         self.setAttribute(Qt.WA_TranslucentBackground)
         self.setWindowTitle("Codex quota")
@@ -266,7 +278,7 @@ class QuotaOverlay(QWidget):
     def mousePressEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.LeftButton:
             self.drag_offset = event.globalPos() - self.frameGeometry().topLeft()
-            self.grabMouse()
+            self.drag_timer.start()
             event.accept()
 
     def mouseMoveEvent(self, event) -> None:  # type: ignore[no-untyped-def]
@@ -276,10 +288,21 @@ class QuotaOverlay(QWidget):
 
     def mouseReleaseEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.LeftButton:
-            self.drag_offset = None
-            self.releaseMouse()
-            self.settings.setValue("overlayPosition", self.pos())
+            self.finish_drag()
             event.accept()
+
+    def track_drag(self) -> None:
+        if self.drag_offset is None:
+            self.drag_timer.stop()
+        elif QApplication.mouseButtons() & Qt.LeftButton:
+            self.move(self.bounded_position(QCursor.pos() - self.drag_offset))
+        else:
+            self.finish_drag()
+
+    def finish_drag(self) -> None:
+        self.drag_timer.stop()
+        self.drag_offset = None
+        self.settings.setValue("overlayPosition", self.pos())
 
     def mouseDoubleClickEvent(self, event) -> None:  # type: ignore[no-untyped-def]
         if event.button() == Qt.LeftButton:
