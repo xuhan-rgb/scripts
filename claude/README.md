@@ -95,16 +95,16 @@ codex-account-manager         # 原生 Qt 软件选择账号或 API
 | 命令 | Skills 数量 | 说明 |
 |------|------------|------|
 | `claude` | 43 (6+37 bundled) | 完整功能 |
-| `claude-yolo` | **5** | 精简模式 |
-| `codex` | **5** | 精简 Skills，保留审批 |
-| `codex-yolo` | **5** | 精简模式 |
+| `claude-yolo` | **7** | 精简模式，包含技术流程图 |
+| `codex` | **7** | 精简 Skills，保留审批 |
+| `codex-yolo` | **7** | 精简模式，包含技术流程图 |
 
 ## 自定义
 
 ### 修改精简 Skills
 编辑 `setup-codex.sh` 中的常量：
 ```bash
-readonly YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling grilling tdd"
+readonly YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling domain-variable-explainer graphviz-technical-flowchart grilling tdd"
 ```
 
 然后重新运行安装脚本。该常量同时控制 `codex`、`codex-yolo`、`claude-yolo` 和 `claudex-yolo` 的 Skill 白名单。

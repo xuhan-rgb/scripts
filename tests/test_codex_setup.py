@@ -52,6 +52,7 @@ class CodexSetupTests(unittest.TestCase):
         "tdd",
     )
     internal_skills = ("domain-modeling", "grilling")
+    diagram_skills = ("domain-variable-explainer", "graphviz-technical-flowchart")
     disabled_skills = ("dev-plan", "project-audit", "document-project", "unused")
 
     def test_provider_live_test_uses_the_selected_model_and_reads_streamed_answer(self):
@@ -211,7 +212,7 @@ class CodexSetupTests(unittest.TestCase):
         )
         self.assertNotIn('uv tool install "agent-reach==', setup)
         self.assertIn(
-            'YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling grilling tdd"',
+            'YOLO_MINIMAL_SKILLS="agent-reach brainstorming domain-modeling domain-variable-explainer graphviz-technical-flowchart grilling tdd"',
             setup,
         )
         self.assertIn("CLAUDE_SETTINGS_CLAUDEX_YOLO", setup)
@@ -256,14 +257,24 @@ class CodexSetupTests(unittest.TestCase):
             codex_skill = home / ".codex" / "skills" / "system-helper" / "SKILL.md"
             codex_skill.parent.mkdir(parents=True)
             codex_skill.write_text("---\nname: system-helper\n---\n", encoding="utf-8")
-            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
+            for skill_name in (
+                self.enabled_skills
+                + self.internal_skills
+                + self.diagram_skills
+                + self.disabled_skills
+            ):
                 skill_file = home / ".agents" / "skills" / skill_name / "SKILL.md"
                 skill_file.parent.mkdir(parents=True, exist_ok=True)
                 skill_file.write_text(
                     f"---\nname: {skill_name}\n---\n",
                     encoding="utf-8",
                 )
-            for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
+            for skill_name in (
+                self.enabled_skills
+                + self.internal_skills
+                + self.diagram_skills
+                + self.disabled_skills
+            ):
                 skill_file = home / ".claude" / "skills" / skill_name / "SKILL.md"
                 skill_file.parent.mkdir(parents=True, exist_ok=True)
                 skill_file.write_text(
@@ -368,11 +379,18 @@ class CodexSetupTests(unittest.TestCase):
                 "agent-reach",
                 "brainstorming",
                 "domain-modeling",
+                "domain-variable-explainer",
+                "graphviz-technical-flowchart",
                 "grilling",
                 "tdd",
             }
             for skill_root in (home / ".agents" / "skills", home / ".claude" / "skills"):
-                for skill_name in self.enabled_skills + self.internal_skills + self.disabled_skills:
+                for skill_name in (
+                    self.enabled_skills
+                    + self.internal_skills
+                    + self.diagram_skills
+                    + self.disabled_skills
+                ):
                     expected = (
                         "true"
                         if skill_root == home / ".agents" / "skills"
@@ -397,8 +415,8 @@ class CodexSetupTests(unittest.TestCase):
             managed_yolo_skills = yolo_config_text.split(
                 "# >>> scripts disabled Codex skills >>>", 1
             )[1]
-            self.assertEqual(managed_skills.count("enabled = true"), 5)
-            self.assertEqual(managed_yolo_skills.count("enabled = true"), 5)
+            self.assertEqual(managed_skills.count("enabled = true"), 7)
+            self.assertEqual(managed_yolo_skills.count("enabled = true"), 7)
             self.assertNotIn(secret_value, config_text)
             self.assertIn(secret_value, secrets.read_text(encoding="utf-8"))
             self.assertEqual(config.stat().st_mode & 0o777, 0o600)
