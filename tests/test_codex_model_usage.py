@@ -144,6 +144,17 @@ class CodexModelUsageTests(unittest.TestCase):
         self.assertNotEqual(result.returncode, 0)
         self.assertIn("ccusage failed", result.stderr)
 
+    def test_last_session_rejects_date_filters_before_querying(self):
+        self.mode.write_text("session")
+        self.env["SESSION_JSON"] = "[]"
+        for args in [("--last-session", "--since", "2026-01-02"),
+                     ("--full-text", "--until=2026-01-03")]:
+            with self.subTest(args=args):
+                result = self.run_script(*args)
+                self.assertEqual(result.returncode, 2, result.stderr)
+                self.assertIn("不能与日期筛选同时使用", result.stderr)
+                self.assertFalse(self.calls.exists())
+
 
 if __name__ == "__main__":
     unittest.main()

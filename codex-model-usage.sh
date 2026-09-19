@@ -11,6 +11,7 @@ Usage: codex-model-usage.sh [--last-session] [--full-text] [--since YYYY-MM-DD] 
 默认统计本机日期的今天，按总 token 从高到低排序。
 传入 --since 或 --until 时使用指定范围，其他参数直接传给 ccusage codex daily。
 --last-session：查询最后有活动的会话，统计整个会话已记录的累计用量。
+  不能与日期筛选同时使用，以免截断会话累计用量。
   不加今天的日期限制；会话可能仍在进行中，不合并独立的子代理会话。
   表格后显示最近一轮已有最终回答的问答预览（问题 300、回答 400 字符）。
 --full-text：启用最近会话模式，并展开该轮问答原文；不显示工具或中间消息。
@@ -34,6 +35,10 @@ for arg in "$@"; do
   args+=("$arg")
 done
 set -- "${args[@]}"
+if [[ "$last_session" == true && "$has_date_filter" == true ]]; then
+  printf '%s\n' '--last-session / --full-text 不能与日期筛选同时使用。' >&2
+  exit 2
+fi
 if [[ "$has_date_filter" == false && "$last_session" == false ]]; then
   today=$(date +%F)
   set -- --since "$today" --until "$today" "$@"
