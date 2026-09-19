@@ -12,6 +12,7 @@
 | Codex API provider 后端 | `python3 claude/codex_provider.py` | 新增、测试、切换自定义 API provider | [Provider 命令行管理](#5-provider-命令行管理) |
 | Codex 账号桌面管理 | `codex-account-manager` | 用 Qt 界面管理账号、provider、额度和托盘 | [原生账号与 API 管理软件](#6-原生账号与-api-管理软件) |
 | Codex 额度 | `codex-usage`、`codex-usage-widget` | 查询额度/token 活动，或显示桌面悬浮窗 | [额度命令与悬浮窗](#额度命令与悬浮窗) |
+| Codex 模型用量 | `./codex-model-usage.sh` | 按模型统计 token、缓存命中率和最近会话问答 | [模型用量与会话预览](#模型用量与会话预览) |
 | Claude 路由控制台 | `claudex-ui` | 选择网关模型、思考强度并查看请求用量 | [网页路由控制台](#7-网页路由控制台可选) |
 | mdview | `mdview [FILE]` | 预览 Markdown、HTML、完整 LaTeX 并导出 PDF | [文档渲染器](#markdown--html--latex-文档渲染器) |
 | Markdown 快速转 PDF | `bash markdown_to_pdf.sh INPUT OUTPUT` | 用 Pandoc + Chromium 快速生成 PDF | [快速转换](#独立-markdown-转-pdf) |
@@ -193,6 +194,30 @@ provider 配置写入 `~/.codex/config.toml` 及对应 profile；密钥单独保
 软件集成 `codex-auth` 和本地 provider 管理后端：添加账号时邮箱输入为可选，留空后完成普通浏览器授权，软件会从登录令牌读取邮箱并自动命名；也可以预先填写邮箱。GUI 默认不使用设备码，因此不需要开启 OpenAI 的“为 Codex 启用设备代码授权”设置；只有在无头或远程终端显式运行 `codex-auth add-auto --device-auth` 时才需要该设置。未完成的浏览器授权可用 `Cancel login` 终止，随后账号和 API 操作按钮会恢复。账号页还可选择账号、查看额度和可恢复移除命名账号，旧版 `unnamed` 登录始终保留且禁止删除。API 页可以新增或编辑名称、Base URL、环境变量名和密钥，也可测试连接、删除非当前 provider 并切换使用。API 密钥通过进程标准输入保存，不出现在命令行参数中。额度卡片中的 `Show on desktop` 会把当前额度显示在桌面工作区左上角；悬浮窗可以按住鼠标左键拖动并记住位置，拖动范围会限制在屏幕以内，再次点击变为 `Hide from desktop`。关闭主窗口后软件驻留系统托盘；托盘可以快速切换账号/API、显示额度悬浮窗或彻底退出。
 
 Qt 软件、`codex-auth` 和 `codex-usage` 使用同一份状态。所有切换只影响新启动的 Codex，不会终止或改变已经运行的终端。额度通过本地 Codex app-server 查询，不需要打开 ChatGPT 网页。
+
+##### 模型用量与会话预览
+
+`codex-model-usage.sh` 直接读取 ccusage 的本地统计结果，依赖 Bash、`ccusage` 和 `jq`（本机使用 ccusage 20.0.4）。无需启动桌面软件或调用模型。
+
+```bash
+./codex-model-usage.sh                      # 今天，按总 token 从高到低排序
+./codex-model-usage.sh --since 2026-09-01 --until 2026-09-19
+./codex-model-usage.sh --last-session        # 最近有活动的会话累计用量与问答预览
+./codex-model-usage.sh --last-session --full-text | less  # 分页查看该轮完整问答
+./codex-model-usage.sh --help
+```
+
+| 列 | 含义 |
+| --- | --- |
+| `Input` | 非缓存输入 token |
+| `Cached` | 缓存输入 token |
+| `Output` | 输出 token |
+| `Total` | 总 token |
+| `Cache Hit` | `Cached / (Input + Cached)`，无输入时显示 `N/A` |
+
+默认按本机日期查询今天；显式传入日期范围时使用指定范围。`--last-session` 按 `lastActivity` 选择会话，默认不限制日期，可能选中当前仍在进行的会话，不合并独立的子代理会话。表格统计整个会话，而下方只展示最近一轮已有最终回答的问答：问题最多 300 字符、回答最多 400 字符，过滤工具输出和中间进度消息。预览是原文截取，不是 AI 摘要；`--full-text` 可展开该轮完整原文。会话原文从 `${CODEX_HOME:-$HOME/.codex}/sessions` 读取。
+
+这些数字是本地 token 用量，不代表套餐实际扣除额度；账号的剩余额度请使用下面的 `codex-usage`。不要将个人会话日志或统计结果提交到仓库。
 
 ##### 额度命令与悬浮窗
 

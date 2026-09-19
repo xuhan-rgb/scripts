@@ -46,6 +46,10 @@ codex-account-manager
 # Shell 语法检查；不会修改系统或用户服务
 bash -n claude/install-codex-bridge.sh
 
+# 模型用量脚本语法及独立测试；测试不读取真实会话或访问网络
+bash -n codex-model-usage.sh
+python -m unittest discover -s tests -p test_codex_model_usage.py -v
+
 # 检查并安装 Flameshot 依赖，配置 Alt+A 与 Alt+S
 bash desktop/install-flameshot-shortcuts.sh
 
@@ -88,6 +92,7 @@ python convert_trt.py
 |- claude/setup-codex.sh              # 新电脑 provider、Skills、私有密钥和 alias 初始化
 |- claude/switch-codex-auth.sh        # 隔离多个 ChatGPT 登录，并在账号与 API provider 间切换 Codex
 |- claude/codex-usage                 # 通过命名账号的 Codex app-server 查询额度与 token 活动
+|- codex-model-usage.sh              # 按模型汇总今日 token、缓存命中率和最近会话问答
 |- claude/codex_account_manager_backend.py # 原生软件的非敏感状态与额度解析
 |- claude/codex_account_manager_qt.py # PyQt5 主窗口、系统托盘与额度悬浮窗
 |- claude/codex_provider.py           # 安装器、Qt 软件与 8320 网页共用的 provider/profile/key 后端
@@ -122,6 +127,7 @@ python convert_trt.py
 ## 维护约定
 
 - 修改 Codex 桥接脚本后运行 `bash -n`；不得把 provider API key、管理密钥或 usage 数据库写入仓库。
+- 修改模型用量脚本后运行 Shell 语法检查及 `test_codex_model_usage.py`；保持 token 用量与实际套餐额度的区别，测试使用合成日志，不提交真实会话原文。
 - 修改原生 Codex 账号管理软件后运行纯数据单元测试与 Python 语法检查；Qt 进程不得读取或显示凭据内容，也不得依赖 8320 网页服务。
 - 修改桌面安装脚本后运行 `bash -n`；已安装的依赖必须跳过，缺失依赖必须能够自动安装。
 - 保持脚本直接可运行，不引入框架、命令行包装或配置层，除非需求明确要求。
