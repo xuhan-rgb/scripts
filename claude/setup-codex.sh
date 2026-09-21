@@ -410,6 +410,8 @@ rm -f -- "${BIN_DIR}/codex-usage-widget"
 install -m 0755 "${CODEX_USAGE_WIDGET_SOURCE}" "${BIN_DIR}/codex-usage-widget"
 install -m 0755 "${ACCOUNT_MANAGER_QT_SOURCE}" \
   "${ACCOUNT_MANAGER_LIB_DIR}/codex_account_manager_qt.py"
+install -m 0755 "${SCRIPT_DIR}/../codex-tokens.py" \
+  "${ACCOUNT_MANAGER_LIB_DIR}/codex-tokens.py"
 install -m 0644 "${ACCOUNT_MANAGER_BACKEND_SOURCE}" \
   "${ACCOUNT_MANAGER_LIB_DIR}/codex_account_manager_backend.py"
 install -m 0644 "${CODEX_PROVIDER_SOURCE}" \

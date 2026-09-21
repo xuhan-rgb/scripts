@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import base64
 import json
+import math
 import os
 import re
 import time
@@ -275,6 +276,53 @@ def parse_quota(output: str) -> dict[str, Any]:
         "windows": windows,
         "overlay_window": max(windows, key=lambda item: item["window_seconds"]),
     }
+
+
+def calculate_weekly_budget(
+    window: dict[str, Any], now: float | None = None
+) -> dict[str, Any] | None:
+    """Budget the reported weekly allowance until its actual reset time."""
+    if window.get("window_seconds") != 604800:
+        return None
+    remaining = window.get("remaining_percent")
+    reset_at = window.get("resets_at")
+    if any(
+        not isinstance(value, (int, float))
+        or isinstance(value, bool)
+        or not math.isfinite(value)
+        for value in (remaining, reset_at)
+    ) or not 0 <= remaining <= 100:
+        return None
+    seconds = max(0.0, min(604800.0, reset_at - (time.time() if now is None else now)))
+    target = seconds / 604800 * 100
+    difference = remaining - target
+    status = (
+        "refresh" if seconds <= 0 else
+        "empty" if remaining <= 0 else
+        "warn" if difference < -1 else "normal"
+    )
+    return {
+        "remaining_percent": remaining,
+        "target_percent": target,
+        "difference_percent": difference,
+        "pause_seconds": max(0.0, seconds - remaining / 100 * 604800),
+        "budget_percent": remaining / max(seconds / 86400, 1) if seconds else None,
+        "status": status,
+        "label": "Daily budget" if seconds >= 86400 else "Until reset",
+    }
+
+
+def format_pace_pause(budget: dict[str, Any]) -> str:
+    """Round a no-use catch-up interval up to the next minute."""
+    minutes = math.ceil(budget["pause_seconds"] / 60)
+    if minutes <= 0:
+        return ""
+    days, minutes = divmod(minutes, 1440)
+    hours, minutes = divmod(minutes, 60)
+    duration = f"{days}d {hours}h {minutes}m" if days else f"{hours}h {minutes}m"
+    if budget["status"] == "empty":
+        return f"Wait {duration} for reset"
+    return f"Pause {duration} to get on pace"
 
 
 def format_countdown(reset_at: float, now: float | None = None) -> str:

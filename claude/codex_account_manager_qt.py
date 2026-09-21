@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import os
+import ctypes
+import html
+import json
 import re
 import signal
 import shutil
@@ -53,15 +56,18 @@ from PyQt5.QtWidgets import (
     QPushButton,
     QSystemTrayIcon,
     QTabWidget,
+    QTextBrowser,
     QVBoxLayout,
     QWidget,
 )
 
 from codex_account_manager_backend import (
     ACCOUNT_NAME_PATTERN,
+    calculate_weekly_budget,
     extract_login_url,
     format_account_row,
     format_countdown,
+    format_pace_pause,
     parse_quota,
     read_state,
 )
@@ -145,6 +151,62 @@ def process_environment() -> QProcessEnvironment:
     return environment
 
 
+class QuotaPaceBar(QWidget):
+    """Remaining allowance with a marker for the even weekly pace."""
+
+    def __init__(self) -> None:
+        super().__init__()
+        self.setFixedHeight(12)
+        self.remaining = 0.0
+        self.target = 0.0
+        self.color = "#60d9b1"
+
+    def paintEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        painter = QPainter(self)
+        width = max(0, self.width() - 2)
+        painter.fillRect(1, 4, width, 4, QColor("#29384d"))
+        painter.fillRect(1, 4, round(width * self.remaining / 100), 4, QColor(self.color))
+        painter.fillRect(round(width * self.target / 100), 1, 2, 10, QColor("#f0f5fc"))
+
+
+class X11Pointer:
+    """Read the button state when the desktop panel consumes Qt mouse events."""
+
+    def __init__(self) -> None:
+        self.xlib = ctypes.CDLL("libX11.so.6")
+        self.xlib.XOpenDisplay.argtypes = [ctypes.c_char_p]
+        self.xlib.XOpenDisplay.restype = ctypes.c_void_p
+        self.xlib.XDefaultRootWindow.argtypes = [ctypes.c_void_p]
+        self.xlib.XDefaultRootWindow.restype = ctypes.c_ulong
+        self.xlib.XQueryPointer.argtypes = [
+            ctypes.c_void_p, ctypes.c_ulong,
+            ctypes.POINTER(ctypes.c_ulong), ctypes.POINTER(ctypes.c_ulong),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_int), ctypes.POINTER(ctypes.c_int),
+            ctypes.POINTER(ctypes.c_uint),
+        ]
+        self.xlib.XCloseDisplay.argtypes = [ctypes.c_void_p]
+        self.display = self.xlib.XOpenDisplay(None)
+
+    def left_down(self) -> bool:
+        if not self.display:
+            return False
+        root, child = ctypes.c_ulong(), ctypes.c_ulong()
+        rx, ry, wx, wy = (ctypes.c_int() for _ in range(4))
+        mask = ctypes.c_uint()
+        self.xlib.XQueryPointer(
+            self.display, self.xlib.XDefaultRootWindow(self.display),
+            ctypes.byref(root), ctypes.byref(child), ctypes.byref(rx), ctypes.byref(ry),
+            ctypes.byref(wx), ctypes.byref(wy), ctypes.byref(mask),
+        )
+        return bool(mask.value & 256)  # X11 Button1Mask
+
+    def close(self) -> None:
+        if self.display:
+            self.xlib.XCloseDisplay(self.display)
+            self.display = None
+
+
 class QuotaOverlay(QWidget):
     open_manager = pyqtSignal()
     refresh_requested = pyqtSignal()
@@ -173,13 +235,86 @@ class QuotaOverlay(QWidget):
         layout = QVBoxLayout(frame)
         layout.setContentsMargins(12, 5, 12, 5)
         layout.setSpacing(1)
+        row = QHBoxLayout()
+        row.setSpacing(12)
+        layout.addLayout(row)
+        account_column = QVBoxLayout()
+        account_column.setSpacing(2)
+        row.addLayout(account_column)
         self.account_label = QLabel("Codex · checking")
         self.account_label.setObjectName("overlayAccount")
         self.quota_label = QLabel("Quota: --")
         self.quota_label.setObjectName("overlayQuota")
-        layout.addWidget(self.account_label)
-        layout.addWidget(self.quota_label)
-        self.drag_targets = (frame, self.account_label, self.quota_label)
+        account_column.addWidget(self.account_label)
+        account_column.addWidget(self.quota_label)
+        self.budget_panel = QWidget()
+        budget_layout = QVBoxLayout(self.budget_panel)
+        budget_layout.setContentsMargins(0, 0, 0, 0)
+        budget_layout.setSpacing(2)
+        self.pace_bar = QuotaPaceBar()
+        self.pace_bar.setToolTip("White marker: expected balance at an even 7-day pace.")
+        self.budget_label = QLabel()
+        self.budget_label.setToolTip("Percentage of your total weekly quota.")
+        self.details_button = QPushButton("Budget details +")
+        self.details_button.setObjectName("overlayDetailsButton")
+        self.details_button.setCheckable(True)
+        self.details_button.toggled.connect(self.toggle_budget_details)
+        self.budget_details = QLabel()
+        self.budget_details.setObjectName("overlayDetails")
+        self.budget_details.setWordWrap(True)
+        self.budget_details.setMaximumWidth(700)
+        self.budget_details.hide()
+        budget_header = QHBoxLayout()
+        budget_header.setSpacing(10)
+        budget_header.addWidget(self.pace_bar, 1)
+        budget_header.addWidget(self.details_button)
+        budget_layout.addLayout(budget_header)
+        budget_layout.addWidget(self.budget_label)
+        self.budget_panel.hide()
+        row.addWidget(self.budget_panel)
+        self.tokens_button = QPushButton("本轮 Token +")
+        self.tokens_button.setObjectName("overlayDetailsButton")
+        self.tokens_button.setCheckable(True)
+        self.tokens_button.toggled.connect(self.toggle_token_details)
+        row.addWidget(self.tokens_button)
+        layout.addWidget(self.budget_details)
+        self.token_details = QTextBrowser()
+        self.token_details.setOpenExternalLinks(False)
+        self.token_details.setOpenLinks(False)
+        self.token_details.anchorClicked.connect(self.toggle_tool_content)
+        self.expanded_tool_calls = set()
+        self.tool_report_scope = None
+        self.token_details.setFixedHeight(230)
+        self.token_details.setMinimumWidth(560)
+        self.token_details.setStyleSheet(
+            "QTextBrowser { background: #111827; color: #e2e8f0; border: none; font-size: 12px; }"
+        )
+        self.token_details.hide()
+        layout.addWidget(self.token_details)
+        self.token_process = QProcess(self)
+        self.token_process.finished.connect(self.token_usage_finished)
+        self.token_process.errorOccurred.connect(self.token_usage_error)
+        self.token_refresh_timer = QTimer(self)
+        self.token_refresh_timer.setInterval(2000)
+        self.token_refresh_timer.timeout.connect(self.refresh_token_usage)
+        self.token_report_key = None
+        self.panel_pressed_button = None
+        self.panel_mouse_down = False
+        self.panel_native_click = False
+        self.tokens_button.installEventFilter(self)
+        self.details_button.installEventFilter(self)
+        self.panel_pointer = None
+        if QApplication.platformName() == "xcb":
+            self.panel_pointer = X11Pointer()
+            self.destroyed.connect(self.panel_pointer.close)
+            self.panel_click_timer = QTimer(self)
+            self.panel_click_timer.setInterval(20)
+            self.panel_click_timer.timeout.connect(self.poll_panel_click)
+            self.panel_click_timer.start()
+        self.drag_targets = (
+            frame, self.account_label, self.quota_label, self.pace_bar,
+            self.budget_label, self.budget_details,
+        )
         for target in self.drag_targets:
             target.installEventFilter(self)
 
@@ -191,6 +326,12 @@ class QuotaOverlay(QWidget):
             QFrame#overlayFrame { background: #111827; border: 1px solid #334155; border-radius: 12px; }
             QLabel#overlayAccount { color: #93c5fd; font: 700 11px 'Ubuntu Sans'; }
             QLabel#overlayQuota { color: #e2e8f0; font: 10px 'Ubuntu Sans'; }
+            QLabel#overlayDetails { color: #a3b5cc; font: 10px 'Ubuntu Sans'; }
+            QPushButton#overlayDetailsButton {
+                color: #8199b6; font: 10px 'Ubuntu Sans'; text-align: left;
+                background: transparent; border: none;
+                padding: 0;
+            }
             """
         )
         self.adjustSize()
@@ -241,28 +382,266 @@ class QuotaOverlay(QWidget):
 
     def set_quota(self, quota: dict[str, Any]) -> None:
         plan = f" · {quota['plan_type']}" if quota.get("plan_type") else ""
-        window = quota["overlay_window"]
+        window = next(
+            (item for item in quota.get("windows", []) if item.get("window_seconds") == 604800),
+            quota["overlay_window"],
+        )
         self.account_label.setText(f"Codex · {quota['account']}{plan}")
         self.quota_label.setText(
             f"{window['label']}: {window['remaining_percent']:g}% left · "
             f"resets in {format_countdown(window['resets_at'])}"
         )
+        budget = calculate_weekly_budget(window)
+        self.budget_panel.setVisible(budget is not None)
+        self.budget_details.setVisible(budget is not None and self.details_button.isChecked())
+        if budget is not None:
+            status = budget["status"]
+            color = {
+                "normal": "#60d9b1", "warn": "#ffbf69",
+                "empty": "#ff8c95", "refresh": "#9cacc2",
+            }[status]
+            state_text = {
+                "normal": "On track", "warn": "Over pace",
+                "empty": "Quota exhausted", "refresh": "Awaiting refresh",
+            }[status]
+            if status == "warn":
+                state_text = f"Over pace by {-budget['difference_percent']:.1f}%"
+            pause = format_pace_pause(budget)
+            if pause:
+                state_text += f" · {pause}"
+            value = budget["budget_percent"]
+            self.budget_label.setText(
+                f"{budget['label']}: {value:.1f}% · {state_text}"
+                if value is not None else "Reset due · Awaiting refresh"
+            )
+            self.budget_label.setStyleSheet(f"color: {color}; font: 10px 'Ubuntu Sans';")
+            self.pace_bar.remaining = budget["remaining_percent"]
+            self.pace_bar.target = budget["target_percent"]
+            self.pace_bar.color = color
+            self.pace_bar.setVisible(status != "refresh")
+            self.pace_bar.update()
+            difference = budget["difference_percent"]
+            relation = "above" if difference >= 0 else "below"
+            detail = (
+                f"Expected balance: {budget['target_percent']:.1f}%. "
+                f"Your balance is {relation} the baseline by {abs(difference):.1f}% "
+                "of your total weekly quota.\n"
+                "White marker: expected balance at an even 7-day pace.\n"
+                "Pause countdown assumes no further use, then an even pace of 1/7 "
+                "of the weekly quota per day. It updates every minute; further use "
+                "is included after the next quota refresh.\n"
+                "Percentage of your total weekly quota. Daily budget covers the next "
+                "24 hours; with less than a day left, use the remaining allowance.\n"
+                "Pacing guidance only; requests are not blocked. Short-term limits may still apply."
+                if value is not None else
+                "Refresh the quota after reset to start the new weekly budget."
+            )
+            self.budget_details.setText(detail)
         self.adjustSize()
         self.move(self.bounded_position(self.pos()))
 
+    def toggle_budget_details(self, expanded: bool) -> None:
+        self.details_button.setText("Hide details −" if expanded else "Budget details +")
+        self.budget_details.setVisible(expanded)
+        self.adjustSize()
+        self.move(self.bounded_position(self.pos()))
+
+    def toggle_token_details(self, expanded: bool) -> None:
+        self.tokens_button.setText("收起 Token −" if expanded else "本轮 Token +")
+        self.token_details.setVisible(expanded)
+        if expanded:
+            self.token_details.setPlainText("正在读取最近会话…")
+            self.token_report_key = None
+            self.refresh_token_usage()
+            self.token_refresh_timer.start()
+        else:
+            self.token_refresh_timer.stop()
+        QTimer.singleShot(0, self.resize_token_panel)
+
+    def refresh_token_usage(self) -> None:
+        if self.tokens_button.isChecked() and self.token_process.state() == QProcess.NotRunning:
+            script = Path(__file__).resolve().with_name("codex-tokens.py")
+            if not script.is_file():
+                script = Path(__file__).resolve().parents[1] / "codex-tokens.py"
+            self.token_process.start(sys.executable, [str(script), "--json"])
+
+    def resize_token_panel(self) -> None:
+        self.adjustSize()
+        self.move(self.bounded_position(self.pos()))
+
+    def poll_panel_click(self) -> None:
+        position = QCursor.pos()
+        screen = QApplication.screenAt(position)
+        # GNOME's top panel can consume X11 input even when this overlay is visible above it.
+        if (not self.isVisible() or screen is None
+                or position.y() >= screen.availableGeometry().top()
+                or not self.frameGeometry().contains(position)):
+            self.panel_pressed_button = None
+            self.panel_mouse_down = False
+            return
+        self.handle_panel_click(position, self.panel_pointer.left_down())
+
+    def handle_panel_click(self, position: QPoint, down: bool) -> None:
+        if self.panel_native_click:
+            return
+        button = next((item for item in (self.tokens_button, self.details_button)
+                       if item.isVisible() and item.isEnabled()
+                       and item.rect().contains(item.mapFromGlobal(position))), None)
+        if down and not self.panel_mouse_down:
+            self.panel_pressed_button = button
+        elif not down and self.panel_mouse_down:
+            if button is not None and button is self.panel_pressed_button:
+                button.click()
+            self.panel_pressed_button = None
+        self.panel_mouse_down = down
+
+    def token_usage_error(self, error) -> None:
+        self.token_report_key = None
+        self.token_details.setPlainText("无法读取最近会话：" + self.token_process.errorString())
+
+    def token_usage_finished(self, exit_code: int, exit_status) -> None:
+        output = bytes(self.token_process.readAllStandardOutput()).decode("utf-8", errors="replace")
+        error = bytes(self.token_process.readAllStandardError()).decode("utf-8", errors="replace")
+        if exit_code != 0 or exit_status != QProcess.NormalExit:
+            self.token_report_key = None
+            self.token_details.setPlainText("无法读取最近会话：\n" + error)
+            return
+        try:
+            report = json.loads(output)
+            self.render_token_report(report)
+        except (ValueError, KeyError, TypeError):
+            self.token_details.setPlainText("无法读取最近会话：统计结果格式无效。")
+
+    def toggle_tool_content(self, url: QUrl) -> None:
+        if url.scheme() != "tool" or self.token_report_key is None:
+            return
+        try:
+            index = int(url.path())
+            call = self.token_report_key["tools"][index]
+        except (ValueError, KeyError, IndexError):
+            return
+        identity = call.get("id") or str(index)
+        if identity in self.expanded_tool_calls:
+            self.expanded_tool_calls.remove(identity)
+        else:
+            self.expanded_tool_calls.add(identity)
+        report = self.token_report_key
+        self.token_report_key = None
+        self.render_token_report(report)
+
+    def tool_preview(self, content: str) -> tuple[str, bool]:
+        width = max(100, self.token_details.viewport().width() - 40)
+        metrics = self.token_details.fontMetrics()
+        lines = []
+        line = ""
+        truncated = False
+        for index, char in enumerate(content):
+            if char == "\n" or metrics.horizontalAdvance(line + char + "…") > width:
+                lines.append(line)
+                line = "" if char == "\n" else char
+                if len(lines) == 2:
+                    if index < len(content) - 1 or line:
+                        lines[-1] += "…"
+                        truncated = True
+                    break
+            else:
+                line += char
+        else:
+            lines.append(line)
+        return "\n".join(lines), truncated
+
+    def render_token_report(self, report) -> None:
+        try:
+            if report == self.token_report_key:
+                return
+            scope = (report["path"], report["question"])
+            if scope != self.tool_report_scope:
+                self.expanded_tool_calls.clear()
+                self.tool_report_scope = scope
+            models = report["models"]
+            question = html.escape(report["question"]).replace("\n", "<br>")
+            fields = ("input_tokens", "cached_input_tokens", "output_tokens", "total_tokens")
+            def usage_cells(usage):
+                hit = (f'{usage["cached_input_tokens"] / usage["input_tokens"]:.1%}'
+                       if usage["input_tokens"] else "N/A")
+                return ("".join(f'<td align="right">{usage[field]:,}</td>' for field in fields)
+                        + f'<td align="right">{hit}</td>')
+
+            headers = '<th>输入</th><th>其中缓存</th><th>输出</th><th>总 Token</th><th>Cache hit</th>'
+            rows = ""
+            for model, usage in sorted(models.items(), key=lambda item: item[1]["total_tokens"], reverse=True):
+                rows += "<tr><td>" + html.escape(model) + "</td>"
+                rows += usage_cells(usage) + "</tr>"
+            if models:
+                total = {field: sum(usage[field] for usage in models.values()) for field in fields}
+                rows += "<tr><td><b>合计</b></td>" + usage_cells(total) + "</tr>"
+            table = (
+                '<table width="100%" cellspacing="0" cellpadding="6" border="1">'
+                '<tr><th>模型</th>' + headers + '</tr>'
+                + rows + "</table>" if models else "<p>暂无已记录用量，或日志版本不支持。</p>"
+            )
+            requests = report.get("requests", [])
+            request_details = f"<p><b>本轮模型请求：{len(requests)} 次</b>（按发生顺序）</p>"
+            if requests:
+                request_details += ('<table width="100%" cellspacing="0" cellpadding="4" border="1">'
+                                    '<tr><th>请求 / 模型</th><th>本次操作</th>' + headers + '</tr>')
+                for index, request in enumerate(requests, 1):
+                    request_details += (f'<tr><td>#{index} {html.escape(request["model"])}</td>'
+                                        + '<td>' + html.escape(request.get("action", "模型处理 / 回复")) + '</td>'
+                                        + usage_cells(request["usage"]) + '</tr>')
+                request_details += '</table>'
+            tools = report.get("tools", [])
+            tool_details = f"<p><b>本轮工具调用：{len(tools)} 次</b>（按日志调用记录去重）</p>"
+            for index, call in enumerate(tools, 1):
+                identity = call.get("id") or str(index - 1)
+                expanded = identity in self.expanded_tool_calls
+                preview, truncated = self.tool_preview(call["content"])
+                content = call["content"] if expanded else preview
+                content = html.escape(content).replace("\n", "<br>")
+                action = "收起" if expanded else "展开"
+                link = (f'<a href="tool:{index - 1}" style="color:#93c5fd">{action}</a>'
+                        if truncated else "")
+                tool_details += (f'<p><b>{index}. {html.escape(call["name"])}</b> '
+                                 + link +
+                                 f'<br>{content}</p>')
+            scroll = self.token_details.verticalScrollBar().value()
+            self.token_details.setHtml(
+                "<b>最近问题</b><p>" + question + "</p>"
+                "<p>每 2 秒自动刷新 · 仅上方问题这一轮 · 不含此前问答及子代理独立日志</p>"
+                + table + "<p>Cache hit = 缓存输入 ÷ 输入；合计按总缓存输入 ÷ 总输入计算。</p>"
+                + request_details + "<p>每行是一次模型请求的实际用量，含上下文；操作按日志顺序关联。</p>"
+                + tool_details
+            )
+            self.token_details.verticalScrollBar().setValue(scroll)
+            self.token_details.setToolTip(report["path"])
+            self.token_report_key = report
+        except (ValueError, KeyError, TypeError):
+            self.token_details.setPlainText("无法读取最近会话：统计结果格式无效。")
+
     def set_api_mode(self, provider: str) -> None:
+        self.budget_panel.hide()
+        self.budget_details.hide()
         self.account_label.setText(f"Codex · API · {provider or 'provider'}")
         self.quota_label.setText("No account quota")
         self.adjustSize()
         self.move(self.bounded_position(self.pos()))
 
     def set_error(self, account: str, message: str = "Quota unavailable") -> None:
+        self.budget_panel.hide()
+        self.budget_details.hide()
         self.account_label.setText(f"Codex · {account or 'account'}")
         self.quota_label.setText(message)
         self.adjustSize()
         self.move(self.bounded_position(self.pos()))
 
     def eventFilter(self, watched, event) -> bool:  # type: ignore[no-untyped-def]
+        if watched in (self.tokens_button, self.details_button):
+            if event.type() == QEvent.MouseButtonPress:
+                self.panel_native_click = True
+                self.panel_pressed_button = None
+            elif event.type() == QEvent.MouseButtonRelease:
+                self.panel_native_click = False
+                self.panel_mouse_down = False
         if watched in self.drag_targets:
             if event.type() == QEvent.MouseButtonPress and event.button() == Qt.LeftButton:
                 self.mousePressEvent(event)
@@ -1096,6 +1475,22 @@ class MainWindow(QMainWindow):
                 f"{window['label']}: {window['remaining_percent']:g}% left · "
                 f"resets in {format_countdown(window['resets_at'])}"
             )
+            budget = calculate_weekly_budget(window)
+            if budget is not None:
+                value = budget["budget_percent"]
+                status = {
+                    "normal": "On track", "warn": "Over pace",
+                    "empty": "Quota exhausted", "refresh": "Awaiting refresh",
+                }[budget["status"]]
+                if budget["status"] == "warn":
+                    status = f"Over pace by {-budget['difference_percent']:.1f}%"
+                pause = format_pace_pause(budget)
+                if pause:
+                    status += f" · {pause}"
+                lines.append(
+                    f"{budget['label']}: {value:.1f}% of total weekly quota · {status}"
+                    if value is not None else "Reset due · Awaiting refresh"
+                )
         self.quota_details.setText("\n".join(lines))
         overlay_quota = dict(self.quota)
         overlay_quota["account"] = quota_account
