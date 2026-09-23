@@ -25,7 +25,7 @@ def call_action(call):
             "web_search_call": "搜索网页", "write_stdin": "继续终端任务"}.get(name, "调用 " + name)
 
 
-def summarize(path):
+def summarize(path, warnings=None):
     models = {}
     records = []
     calls = []
@@ -42,7 +42,9 @@ def summarize(path):
                 # 正在写入的最后一行可能尚未完整。
                 if not line.endswith("\n"):
                     break
-                raise ValueError(f"日志第 {number} 行不是有效 JSON") from None
+                if warnings is not None:
+                    warnings.append(f"已跳过日志第 {number} 行的无效 JSON；统计可能不完整。")
+                continue
             payload = event.get("payload", {})
             if event.get("type") == "turn_context":
                 latest_turn = payload.get("turn_id")
@@ -164,16 +166,19 @@ def main():
             path = max(root.rglob("*.jsonl"), key=lambda item: item.stat().st_mtime, default=None)
         if path is None:
             parser.error(f"没有找到会话日志：{root}")
-        totals, question, tool_calls, requests = summarize(path.expanduser())
+        warnings = []
+        totals, question, tool_calls, requests = summarize(path.expanduser(), warnings)
     except (OSError, ValueError, KeyError) as error:
         parser.error(str(error))
 
     if args.json:
         print(json.dumps({"path": str(path), "question": question, "models": totals,
-                          "tools": tool_calls, "requests": requests}, ensure_ascii=False))
+                          "tools": tool_calls, "requests": requests, "warnings": warnings}, ensure_ascii=False))
         return
 
     print("\nCodex 最近一轮 Token 统计\n")
+    for warning in warnings:
+        print(warning)
     print_question(question)
     print(f"\n本轮工具调用：{len(tool_calls)} 次（按日志调用记录去重）")
     print("\n用量范围：上方问题这一轮的已记录请求，不含此前问答或子代理独立日志。\n")

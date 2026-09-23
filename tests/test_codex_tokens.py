@@ -15,6 +15,32 @@ spec.loader.exec_module(tokens)
 
 
 class LatestTurnTests(unittest.TestCase):
+    def test_corrupt_record_does_not_hide_later_usage(self):
+        events = [
+            json.dumps({"type": "turn_context", "payload": {"turn_id": "t", "model": "a"}}),
+            '{"type":"response_item","payload":{"text":"truncated',
+            json.dumps({"type": "token_usage_record", "payload": {
+                "turn_id": "t", "response_id": "r", "usage": {"total_tokens": 110}}}),
+        ]
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_text("\n".join(events) + "\n", encoding="utf-8")
+            warnings = []
+            totals, _, _, requests = tokens.summarize(path, warnings)
+        self.assertEqual(totals["a"]["total_tokens"], 110)
+        self.assertEqual(len(requests), 1)
+        self.assertEqual(warnings, ["已跳过日志第 2 行的无效 JSON；统计可能不完整。"])
+
+    def test_incomplete_last_line_is_ignored_without_warning(self):
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_text('{"type":', encoding="utf-8")
+            warnings = []
+            totals, _, _, requests = tokens.summarize(path, warnings)
+        self.assertEqual(totals, {})
+        self.assertEqual(requests, [])
+        self.assertEqual(warnings, [])
+
     def test_actions_match_request_order_without_changing_usage(self):
         usage = {"input_tokens": 100, "output_tokens": 10, "total_tokens": 110}
         events = [{"type": "turn_context", "payload": {"turn_id": "t", "model": "a"}}]

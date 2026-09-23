@@ -605,10 +605,12 @@ class QuotaOverlay(QWidget):
                                  + link +
                                  f'<br>{content}</p>')
             scroll = self.token_details.verticalScrollBar().value()
+            warnings = "".join("<p>" + html.escape(warning) + "</p>"
+                               for warning in report.get("warnings", []))
             self.token_details.setHtml(
                 "<b>最近问题</b><p>" + question + "</p>"
                 "<p>每 2 秒自动刷新 · 仅上方问题这一轮 · 不含此前问答及子代理独立日志</p>"
-                + table + "<p>Cache hit = 缓存输入 ÷ 输入；合计按总缓存输入 ÷ 总输入计算。</p>"
+                + warnings + table + "<p>Cache hit = 缓存输入 ÷ 输入；合计按总缓存输入 ÷ 总输入计算。</p>"
                 + request_details + "<p>每行是一次模型请求的实际用量，含上下文；操作按日志顺序关联。</p>"
                 + tool_details
             )
