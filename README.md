@@ -120,7 +120,7 @@ codex-account-manager                   # 打开原生 Qt 账号/API 管理软�
 
 安装后，`codex` 和 `codex-yolo` 都会通过 `codex-auth run` 启动。每个进程在启动时固定自己的账号目录，因此在另一个终端执行 `codex-auth use work` 不会切换或退出已经运行的 Codex，只影响后来启动的进程。
 
-两条命令加载相同的 5 个核心 Skills：`agent-reach`、`brainstorming`、`domain-modeling`、`grilling` 和 `tdd`。区别仅在权限策略：`codex` 保留审批流程，`codex-yolo` 跳过审批与沙箱。
+`codex-yolo` 的精简 Skills 列表由安装脚本维护，当前包含 `agent-reach`、`brainstorming`、`domain-modeling`、`domain-variable-explainer`、`graphviz-technical-flowchart`、`grilling` 和 `tdd`。普通 `codex` 使用其默认技能配置；`codex-yolo` 跳过审批与沙箱。
 
 命名账号的登录凭据彼此隔离；`sessions`、归档、历史和会话索引仍链接到主 `~/.codex`，所以不同账号运行 `codex resume` 时可以看到同一批对话。不要让两个进程同时修改同一个对话。
 
@@ -197,12 +197,14 @@ Qt 软件、`codex-auth` 和 `codex-usage` 使用同一份状态。所有切换�
 
 ##### 模型用量与会话预览
 
-`codex-model-usage.sh` 直接读取 ccusage 的本地统计结果，依赖 Bash、`ccusage` 和 `jq`（本机使用 ccusage 20.0.4）。无需启动桌面软件或调用模型。
+`codex-model-usage.sh` 通过 ccusage 读取本地统计结果，依赖 Bash、`ccusage` 和 `jq`（本机使用 ccusage 20.0.4）；最近会话模式还使用 Python 3 标准库读取日志中的父子关系。无需启动桌面软件或调用模型。
 
 ```bash
 ./codex-model-usage.sh                      # 今天，按总 token 从高到低排序
+./codex-model-usage.sh --last 1h            # 截至现在的最近一小时，包含各会话及子代理
+./codex-model-usage.sh --last 30m           # 最近 30 分钟
 ./codex-model-usage.sh --since 2026-09-01 --until 2026-09-19
-./codex-model-usage.sh --last-session        # 最近有活动的会话累计用量与问答预览
+./codex-model-usage.sh --last-session        # 最近主会话及全部子代理累计用量，展示主会话问答
 ./codex-model-usage.sh --last-session --full-text | less  # 分页查看该轮完整问答
 ./codex-model-usage.sh --help
 ```
@@ -215,9 +217,11 @@ Qt 软件、`codex-auth` 和 `codex-usage` 使用同一份状态。所有切换�
 | `Total` | 总 token |
 | `Cache Hit` | `Cached / (Input + Cached)`，无输入时显示 `N/A` |
 
-默认按本机日期查询今天；显式传入日期范围时使用指定范围。`--last-session` 按 `lastActivity` 选择会话，不能与日期筛选同时使用，以免截断会话累计用量；可能选中当前仍在进行的会话，不合并独立的子代理会话。表格统计整个会话，而下方只展示最近一轮已有最终回答的问答：问题最多 300 字符、回答最多 400 字符，过滤工具输出和中间进度消息。预览是原文截取，不是 AI 摘要；`--full-text` 可展开该轮完整原文。会话原文从 `${CODEX_HOME:-$HOME/.codex}/sessions` 读取。
+默认按本机日期查询今天；显式传入日期范围时使用指定范围。`--last-session` 按 `lastActivity` 找到最近活跃的会话，再沿日志父子关系回溯到主会话，按模型合并主会话及其全部递归子代理的累计用量，不包含无关会话。它不能与日期筛选同时使用，以免截断累计用量；可能选中当前仍在进行的会话。输出标明合并的子代理数量，下方只展示主会话最近一轮已有最终回答的问答：问题最多 300 字符、回答最多 400 字符，过滤工具输出和中间进度消息。预览是原文截取，不是 AI 摘要；`--full-text` 可展开该轮完整原文。会话原文和父子关系从 `${CODEX_HOME:-$HOME/.codex}/sessions` 读取；用量仍使用 ccusage 的统计值。
 
-这些数字是本地 token 用量，不代表套餐实际扣除额度；账号的剩余额度请使用下面的 `codex-usage`。不要将个人会话日志或统计结果提交到仓库。
+`--last` 支持正整数小时（`h`）或分钟（`m`），通过 Python 3 标准库直接读取本地日志，无需 ccusage；不能与其他筛选参数混用。窗口按 Token 事件的记录时间计算，显示带时区的起止时间，跨日期有效；重复的累计用量记录只计一次。模型来自日志的 `turn_context`，缺失时列为 `unknown`。尚未写入日志的用量不会显示；跨越窗口边界的请求按用量记录时间整体归入，不拆分请求。
+
+这些数字是本地 token 用量，不是调用次数，也不代表套餐实际扣除额度；账号的剩余额度请使用下面的 `codex-usage`。不要将个人会话日志或统计结果提交到仓库。
 
 ##### 额度命令与悬浮窗
 
