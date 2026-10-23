@@ -11,6 +11,7 @@ import re
 import signal
 import shutil
 import sys
+from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable
 
@@ -54,6 +55,7 @@ from PyQt5.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSizePolicy,
     QSystemTrayIcon,
     QTabWidget,
     QTextBrowser,
@@ -568,28 +570,79 @@ class QuotaOverlay(QWidget):
                         + f'<td align="right">{hit}</td>')
 
             headers = '<th>输入</th><th>其中缓存</th><th>输出</th><th>总 Token</th><th>Cache hit</th>'
+            requests = report.get("requests", [])
             rows = ""
             for model, usage in sorted(models.items(), key=lambda item: item[1]["total_tokens"], reverse=True):
                 rows += "<tr><td>" + html.escape(model) + "</td>"
+                efforts = list(dict.fromkeys(request.get("reasoning_effort") or "未知"
+                                            for request in requests if request["model"] == model))
+                rows += "<td>" + html.escape(" / ".join(efforts) or "未知") + "</td>"
                 rows += usage_cells(usage) + "</tr>"
             if models:
                 total = {field: sum(usage[field] for usage in models.values()) for field in fields}
-                rows += "<tr><td><b>合计</b></td>" + usage_cells(total) + "</tr>"
+                rows += "<tr><td><b>合计</b></td><td>—</td>" + usage_cells(total) + "</tr>"
             table = (
                 '<table width="100%" cellspacing="0" cellpadding="6" border="1">'
-                '<tr><th>模型</th>' + headers + '</tr>'
+                '<tr><th>模型</th><th>思考强度</th>' + headers + '</tr>'
                 + rows + "</table>" if models else "<p>暂无已记录用量，或日志版本不支持。</p>"
             )
-            requests = report.get("requests", [])
+            def request_time(value):
+                return "未记录" if value is None else datetime.fromtimestamp(value).strftime("%H:%M:%S.%f")[:-3]
+
+            def request_elapsed(value):
+                return "未记录" if value is None else f"{value / 1000:.2f} 秒"
+
+            network = report.get("timing", {})
+            pending_start = network.get("pending_request_started_at")
+            network_details = "<p><b>上传上下文耗时：</b>未记录（缺少上传完成事件）</p>"
+            if pending_start is not None:
+                waiting = max(0, (datetime.now().timestamp() - pending_start) * 1000)
+                network_details += ("<p><b>当前请求发起（日志）：</b>" + request_time(pending_start)
+                                    + " · 尚无结束用量记录 · 已经过 " + request_elapsed(waiting) + "</p>")
             request_details = f"<p><b>本轮模型请求：{len(requests)} 次</b>（按发生顺序）</p>"
             if requests:
                 request_details += ('<table width="100%" cellspacing="0" cellpadding="4" border="1">'
-                                    '<tr><th>请求 / 模型</th><th>本次操作</th>' + headers + '</tr>')
+                                    '<tr><th>请求 / 模型</th><th>思考强度</th><th>本次操作</th>' + headers + '</tr>')
                 for index, request in enumerate(requests, 1):
                     request_details += (f'<tr><td>#{index} {html.escape(request["model"])}</td>'
+                                        + '<td>' + html.escape(request.get("reasoning_effort") or "未知") + '</td>'
                                         + '<td>' + html.escape(request.get("action", "模型处理 / 回复")) + '</td>'
-                                        + usage_cells(request["usage"]) + '</tr>')
+                                        + usage_cells(request["usage"]) + '</tr>'
+                                        + '<tr><td colspan="8"><b>发起请求（日志）：</b>'
+                                        + request_time(request.get("request_started_at"))
+                                        + ' · <b>响应结束记录：</b>' + request_time(request.get("usage_recorded_at"))
+                                        + ' · <b>请求耗时（估算）：</b>'
+                                        + request_elapsed(request.get("request_duration_ms")) + '</td></tr>')
                 request_details += '</table>'
+            def elapsed(value):
+                return "未记录" if value is None else f"{value / 1000:.2f} 秒"
+
+            history = report.get("history", [])
+            timing = ""
+            current = next((item for item in history if item.get("is_current")), None)
+            if current:
+                timing = ("<p><b>本轮状态：</b>" + html.escape(current["status"])
+                          + " · <b>首 token 等待：</b>" + elapsed(current.get("time_to_first_token_ms"))
+                          + " · <b>整轮耗时：</b>" + elapsed(current.get("duration_ms")) + "</p>")
+            history_details = "<p><b>本会话问答记录</b>（最新在前）</p>"
+            if history:
+                history_details += ('<table width="100%" cellspacing="0" cellpadding="4" border="1">'
+                                    '<tr><th>开始时间 / 问题</th><th>状态</th><th>最近上下文</th>'
+                                    '<th>累计输入</th><th>首 token 等待</th><th>整轮耗时</th></tr>')
+                for item in reversed(history):
+                    started = item.get("started_at")
+                    label = datetime.fromtimestamp(started).strftime("%m-%d %H:%M:%S") if started is not None else "未记录"
+                    context = item.get("latest_input_tokens")
+                    context_text = "未记录" if context is None else f"{context:,} token"
+                    history_details += ("<tr><td>" + label + "<br>" + html.escape(item["question"][:100])
+                                        + "</td><td>" + html.escape(item["status"]) + "</td><td>" + context_text
+                                        + f'</td><td>{item["input_tokens"]:,} token / {item["requests"]} 次</td><td>'
+                                        + elapsed(item.get("time_to_first_token_ms")) + "</td><td>"
+                                        + elapsed(item.get("duration_ms")) + "</td></tr>")
+                history_details += "</table>"
+            history_details += ("<p>上下文大小取日志实际输入 token（含缓存）；累计输入为本轮各请求之和。"
+                                "首 token 等待取 Codex 日志指标；整轮耗时包含模型、工具与其他等待。"
+                                "进行中显示已用时间；未记录指标不估算。日志不含请求体字节数。</p>")
             tools = report.get("tools", [])
             tool_details = f"<p><b>本轮工具调用：{len(tools)} 次</b>（按日志调用记录去重）</p>"
             for index, call in enumerate(tools, 1):
@@ -610,9 +663,11 @@ class QuotaOverlay(QWidget):
             self.token_details.setHtml(
                 "<b>最近问题</b><p>" + question + "</p>"
                 "<p>每 2 秒自动刷新 · 仅上方问题这一轮 · 不含此前问答及子代理独立日志</p>"
-                + warnings + table + "<p>Cache hit = 缓存输入 ÷ 输入；合计按总缓存输入 ÷ 总输入计算。</p>"
-                + request_details + "<p>每行是一次模型请求的实际用量，含上下文；操作按日志顺序关联。</p>"
-                + tool_details
+                + warnings + timing + network_details + table + "<p>Cache hit = 缓存输入 ÷ 输入；合计按总缓存输入 ÷ 总输入计算。</p>"
+                + request_details + "<p>每行是一次模型请求的实际用量，含上下文；操作按日志顺序关联。"
+                "发起时间取底层请求准备日志，结束时间取用量记录；差值为客户端请求耗时估算，"
+                "包含网络、排队和模型生成，不是纯上传或纯推理时间。重试或记录不完整时不关联。</p>"
+                + history_details + tool_details
             )
             self.token_details.verticalScrollBar().setValue(scroll)
             self.token_details.setToolTip(report["path"])
@@ -698,6 +753,22 @@ class QuotaOverlay(QWidget):
         menu.exec_(event.globalPos())
 
 
+class ElidedLabel(QLabel):
+    """Keep long provider identifiers within the list column."""
+
+    def __init__(self, text: str) -> None:
+        super().__init__(text)
+        self.full_text = text
+        self.setToolTip(text)
+        self.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Preferred)
+
+    def resizeEvent(self, event) -> None:  # type: ignore[no-untyped-def]
+        super().resizeEvent(event)
+        self.setText(self.fontMetrics().elidedText(
+            self.full_text, Qt.ElideRight, self.contentsRect().width()
+        ))
+
+
 class MainWindow(QMainWindow):
     def __init__(self, app: QApplication, settings: QSettings) -> None:
         super().__init__()
@@ -751,8 +822,8 @@ class MainWindow(QMainWindow):
         central = QWidget()
         central.setObjectName("appRoot")
         root = QVBoxLayout(central)
-        root.setContentsMargins(28, 24, 28, 20)
-        root.setSpacing(18)
+        root.setContentsMargins(20, 18, 20, 16)
+        root.setSpacing(12)
 
         header = QHBoxLayout()
         header.setSpacing(14)
@@ -766,18 +837,22 @@ class MainWindow(QMainWindow):
         title_box.setSpacing(2)
         title = QLabel(APP_NAME)
         title.setObjectName("title")
+        title.setWordWrap(True)
         subtitle = QLabel("Manage account profiles, API providers, and usage from one desktop app")
         subtitle.setObjectName("subtitle")
+        subtitle.setWordWrap(True)
         title_box.addWidget(title)
         title_box.addWidget(subtitle)
         header.addLayout(title_box, 1)
         mode_box = QVBoxLayout()
         mode_box.setSpacing(5)
-        mode_caption = QLabel("ACTIVE FOR NEW PROCESSES")
+        mode_caption = QLabel("FOR NEW PROCESSES")
         mode_caption.setObjectName("modeCaption")
         mode_caption.setAlignment(Qt.AlignRight)
         self.mode_label = QLabel("Checking current mode…")
         self.mode_label.setObjectName("modePill")
+        self.mode_label.setWordWrap(True)
+        self.mode_label.setMaximumWidth(250)
         mode_box.addWidget(mode_caption)
         mode_box.addWidget(self.mode_label, 0, Qt.AlignRight)
         header.addLayout(mode_box)
@@ -797,6 +872,7 @@ class MainWindow(QMainWindow):
         quota_head = QHBoxLayout()
         self.quota_summary = QLabel("Waiting for account state…")
         self.quota_summary.setObjectName("quotaSummary")
+        self.quota_summary.setWordWrap(True)
         self.overlay_button = QPushButton("Show on desktop")
         self.overlay_button.setProperty("role", "quiet")
         self.overlay_button.clicked.connect(self.toggle_overlay)
@@ -820,6 +896,7 @@ class MainWindow(QMainWindow):
         status_layout.setContentsMargins(12, 8, 12, 8)
         self.status_label = QLabel("Ready")
         self.status_label.setObjectName("status")
+        self.status_label.setWordWrap(True)
         status_layout.addWidget(self.status_label, 1)
         local_label = QLabel("LOCAL DESKTOP")
         local_label.setObjectName("localStatus")
@@ -943,9 +1020,10 @@ class MainWindow(QMainWindow):
         provider_heading.setObjectName("panelTitle")
         provider_layout.addWidget(provider_heading)
         self.provider_list = QListWidget()
-        self.provider_list.setObjectName("resourceList")
+        self.provider_list.setObjectName("providerList")
         self.provider_list.setSpacing(2)
         self.provider_list.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self.provider_list.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOn)
         self.provider_list.setTextElideMode(Qt.ElideRight)
         self.provider_list.itemDoubleClicked.connect(lambda _: self.activate_selected_provider())
         self.provider_list.currentItemChanged.connect(self.load_selected_provider)
@@ -977,9 +1055,11 @@ class MainWindow(QMainWindow):
         editor_layout.setSpacing(12)
         editor_layout.setAlignment(Qt.AlignTop)
         form = QFormLayout()
+        form.setRowWrapPolicy(QFormLayout.DontWrapRows)
+        form.setLabelAlignment(Qt.AlignLeft | Qt.AlignVCenter)
         form.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         form.setHorizontalSpacing(16)
-        form.setVerticalSpacing(11)
+        form.setVerticalSpacing(6)
         self.provider_name = QLineEdit()
         self.provider_name.setPlaceholderText("provider_name")
         self.provider_name.setMaxLength(64)
@@ -1070,17 +1150,18 @@ class MainWindow(QMainWindow):
         self.setStyleSheet(
             """
             QMainWindow { background: #f4f7fb; }
-            QWidget#appRoot { background: #f4f7fb; color: #172033; font: 10pt 'Ubuntu Sans'; }
+            QWidget { font: 10pt 'Ubuntu Sans'; }
+            QWidget#appRoot { background: #f4f7fb; color: #172033; }
             QWidget#tabPage { background: transparent; }
             QLabel { background: transparent; }
             QLabel#brandMark { background: transparent; }
-            QLabel#title { color: #0f172a; font-size: 20pt; font-weight: 800; }
+            QLabel#title { color: #0f172a; font-size: 18pt; font-weight: 700; }
             QLabel#subtitle { color: #64748b; font-size: 9.5pt; }
             QLabel#modeCaption {
                 color: #94a3b8;
                 font-size: 7.5pt;
                 font-weight: 800;
-                letter-spacing: 1px;
+                letter-spacing: 0;
             }
             QLabel#modePill {
                 padding: 7px 12px;
@@ -1096,24 +1177,6 @@ class MainWindow(QMainWindow):
             QLabel#providerDot { color: #94a3b8; font-size: 12pt; }
             QLabel#providerDot[active="true"] { color: #2563eb; }
             QLabel#providerName { color: #1e293b; font-size: 10pt; font-weight: 800; }
-            QLabel#providerUrl { color: #64748b; font-size: 8.5pt; }
-            QLabel#keyBadge {
-                padding: 2px 5px;
-                color: #047857;
-                background: #d1fae5;
-                border-radius: 5px;
-                font-size: 7pt;
-                font-weight: 800;
-            }
-            QLabel#keyBadge[ready="false"] { color: #b45309; background: #fef3c7; }
-            QLabel#activeBadge {
-                padding: 2px 5px;
-                color: #1d4ed8;
-                background: #dbeafe;
-                border-radius: 5px;
-                font-size: 7pt;
-                font-weight: 800;
-            }
             QLabel#quotaSummary { color: #0f172a; font-size: 10.5pt; font-weight: 800; }
             QLabel#quotaDetails { color: #475569; font-size: 9pt; }
             QLabel#status { color: #475569; font-size: 9pt; }
@@ -1121,7 +1184,7 @@ class MainWindow(QMainWindow):
                 color: #64748b;
                 font-size: 7.5pt;
                 font-weight: 800;
-                letter-spacing: 1px;
+                letter-spacing: 0;
             }
             QLabel#actionLink { color: #2563eb; font-weight: 700; }
 
@@ -1194,6 +1257,7 @@ class MainWindow(QMainWindow):
                 background: #eaf2ff;
                 border-color: #bfdbfe;
             }
+            QListWidget#providerList::item { padding: 0; min-height: 0; }
 
             QLineEdit, QPlainTextEdit {
                 padding: 8px 10px;
@@ -1204,7 +1268,6 @@ class MainWindow(QMainWindow):
                 border: 1px solid #cbd5e1;
                 border-radius: 7px;
             }
-            QLineEdit { min-height: 20px; }
             QLineEdit:hover, QPlainTextEdit:hover { border-color: #94a3b8; }
             QLineEdit:focus, QPlainTextEdit:focus { border: 2px solid #3b82f6; }
             QLineEdit:read-only { color: #64748b; background: #f8fafc; }
@@ -1247,6 +1310,15 @@ class MainWindow(QMainWindow):
             QMenu::item:selected { color: #1d4ed8; background: #eff6ff; }
             """
         )
+        # Resolve styled font metrics before Qt negotiates the initial layout.
+        for button in self.findChildren(QPushButton):
+            button.ensurePolished()
+            button.setMinimumWidth(button.sizeHint().width())
+        # QLineEdit.minimumSizeHint can exclude stylesheet padding. Keep the
+        # full text height, including the extra border pixels on focus.
+        for field in self.findChildren(QLineEdit):
+            field.ensurePolished()
+            field.setMinimumHeight(field.sizeHint().height() + 2)
 
     def _tray_activated(self, reason: QSystemTrayIcon.ActivationReason) -> None:
         if reason in (QSystemTrayIcon.Trigger, QSystemTrayIcon.DoubleClick):
@@ -1315,33 +1387,17 @@ class MainWindow(QMainWindow):
     def _build_provider_row(self, provider: dict[str, Any], active: bool) -> QWidget:
         row = QWidget()
         row.setObjectName("providerItem")
-        layout = QVBoxLayout(row)
-        layout.setContentsMargins(7, 5, 7, 5)
-        layout.setSpacing(2)
-
-        heading = QHBoxLayout()
-        heading.setSpacing(6)
+        layout = QHBoxLayout(row)
+        layout.setContentsMargins(10, 8, 10, 8)
+        layout.setSpacing(6)
         dot = QLabel("●" if active else "○")
         dot.setObjectName("providerDot")
         dot.setProperty("active", active)
-        name = QLabel(str(provider["name"]))
+        name = ElidedLabel(str(provider["name"]))
         name.setObjectName("providerName")
-        heading.addWidget(dot)
-        heading.addWidget(name, 1)
-        if active:
-            active_badge = QLabel("ACTIVE")
-            active_badge.setObjectName("activeBadge")
-            heading.addWidget(active_badge)
-        key_badge = QLabel("KEY READY" if provider["key_set"] else "KEY MISSING")
-        key_badge.setObjectName("keyBadge")
-        key_badge.setProperty("ready", provider["key_set"])
-        heading.addWidget(key_badge)
-
-        url = QLabel(str(provider["base_url"]))
-        url.setObjectName("providerUrl")
-        url.setToolTip(str(provider["base_url"]))
-        layout.addLayout(heading)
-        layout.addWidget(url)
+        name.setToolTip("")
+        layout.addWidget(dot)
+        layout.addWidget(name, 1)
         return row
 
     def refresh_state(self, force: bool = False) -> None:
@@ -1393,7 +1449,6 @@ class MainWindow(QMainWindow):
             active = self.state.get("mode") == "api" and provider["active"]
             key_state = "Key ready" if provider["key_set"] else "Key missing"
             item = QListWidgetItem()
-            item.setSizeHint(QSize(0, 58))
             item.setToolTip(
                 f"{provider['name']}\n{key_state}\n{provider['base_url']}"
             )
@@ -1404,7 +1459,10 @@ class MainWindow(QMainWindow):
             item.setData(Qt.UserRole + 4, provider["env_key"])
             self.provider_list.addItem(item)
             provider_widget = self._build_provider_row(provider, active)
+            provider_widget.setToolTip(item.toolTip())
             self.provider_list.setItemWidget(item, provider_widget)
+            provider_widget.ensurePolished()
+            item.setSizeHint(QSize(0, provider_widget.sizeHint().height() + 6))
             if provider["name"] == selected_provider_name or active:
                 self.provider_list.setCurrentItem(item)
         if self.provider_list.currentRow() < 0 and self.provider_list.count():

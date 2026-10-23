@@ -276,11 +276,11 @@ env_key = "CRS_OPENAI_KEY"
         self.assertIn('QPushButton("Use provider")', source)
         self.assertIn('QPushButton("New")', source)
         self.assertIn('QPushButton("Delete")', source)
-        self.assertIn("item.setSizeHint(QSize(0, 58))", source)
+        self.assertIn("provider_widget.sizeHint().height() + 6", source)
         self.assertIn("self.provider_list.setItemWidget(item, provider_widget)", source)
         self.assertIn('setObjectName("providerName")', source)
-        self.assertIn('setObjectName("providerUrl")', source)
-        self.assertIn('setObjectName("activeBadge")', source)
+        self.assertNotIn('setObjectName("providerUrl")', source)
+        self.assertNotIn('setObjectName("activeBadge")', source)
         self.assertIn("editor_layout.setAlignment(Qt.AlignTop)", source)
         self.assertNotIn(
             "provider_layout.addWidget(self.provider_delete, 0, Qt.AlignRight)",

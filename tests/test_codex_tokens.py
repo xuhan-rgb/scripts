@@ -15,6 +15,25 @@ spec.loader.exec_module(tokens)
 
 
 class LatestTurnTests(unittest.TestCase):
+    def test_request_effort_tracks_context_changes_and_missing_values(self):
+        events = []
+        for index, effort in enumerate(("high", "xhigh", None)):
+            context = {"turn_id": "t", "model": "a"}
+            if effort is not None:
+                context["effort"] = effort
+            events.extend([
+                {"type": "turn_context", "payload": context},
+                {"type": "token_usage_record", "payload": {
+                    "turn_id": "t", "response_id": str(index),
+                    "usage": {"total_tokens": 10}}},
+            ])
+        with tempfile.TemporaryDirectory() as directory:
+            path = Path(directory) / "session.jsonl"
+            path.write_text("".join(json.dumps(event) + "\n" for event in events))
+            totals, _, _, requests = tokens.summarize(path)
+        self.assertEqual([r["reasoning_effort"] for r in requests], ["high", "xhigh", "未知"])
+        self.assertEqual(totals["a"]["total_tokens"], 30)
+
     def test_corrupt_record_does_not_hide_later_usage(self):
         events = [
             json.dumps({"type": "turn_context", "payload": {"turn_id": "t", "model": "a"}}),

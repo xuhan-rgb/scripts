@@ -1,0 +1,143 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Codex · Weekly Quota Monitor</title>
+<style>
+  :root { color-scheme: light; font-family: Inter, "Noto Sans CJK SC", "Microsoft YaHei", sans-serif; color: #182638; background: #f4f6f8; }
+  * { box-sizing: border-box; }
+  body { margin: 0; }
+  main { max-width: 1080px; margin: auto; padding: 52px 28px; }
+  .eyebrow { font-size: 11px; font-weight: 700; letter-spacing: 2px; color: #687c90; }
+  h1 { font-size: clamp(26px, 4vw, 38px); letter-spacing: -1px; margin: 12px 0; }
+  .intro { color: #677586; font-size: 14px; line-height: 1.9; max-width: 700px; }
+  .workspace { display: grid; grid-template-columns: 1.4fr 1fr; gap: 24px; margin-top: 30px; }
+  .stage { background: #e6ebf1; border: 1px solid #d8e0e9; border-radius: 18px; overflow: hidden; min-height: 460px; position: relative; }
+  .desktop-bar { background: #202631; color: #bdc8d4; height: 30px; font-size: 10px; display: flex; align-items: center; justify-content: space-between; padding: 0 16px; }
+  .stage-caption { position: absolute; bottom: 23px; left: 24px; font-size: 12px; line-height: 1.8; color: #697c90; right: 24px; }
+  .ghost-window { position: absolute; inset: 145px 28px 90px; background: #f6f8fa; border-radius: 10px; box-shadow: 0 12px 32px #5262790b; padding: 16px; }
+  .ghost-title { font-size: 11px; color: #8a98a9; padding-bottom: 15px; border-bottom: 1px solid #e5eaf0; }
+  .ghost-line { height: 6px; background: #e8edf2; border-radius: 8px; margin-top: 16px; width: 68%; }
+  .overlay { position: relative; margin: 14px auto; width: 294px; max-width: calc(100% - 24px); border: 1px solid #324357; border-radius: 13px; background: #101a29; color: #e0edff; padding: 10px 13px; box-shadow: 0 8px 22px #1a2a4230; font-size: 11px; --state: #60d9b1; }
+  .overlay[data-state="warn"] { --state: #ffbf69; }
+  .overlay[data-state="empty"] { --state: #ff8c95; }
+  .account { display: flex; align-items: center; gap: 7px; color: #86c6ff; font-weight: 700; font-size: 11px; }
+  .dot { width: 6px; height: 6px; border-radius: 50%; background: var(--state); flex: 0 0 auto; }
+  .plan { margin-left: auto; color: #8ba1ba; font-size: 9px; text-transform: uppercase; }
+  .quota-row { display: flex; justify-content: space-between; margin-top: 9px; align-items: baseline; }
+  .remaining { font-size: 21px; font-weight: 650; letter-spacing: -.5px; }
+  .remaining small { font-size: 10px; color: #93a6be; font-weight: 400; letter-spacing: 0; }
+  .countdown { color: #9cacc2; font-size: 10px; }
+  .track { height: 4px; background: #29384d; border-radius: 4px; margin: 9px 0; position: relative; }
+  .fill { height: 100%; background: var(--state); border-radius: 4px; width: 98%; }
+  .marker { position: absolute; height: 10px; width: 2px; background: #f0f5fc; top: -3px; left: 98.8%; }
+  .budget-row { display: flex; justify-content: space-between; align-items: center; gap: 4px; font-size: 10px; }
+  .budget-row strong { font-weight: 600; color: var(--state); }
+  .status { color: var(--state); }
+  .expand { display: block; width: 100%; border: 0; border-top: 1px solid #263449; background: none; text-align: left; color: #8199b6; font-size: 10px; margin-top: 10px; padding: 7px 0 0; cursor: pointer; }
+  .details { color: #a3b5cc; font-size: 10px; line-height: 1.9; padding-top: 7px; }
+  .details p { margin: 3px 0; }
+  .controls { padding: 26px; background: white; border: 1px solid #e0e6ed; border-radius: 18px; }
+  h2 { margin: 0 0 8px; font-size: 17px; }
+  .muted { color: #8190a1; font-size: 12px; line-height: 1.8; }
+  .presets { display: flex; gap: 7px; margin: 22px 0 28px; flex-wrap: wrap; }
+  .presets button { border: 1px solid #dfe6ee; color: #55677c; border-radius: 7px; padding: 8px 10px; background: #fff; cursor: pointer; font: inherit; font-size: 12px; }
+  .presets button[aria-pressed="true"] { border-color: #245e97; background: #edf5fc; color: #245e97; }
+  label { display: flex; justify-content: space-between; font-size: 12px; margin-top: 22px; }
+  output { font-variant-numeric: tabular-nums; color: #276599; font-weight: 600; }
+  input[type="range"] { width: 100%; accent-color: #3275ad; margin: 15px 0 3px; }
+  .ends { display: flex; justify-content: space-between; color: #9aa6b4; font-size: 10px; }
+  .assumption { border-top: 1px solid #edf0f4; margin-top: 26px; padding-top: 16px; font-size: 12px; line-height: 1.9; color: #738296; }
+  .notes { display: grid; grid-template-columns: repeat(3, 1fr); gap: 26px; margin-top: 30px; }
+  .note { border-top: 1px solid #d9e1ea; padding-top: 17px; }
+  .number { font-size: 11px; color: #8b9bac; }
+  h3 { font-size: 13px; margin: 10px 0; }
+  .note p { font-size: 12px; line-height: 1.9; color: #708094; margin: 0; }
+  button:focus-visible, input:focus-visible { outline: 2px solid #398bd1; outline-offset: 4px; }
+  footer { margin-top: 32px; font-size: 11px; color: #8c99a8; }
+  @media(max-width: 720px) { main { padding: 28px 18px; } .workspace, .notes { grid-template-columns: 1fr; } .stage { min-height: 420px; } }
+</style>
+</head>
+<body>
+<main>
+  <div class="eyebrow">CODEX ACCOUNT MANAGER / DESIGN 01</div>
+  <h1>Make your quota last all week.</h1>
+  <p class="intro">Keep your usage on track from the desktop overlay. See your account, remaining quota, reset time, and daily budget at a glance. Expand the details when you need them.</p>
+  <div class="workspace">
+    <section class="stage" aria-label="Desktop overlay preview">
+      <div class="desktop-bar"><span>Activities &nbsp; · &nbsp; Codex Account Manager</span><span>Desktop preview</span></div>
+      <div class="ghost-window" aria-hidden="true"><div class="ghost-title">Codex Account Manager</div><div class="ghost-line"></div><div class="ghost-line" style="width:45%"></div><div class="ghost-line" style="width:57%"></div></div>
+      <div class="overlay" id="overlay" data-state="normal">
+        <div class="account"><span class="dot"></span>Codex · demo@example.com<span class="plan">pro</span></div>
+        <div class="quota-row"><div class="remaining"><span id="remaining">98</span>% <small>weekly left</small></div><span class="countdown" id="countdown">Resets in 6d 22h</span></div>
+        <div class="track" aria-hidden="true"><div class="fill" id="fill"></div><div class="marker" id="marker"></div></div>
+        <div class="budget-row"><span>Daily budget: <strong id="budget">14.2%</strong></span><span class="status" id="status">On track</span></div>
+        <button class="expand" id="expand" aria-expanded="false" aria-controls="details">Budget details +</button>
+        <div class="details" id="details" hidden>
+          <p id="target"></p><p id="difference"></p>
+          <p>White marker: expected balance at an even 7-day pace.</p>
+          <p>Percentage of your total weekly quota. Daily budget covers the next 24 hours and updates with your balance.<br>Pacing guidance only; requests are not blocked.</p>
+        </div>
+      </div>
+      <div class="stage-caption">Compact overlay · Select “Budget details” to expand.<br>Demo data; no live account connected.</div>
+    </section>
+    <section class="controls" aria-label="Interactive demo controls">
+      <h2>Explore your usage pace</h2>
+      <div class="muted">Choose a scenario or move the sliders to update the overlay.</div>
+      <div class="presets"><button data-remaining="98" data-hours="166" aria-pressed="true">Original scenario</button><button data-remaining="30" data-hours="96" aria-pressed="false">Over pace</button><button data-remaining="0" data-hours="24" aria-pressed="false">Quota exhausted</button></div>
+      <label for="balance">Weekly quota remaining <output id="balance-value" for="balance">98%</output></label>
+      <input id="balance" type="range" min="0" max="100" value="98" step="1">
+      <div class="ends"><span>0%</span><span>100%</span></div>
+      <label for="hours">Time until reset <output id="hours-value" for="hours">6d 22h</output></label>
+      <input id="hours" type="range" min="0" max="168" value="166" step="1">
+      <div class="ends"><span>Reset due</span><span>7 days</span></div>
+      <div class="assumption"><strong>Budget assumption</strong><br>The budget runs until the account’s next weekly reset. Budget percentages refer to your total weekly quota, not token counts.</div>
+    </section>
+  </div>
+  <div class="notes">
+    <div class="note"><span class="number">01 / BUDGET</span><h3>Know your daily budget</h3><p>Remaining quota ÷ days until reset. With less than a day left, the overlay shows “Until reset” and the remaining allowance.</p></div>
+    <div class="note"><span class="number">02 / PACE</span><h3>Keep your pace in check</h3><p>Compare your balance with an even 7-day pace. This demo allows a margin of 1% of your total weekly quota: falling further behind turns the status amber; an empty balance turns it red.</p></div>
+    <div class="note"><span class="number">03 / SCOPE</span><h3>Track the weekly allowance</h3><p>Short-term limits may still apply. This design provides budget and pace guidance. When the reset is due, it asks for a refresh rather than assuming the balance has recovered.</p></div>
+  </div>
+  <footer>Interactive HTML concept · Standalone offline page · Qt app unchanged</footer>
+</main>
+<script>
+  const byId = id => document.getElementById(id);
+  const duration = hours => [Math.floor(hours / 24) ? Math.floor(hours / 24) + 'd' : '', hours % 24 ? hours % 24 + 'h' : ''].filter(Boolean).join(' ') || '0h';
+  function calculateQuota(remaining, hours) {
+    const target = hours / 168 * 100;
+    return { target, difference: remaining - target,
+      budget: hours > 0 ? remaining / Math.max(hours / 24, 1) : null,
+      state: hours <= 0 ? 'refresh' : remaining <= 0 ? 'empty' : remaining < target - 1 ? 'warn' : 'normal' };
+  }
+  function render() {
+    const remaining = Number(byId('balance').value), hours = Number(byId('hours').value);
+    const result = calculateQuota(remaining, hours);
+    byId('balance-value').textContent = `${remaining}%`;
+    byId('hours-value').textContent = duration(hours);
+    byId('remaining').textContent = remaining;
+    byId('countdown').textContent = hours ? `Resets in ${duration(hours)}` : 'Reset due · Refresh';
+    byId('fill').style.width = `${remaining}%`;
+    byId('marker').style.left = `${result.target}%`;
+    byId('overlay').dataset.state = result.state;
+    byId('budget').parentNode.firstChild.textContent = hours >= 24 ? 'Daily budget: ' : 'Until reset: ';
+    byId('budget').textContent = result.budget === null ? 'Refresh needed' : `${result.budget.toFixed(1)}%`;
+    byId('status').textContent = { normal: 'On track', warn: 'Over pace', empty: 'Quota exhausted', refresh: 'Awaiting refresh' }[result.state];
+    if (result.state === 'warn') byId('status').textContent = `Over pace by ${(-result.difference).toFixed(1)}%`;
+    byId('target').textContent = `Expected balance at an even pace: ${result.target.toFixed(1)}%.`;
+    byId('difference').textContent = hours <= 0 ? 'Refresh the quota after reset to start the new weekly budget.' : `Your balance is ${result.difference >= 0 ? 'above' : 'below'} the baseline by ${Math.abs(result.difference).toFixed(1)}% of your total weekly quota.`;
+    document.querySelectorAll('[data-remaining]').forEach(button => button.setAttribute('aria-pressed', String(Number(button.dataset.remaining) === remaining && Number(button.dataset.hours) === hours)));
+  }
+  ['balance', 'hours'].forEach(id => byId(id).addEventListener('input', render));
+  document.querySelectorAll('[data-remaining]').forEach(button => button.addEventListener('click', () => { byId('balance').value = button.dataset.remaining; byId('hours').value = button.dataset.hours; render(); }));
+  byId('expand').addEventListener('click', () => {
+    const expanded = byId('expand').getAttribute('aria-expanded') !== 'true';
+    byId('expand').setAttribute('aria-expanded', String(expanded));
+    byId('details').hidden = !expanded;
+    byId('expand').textContent = expanded ? 'Hide details −' : 'Budget details +';
+  });
+  render();
+</script>
+</body>
+</html>

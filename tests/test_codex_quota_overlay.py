@@ -157,6 +157,21 @@ class QuotaOverlayTests(unittest.TestCase):
         self.assertIn("本次操作", text)
         self.assertIn("执行本地命令", text)
 
+    def test_request_timing_labels_and_missing_upload_metric(self):
+        usage = {"input_tokens": 100, "cached_input_tokens": 0, "output_tokens": 10, "total_tokens": 110}
+        report = {"path": "test.jsonl", "question": "问题", "models": {"model-a": usage}, "tools": [],
+                  "requests": [{"model": "model-a", "usage": usage, "request_started_at": 100,
+                                "usage_recorded_at": 104.25, "request_duration_ms": 4250}]}
+        self.overlay.render_token_report(report)
+        text = self.overlay.token_details.toPlainText()
+        for expected in ("发起请求（日志）", "响应结束记录", "请求耗时（估算）", "4.25 秒",
+                         "上传上下文耗时：未记录", "不是纯上传或纯推理时间"):
+            self.assertIn(expected, text)
+        pending = {**report, "timing": {"pending_request_started_at": 100}}
+        self.overlay.render_token_report(pending)
+        self.assertIn("当前请求发起（日志）", self.overlay.token_details.toPlainText())
+        self.assertIn("尚无结束用量记录", self.overlay.token_details.toPlainText())
+
     def test_tool_content_previews_two_lines_and_preserves_expansion(self):
         report = {"path": "test.jsonl", "question": "问题", "models": {}, "tools": [
             {"id": "call-a", "name": "exec", "content": "第一行\n第二行\n第三行完整内容"}]}
